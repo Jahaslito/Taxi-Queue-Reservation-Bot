@@ -1,0 +1,207 @@
+const { chromium } = require('playwright');
+
+// Entry point — redirects to OIDC login, then back to the app after auth
+const SAN_URL     = 'https://san.gtcvms.com/gsidispatch.edispatch';
+const OIDC_HOST   = 'san.gtcvms.com/GsiIdentityServer';
+const APP_HOST    = 'san.gtcvms.com/gsidispatch.edispatch';
+const TIMEOUT     = 60000;   // 60s — OIDC handshake + SPA hydration can be slow
+const NAV_TIMEOUT = 60000;   // Extra time for full page-navigation round-trips
+
+/**
+ * Automates the full SAN eDispatch queue process for one driver.
+ *
+ * Flow:
+ *  1. Navigate to eDispatch → OIDC redirects to identity server login page
+ *  2. Fill username + password, click Log In
+ *  3. OIDC callback redirects back to eDispatch app
+ *  4. Fill vehicle NUMBER in search field, click Search
+ *  5. Click "Add To Queue" on the vehicle result page
+ *  6. Read Position / Location / Time from the WAIT confirmation screen
+ */
+async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
+  const startTime = Date.now();
+  let browser = null;
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--single-process'
+      ]
+    });
+
+    const context = await browser.newContext({
+      // Mobile UA matches what the site expects (optimised for mobile)
+      userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+      viewport: { width: 390, height: 844 },
+      permissions: [],
+      acceptDownloads: false
+    });
+
+    const page = await context.newPage();
+
+    // ─── STEP 1: Navigate ─────────────────────────────────────────────────────
+    // Navigating to the app URL triggers an OIDC redirect to:
+    //   https://san.gtcvms.com/GsiIdentityServer/Account/Login?ReturnUrl=...
+    // Playwright follows all redirects automatically; we wait for the login
+    // form to appear on the identity-server page.
+    console.log(`[Bot] ${vehicleNumber} → Navigating to SAN eDispatch (OIDC flow)…`);
+    await page.goto(SAN_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+
+    // Confirm we landed on the OIDC login page
+    await page.waitForURL(`**/${OIDC_HOST}/**`, { timeout: TIMEOUT });
+    console.log(`[Bot] ${vehicleNumber} → Redirected to OIDC login: ${page.url()}`);
+
+    // ─── STEP 2: Fill login form ──────────────────────────────────────────────
+    await page.waitForSelector('input[placeholder="Enter Username"]', { timeout: TIMEOUT });
+    console.log(`[Bot] ${vehicleNumber} → Filling credentials for ${sanUsername}…`);
+
+    await page.fill('input[placeholder="Enter Username"]', sanUsername);
+    await page.fill('input[placeholder="Enter Password"]', sanPassword);
+
+    // Click Log In — wait for the OIDC callback to redirect us back to the app
+    await Promise.all([
+      page.waitForURL(`**/${APP_HOST}/**`, { timeout: NAV_TIMEOUT }),
+      page.click('button:has-text("Log In")')
+    ]);
+
+    console.log(`[Bot] ${vehicleNumber} → OIDC callback complete — back on eDispatch.`);
+
+    // Let the SPA fully hydrate before querying the DOM
+    await page.waitForLoadState('networkidle', { timeout: TIMEOUT }).catch(() => {});
+
+    // ─── STEP 3: Check for wrong-credentials error ────────────────────────────
+    // If the URL is still on the identity server, login failed
+    if (page.url().includes(OIDC_HOST)) {
+      const errorText = await page.textContent('body').catch(() => '');
+      const hint = errorText.includes('Invalid') || errorText.includes('incorrect')
+        ? 'Invalid SAN username or password'
+        : 'Login failed — check credentials';
+      return { success: false, durationMs: Date.now() - startTime, error: hint, message: hint };
+    }
+
+    // ─── STEP 4: Wait for either the search page OR the WAIT screen ─────────────
+    // When already queued, SAN skips the search page and shows the WAIT screen directly
+    await page.waitForFunction(
+      () => {
+        const hasSearch = document.querySelector('input[placeholder="Vehicle Dispatch Name"]') !== null;
+        const onWaitScreen = document.body.innerText.includes('Remove From Queue');
+        return hasSearch || onWaitScreen;
+      },
+      { timeout: TIMEOUT }
+    );
+
+    // If we landed on the WAIT screen directly → already queued
+    if (await isWaitScreen(page)) {
+      const info = await extractQueueInfo(page);
+      console.log(`[Bot] ${vehicleNumber} → Already in queue (landed on WAIT screen directly).`);
+      return { success: true, alreadyQueued: true, ...info, durationMs: Date.now() - startTime,
+               message: `Vehicle already in queue at position ${info.position}` };
+    }
+
+    console.log(`[Bot] ${vehicleNumber} → On vehicle search page.`);
+
+    // ─── STEP 5: Search by vehicle number ────────────────────────────────────
+    // The field placeholder says "Vehicle Dispatch Name" but the actual value
+    // entered is the numeric vehicle number (e.g. "4000")
+    console.log(`[Bot] ${vehicleNumber} → Searching for vehicle ${vehicleNumber}…`);
+    await page.fill('input[placeholder="Vehicle Dispatch Name"]', String(vehicleNumber));
+    await page.click('button:has-text("Search")');
+
+    // Wait for one of: Add To Queue button, WAIT screen, or not-found message
+    await page.waitForFunction(
+      () => document.body.innerText.includes('Add To Queue')      ||
+            document.body.innerText.includes('Remove From Queue') ||
+            document.body.innerText.includes('not found')         ||
+            document.body.innerText.includes('No vehicle')        ||
+            document.body.innerText.includes('No results'),
+      { timeout: TIMEOUT }
+    );
+
+    // ─── STEP 6: Already queued after search? ────────────────────────────────
+    if (await isWaitScreen(page)) {
+      const info = await extractQueueInfo(page);
+      return { success: true, alreadyQueued: true, ...info, durationMs: Date.now() - startTime,
+               message: `Vehicle already in queue at position ${info.position}` };
+    }
+
+    // ─── STEP 7: Confirm vehicle was found ───────────────────────────────────
+    const addToQueueVisible = await page.isVisible('button:has-text("Add To Queue")').catch(() => false);
+    if (!addToQueueVisible) {
+      return {
+        success: false,
+        durationMs: Date.now() - startTime,
+        error: `Vehicle "${vehicleNumber}" not found — check vehicle number`,
+        message: `Vehicle ${vehicleNumber} not found in SAN eDispatch`
+      };
+    }
+
+    // ─── STEP 8: Click Add To Queue ───────────────────────────────────────────
+    console.log(`[Bot] ${vehicleNumber} → Clicking Add To Queue…`);
+    await page.click('button:has-text("Add To Queue")');
+
+    // Wait for WAIT confirmation screen — "Remove From Queue" is unique to this screen
+    await page.waitForFunction(
+      () => document.body.innerText.includes('Remove From Queue'),
+      { timeout: TIMEOUT }
+    );
+    console.log(`[Bot] ${vehicleNumber} → ✓ Successfully added to queue!`);
+
+    // ─── STEP 9: Extract queue details ───────────────────────────────────────
+    const info = await extractQueueInfo(page);
+    return {
+      success: true,
+      alreadyQueued: false,
+      ...info,
+      durationMs: Date.now() - startTime,
+      message: `Added to queue — Position: ${info.position}, Location: ${info.location}`
+    };
+
+  } catch (err) {
+    console.error(`[Bot] ${vehicleNumber} → ERROR: ${err.message}`);
+    return {
+      success: false,
+      durationMs: Date.now() - startTime,
+      error: err.message,
+      message: `Automation failed: ${err.message}`
+    };
+  } finally {
+    if (browser) await browser.close();
+  }
+}
+
+/** Returns true if the WAIT confirmation screen is currently visible. */
+async function isWaitScreen(page) {
+  return page.evaluate(() => {
+    const t = document.body.innerText;
+    // "Remove From Queue" button is unique to the WAIT confirmation screen
+    return t.includes('Remove From Queue');
+  }).catch(() => false);
+}
+
+/**
+ * Extracts Position, Location, and Time from the WAIT screen.
+ * The screen text looks like:
+ *   "Vehicle: 4000  WAIT  Location  V Holding  Position  401  Time  06:25:34"
+ */
+async function extractQueueInfo(page) {
+  try {
+    const bodyText = await page.textContent('body');
+    const positionMatch = bodyText.match(/Position\s+(\d+)/i);
+    const locationMatch = bodyText.match(/Location\s+([\s\S]+?)(?=\s*Position|\s*Time|\s*Special)/i);
+    const timeMatch     = bodyText.match(/Time\s+([\d:]+)/i);
+    return {
+      position:  positionMatch ? parseInt(positionMatch[1]) : null,
+      location:  locationMatch ? locationMatch[1].trim()    : null,
+      queueTime: timeMatch     ? timeMatch[1].trim()        : null
+    };
+  } catch {
+    return { position: null, location: null, queueTime: null };
+  }
+}
+
+module.exports = { addToQueue };

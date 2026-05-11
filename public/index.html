@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#060F2A" />
+  <title>SAN Queue Scheduler</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --navy:   #060F2A;
+      --navy2:  #0D1B45;
+      --navy3:  #162255;
+      --teal:   #00C2D4;
+      --amber:  #F5A623;
+      --green:  #27C083;
+      --red:    #F05A5B;
+      --white:  #F0F4FF;
+      --muted:  #7A8AB5;
+      --card:   rgba(255,255,255,0.04);
+      --border: rgba(255,255,255,0.08);
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'DM Sans', sans-serif;
+      background: var(--navy);
+      color: var(--white);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      max-width: 480px;
+      margin: 0 auto;
+      position: relative;
+      overflow-x: hidden;
+    }
+
+    /* Background glow */
+    body::before {
+      content: '';
+      position: fixed;
+      top: -120px; left: 50%;
+      transform: translateX(-50%);
+      width: 500px; height: 500px;
+      background: radial-gradient(circle, rgba(0,194,212,0.12) 0%, transparent 70%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* ── Views ── */
+    .view { display: none; flex-direction: column; min-height: 100vh; padding: 0 20px 40px; position: relative; z-index: 1; }
+    .view.active { display: flex; }
+
+    /* ── Header ── */
+    .app-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 20px 20px 0;
+      position: relative; z-index: 1;
+    }
+    .logo { display: flex; align-items: center; gap: 10px; }
+    .logo-dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: var(--teal);
+      box-shadow: 0 0 10px var(--teal);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.6;transform:scale(1.3)} }
+    .logo-text { font-family: 'Syne', sans-serif; font-size: 16px; font-weight: 700; letter-spacing: 0.02em; }
+    .logo-text span { color: var(--teal); }
+
+    .menu-btn {
+      background: none; border: none; color: var(--muted); cursor: pointer;
+      font-size: 22px; padding: 4px; display: none;
+    }
+    .menu-btn.visible { display: block; }
+
+    /* ── Welcome hero ── */
+    .hero {
+      padding: 60px 0 40px;
+      text-align: center;
+    }
+    .hero-icon {
+      width: 80px; height: 80px; border-radius: 24px;
+      background: linear-gradient(135deg, var(--teal), #006FD6);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 36px; margin: 0 auto 24px;
+      box-shadow: 0 16px 40px rgba(0,194,212,0.3);
+    }
+    .hero h1 { font-family: 'Syne', sans-serif; font-size: 28px; font-weight: 800; line-height: 1.2; margin-bottom: 12px; }
+    .hero p { color: var(--muted); font-size: 15px; line-height: 1.6; max-width: 300px; margin: 0 auto; }
+
+    /* ── Forms ── */
+    .form-section { flex: 1; padding-top: 8px; }
+    .form-group { margin-bottom: 16px; }
+    label { display: block; font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+    input, select {
+      width: 100%;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px 16px;
+      color: var(--white);
+      font-family: 'DM Sans', sans-serif;
+      font-size: 16px;
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      -webkit-appearance: none;
+    }
+    input:focus, select:focus {
+      border-color: var(--teal);
+      box-shadow: 0 0 0 3px rgba(0,194,212,0.15);
+    }
+    input::placeholder { color: rgba(255,255,255,0.25); }
+    select option { background: var(--navy2); }
+
+    .form-divider {
+      display: flex; align-items: center; gap: 12px;
+      margin: 20px 0; color: var(--muted); font-size: 13px;
+    }
+    .form-divider::before, .form-divider::after {
+      content: ''; flex: 1; height: 1px; background: var(--border);
+    }
+
+    .section-label {
+      font-size: 11px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+      color: var(--teal); margin-bottom: 16px; margin-top: 8px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .section-label::after { content:''; flex:1; height:1px; background: rgba(0,194,212,0.2); }
+
+    /* ── Buttons ── */
+    .btn {
+      width: 100%; padding: 16px; border-radius: 14px; border: none;
+      font-family: 'DM Sans', sans-serif; font-size: 16px; font-weight: 600;
+      cursor: pointer; transition: all 0.2s; letter-spacing: 0.01em;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--teal), #006FD6);
+      color: #fff;
+      box-shadow: 0 8px 24px rgba(0,194,212,0.3);
+    }
+    .btn-primary:hover { opacity: 0.9; transform: translateY(-1px); }
+    .btn-primary:active { transform: translateY(0); }
+    .btn-ghost {
+      background: var(--card); border: 1px solid var(--border);
+      color: var(--white);
+    }
+    .btn-ghost:hover { border-color: rgba(255,255,255,0.2); }
+    .btn-danger { background: rgba(240,90,91,0.15); border: 1px solid rgba(240,90,91,0.3); color: var(--red); }
+    .btn + .btn { margin-top: 10px; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* ── Dashboard ── */
+    .dash-greeting { padding: 28px 0 20px; }
+    .dash-greeting .sub { font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+    .dash-greeting h2 { font-family: 'Syne', sans-serif; font-size: 24px; font-weight: 700; }
+
+    .status-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 20px;
+      margin-bottom: 14px;
+      position: relative;
+      overflow: hidden;
+    }
+    .status-card::before {
+      content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+      background: linear-gradient(90deg, var(--teal), #006FD6);
+    }
+    .status-card .card-label { font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin-bottom: 12px; }
+    .status-card .card-main { font-family: 'Syne', sans-serif; font-size: 22px; font-weight: 700; }
+    .status-card .card-sub { font-size: 13px; color: var(--muted); margin-top: 4px; }
+
+    .status-badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600;
+    }
+    .badge-success { background: rgba(39,192,131,0.15); color: var(--green); }
+    .badge-failed  { background: rgba(240,90,91,0.15);  color: var(--red); }
+    .badge-pending { background: rgba(245,166,35,0.15); color: var(--amber); }
+    .badge-dot { width:6px; height:6px; border-radius:50%; background:currentColor; }
+
+    .stats-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+    .stat-mini {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 16px; padding: 16px;
+      text-align: center;
+    }
+    .stat-mini .val { font-family: 'Syne', sans-serif; font-size: 26px; font-weight: 700; color: var(--teal); }
+    .stat-mini .lbl { font-size: 11px; color: var(--muted); margin-top: 4px; text-transform: uppercase; letter-spacing: 0.06em; }
+
+    /* ── Schedule time picker ── */
+    .time-picker-wrap { position: relative; }
+    .time-display {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 14px; padding: 14px 16px;
+      display: flex; align-items: center; justify-content: space-between;
+      cursor: pointer; transition: border-color 0.2s;
+    }
+    .time-display:hover { border-color: var(--teal); }
+    .time-display .time-val { font-family: 'Syne', sans-serif; font-size: 20px; font-weight: 700; color: var(--teal); }
+    .time-display .time-label { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .time-display .chevron { color: var(--muted); font-size: 18px; }
+
+    /* ── Logs list ── */
+    .logs-list { margin-top: 8px; }
+    .log-item {
+      display: flex; align-items: center; gap: 12px;
+      padding: 14px 0; border-bottom: 1px solid var(--border);
+    }
+    .log-item:last-child { border-bottom: none; }
+    .log-icon {
+      width: 36px; height: 36px; border-radius: 10px; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center; font-size: 16px;
+    }
+    .log-icon.success { background: rgba(39,192,131,0.15); }
+    .log-icon.failed  { background: rgba(240,90,91,0.15); }
+    .log-icon.pending { background: rgba(245,166,35,0.15); }
+    .log-details { flex: 1; min-width: 0; }
+    .log-details .log-date { font-size: 13px; font-weight: 500; }
+    .log-details .log-meta { font-size: 12px; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .log-pos { font-family: 'Syne', sans-serif; font-size: 18px; font-weight: 700; color: var(--teal); }
+
+    /* ── Nav bar ── */
+    .nav-bar {
+      position: fixed; bottom: 0; left: 50%; transform: translateX(-50%);
+      width: 100%; max-width: 480px;
+      background: rgba(6,15,42,0.95);
+      backdrop-filter: blur(20px);
+      border-top: 1px solid var(--border);
+      display: flex; padding: 10px 0 env(safe-area-inset-bottom, 10px);
+      z-index: 100;
+    }
+    .nav-item {
+      flex: 1; display: flex; flex-direction: column; align-items: center;
+      gap: 4px; cursor: pointer; padding: 6px;
+      color: var(--muted); font-size: 10px; font-weight: 600;
+      letter-spacing: 0.04em; text-transform: uppercase;
+      transition: color 0.2s; border: none; background: none;
+    }
+    .nav-item .nav-icon { font-size: 22px; line-height: 1; }
+    .nav-item.active { color: var(--teal); }
+
+    /* Padding for nav bar */
+    .with-nav { padding-bottom: 90px; }
+
+    /* ── Toast ── */
+    .toast {
+      position: fixed; bottom: 90px; left: 50%; transform: translateX(-50%) translateY(20px);
+      background: var(--navy3); border: 1px solid var(--border); border-radius: 14px;
+      padding: 12px 20px; font-size: 14px; font-weight: 500; z-index: 999;
+      opacity: 0; transition: all 0.3s; white-space: nowrap;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+    .toast.success { border-color: rgba(39,192,131,0.4); color: var(--green); }
+    .toast.error   { border-color: rgba(240,90,91,0.4); color: var(--red); }
+
+    /* ── Misc ── */
+    .mt-auto { margin-top: auto; }
+    .mt-4 { margin-top: 16px; }
+    .mt-8 { margin-top: 32px; }
+    .text-link { color: var(--teal); cursor: pointer; background: none; border: none; font-size: 14px; }
+    .text-center { text-align: center; }
+    .spinner {
+      display: inline-block; width: 16px; height: 16px;
+      border: 2px solid rgba(255,255,255,0.3); border-top-color: white;
+      border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .error-msg { color: var(--red); font-size: 13px; margin-top: 8px; }
+    .info-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 14px; }
+    .info-row:last-child { border-bottom: none; }
+    .info-row .lbl { color: var(--muted); }
+    .info-row .val { font-weight: 500; }
+    .big-time { font-family: 'Syne', sans-serif; font-size: 48px; font-weight: 800; color: var(--teal); text-align: center; margin: 16px 0; }
+  </style>
+</head>
+<body>
+
+<!-- ════════════════════════════════════════════════ LOGIN VIEW ════ -->
+<div class="view active" id="view-login">
+  <header class="app-header">
+    <div class="logo">
+      <div class="logo-dot"></div>
+      <div class="logo-text">SAN <span>Queue</span></div>
+    </div>
+  </header>
+
+  <div class="hero">
+    <div class="hero-icon">🚕</div>
+    <h1>Skip the Early Alarm</h1>
+    <p>Schedule your SAN airport queue slot — we'll check you in automatically.</p>
+  </div>
+
+  <div class="form-section">
+    <div class="form-group">
+      <label>Email</label>
+      <input type="email" id="login-identifier" placeholder="your@email.com" autocomplete="username" />
+    </div>
+    <div class="form-group">
+      <label>App Password</label>
+      <input type="password" id="login-password" placeholder="Your app password" autocomplete="current-password" />
+    </div>
+    <div class="error-msg" id="login-error"></div>
+    <div class="mt-4">
+      <button class="btn btn-primary" id="btn-login">Log In</button>
+    </div>
+    <div class="form-divider">or</div>
+    <button class="btn btn-ghost" onclick="showView('view-register')">Create Account</button>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════ REGISTER VIEW ════ -->
+<div class="view" id="view-register">
+  <header class="app-header">
+    <div class="logo">
+      <div class="logo-dot"></div>
+      <div class="logo-text">SAN <span>Queue</span></div>
+    </div>
+  </header>
+
+  <div style="padding: 28px 0 8px;">
+    <h2 style="font-family:'Syne',sans-serif;font-size:24px;font-weight:800;">Create Account</h2>
+    <p style="color:var(--muted);font-size:14px;margin-top:6px;">Set up your scheduler in 2 minutes</p>
+  </div>
+
+  <div class="form-section">
+    <div class="section-label">Your Details</div>
+    <div class="form-group">
+      <label>Full Name</label>
+      <input type="text" id="reg-name" placeholder="John Doe" />
+    </div>
+    <div class="form-group">
+      <label>Phone Number</label>
+      <input type="tel" id="reg-phone" placeholder="+1 619 555 0123" />
+    </div>
+    <div class="form-group">
+      <label>Email (optional)</label>
+      <input type="email" id="reg-email" placeholder="john@example.com" />
+    </div>
+    <div class="form-group">
+      <label>App Password</label>
+      <input type="password" id="reg-app-password" placeholder="Create a password for this app" />
+    </div>
+
+    <div class="section-label">SAN eDispatch Credentials</div>
+    <div class="form-group">
+      <label>SAN Username</label>
+      <input type="text" id="reg-san-username" placeholder="Your SAN eDispatch username" autocomplete="off" />
+    </div>
+    <div class="form-group">
+      <label>SAN Password</label>
+      <input type="password" id="reg-san-password" placeholder="Your SAN eDispatch password" autocomplete="new-password" />
+    </div>
+    <div class="form-group">
+      <label>Vehicle Dispatch Number</label>
+      <input type="text" id="reg-vehicle" placeholder="e.g. 4000" autocomplete="off" inputmode="numeric" />
+    </div>
+
+    <div class="section-label">Queue Schedule</div>
+    <div class="form-group">
+      <label>Auto Check-In Time <span style="color:var(--teal);font-weight:700;">· San Diego (PT)</span></label>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <select id="reg-time-hour" style="flex:1;">
+          <option value="04">04</option><option value="05" selected>05</option><option value="06">06</option>
+          <option value="07">07</option><option value="08">08</option><option value="09">09</option>
+          <option value="10">10</option><option value="11">11</option><option value="12">12</option>
+          <option value="13">13</option><option value="14">14</option><option value="15">15</option>
+          <option value="16">16</option><option value="17">17</option><option value="18">18</option>
+          <option value="19">19</option><option value="20">20</option><option value="21">21</option>
+        </select>
+        <span style="color:var(--muted);font-size:20px;font-weight:700;">:</span>
+        <select id="reg-time-min" style="flex:1;">
+          <option value="00" selected>00</option><option value="15">15</option>
+          <option value="30">30</option><option value="45">45</option>
+        </select>
+      </div>
+    </div>
+    <p style="font-size:12px;color:var(--muted);margin-top:-8px;margin-bottom:16px;">
+      🤖 The bot will automatically add you to the San Diego queue at this time every day.
+    </p>
+
+    <div class="error-msg" id="reg-error"></div>
+    <button class="btn btn-primary" id="btn-register">Create Account</button>
+    <button class="btn btn-ghost mt-4" onclick="showView('view-login')">← Back to Login</button>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════ DASHBOARD VIEW ════ -->
+<div class="view with-nav" id="view-dashboard">
+  <header class="app-header">
+    <div class="logo">
+      <div class="logo-dot"></div>
+      <div class="logo-text">SAN <span>Queue</span></div>
+    </div>
+    <button class="menu-btn visible" id="btn-logout-menu" title="Logout">⎋</button>
+  </header>
+
+  <div class="dash-greeting">
+    <div class="sub">Welcome back</div>
+    <h2 id="dash-name">Loading…</h2>
+  </div>
+
+  <!-- Today's Status -->
+  <div class="status-card" id="today-status-card">
+    <div class="card-label">Today's Queue Status</div>
+    <div id="today-status-content">
+      <div style="color:var(--muted);font-size:14px;">Loading…</div>
+    </div>
+  </div>
+
+  <!-- Schedule -->
+  <div class="stats-row">
+    <div class="stat-mini">
+      <div class="val" id="stat-time">--:--</div>
+      <div class="lbl">Scheduled Time</div>
+    </div>
+    <div class="stat-mini">
+      <div class="val" id="stat-vehicle" style="font-size:18px;">----</div>
+      <div class="lbl">Vehicle No.</div>
+    </div>
+  </div>
+
+  <!-- Recent logs -->
+  <div class="status-card">
+    <div class="card-label">Recent Activity</div>
+    <div class="logs-list" id="dash-logs">
+      <div style="color:var(--muted);font-size:14px;text-align:center;padding:16px;">Loading…</div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════ SCHEDULE VIEW ════ -->
+<div class="view with-nav" id="view-schedule">
+  <header class="app-header">
+    <div class="logo">
+      <div class="logo-dot"></div>
+      <div class="logo-text">SAN <span>Queue</span></div>
+    </div>
+  </header>
+
+  <div style="padding:28px 0 20px;">
+    <h2 style="font-family:'Syne',sans-serif;font-size:24px;font-weight:800;">My Schedule</h2>
+    <p style="color:var(--muted);font-size:14px;margin-top:6px;">Update your automatic queue time</p>
+  </div>
+
+  <div class="status-card">
+    <div class="card-label">Current Schedule</div>
+    <div class="big-time" id="sched-current-time">--:--</div>
+    <p style="text-align:center;font-size:13px;color:var(--muted);">Pacific Time · Every Day</p>
+  </div>
+
+  <div class="form-group" style="margin-top:20px;">
+    <label>New Check-In Time (Pacific Time)</label>
+    <input type="time" id="sched-new-time" />
+  </div>
+
+  <div class="section-label" style="margin-top:16px;">Update SAN Credentials</div>
+  <p style="font-size:12px;color:var(--muted);margin-bottom:12px;margin-top:-8px;">Leave blank to keep existing credentials</p>
+
+  <div class="form-group">
+    <label>SAN Username</label>
+    <input type="text" id="sched-san-username" placeholder="Leave blank to keep current" autocomplete="off" />
+  </div>
+  <div class="form-group">
+    <label>SAN Password</label>
+    <input type="password" id="sched-san-password" placeholder="Leave blank to keep current" autocomplete="new-password" />
+  </div>
+  <div class="form-group">
+    <label>Vehicle Dispatch Number</label>
+    <input type="text" id="sched-vehicle" placeholder="Leave blank to keep current" autocomplete="off" inputmode="numeric" />
+  </div>
+
+  <div class="error-msg" id="sched-error"></div>
+  <button class="btn btn-primary" id="btn-save-schedule" style="margin-top:8px;">Save Changes</button>
+</div>
+
+<!-- ════════════════════════════════════════════════ HISTORY VIEW ════ -->
+<div class="view with-nav" id="view-history">
+  <header class="app-header">
+    <div class="logo">
+      <div class="logo-dot"></div>
+      <div class="logo-text">SAN <span>Queue</span></div>
+    </div>
+  </header>
+
+  <div style="padding:28px 0 20px;">
+    <h2 style="font-family:'Syne',sans-serif;font-size:24px;font-weight:800;">Queue History</h2>
+  </div>
+
+  <div id="history-list">
+    <div style="color:var(--muted);font-size:14px;text-align:center;padding:32px;">Loading…</div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════ NAV BAR ════ -->
+<nav class="nav-bar" id="main-nav" style="display:none;">
+  <button class="nav-item active" data-view="view-dashboard">
+    <span class="nav-icon">🏠</span>
+    Home
+  </button>
+  <button class="nav-item" data-view="view-schedule">
+    <span class="nav-icon">⏰</span>
+    Schedule
+  </button>
+  <button class="nav-item" data-view="view-history">
+    <span class="nav-icon">📋</span>
+    History
+  </button>
+</nav>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+  const API = '';  // Same origin
+  let authToken = localStorage.getItem('driverToken');
+  let driverProfile = null;
+
+  // ─── Navigation ──────────────────────────────────────────────────────────
+  function showView(viewId) {
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    document.getElementById(viewId).classList.add('active');
+
+    const isLoggedIn = ['view-dashboard', 'view-schedule', 'view-history'].includes(viewId);
+    document.getElementById('main-nav').style.display = isLoggedIn ? 'flex' : 'none';
+
+    // Update nav active state
+    document.querySelectorAll('.nav-item').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.view === viewId);
+    });
+
+    if (viewId === 'view-dashboard') loadDashboard();
+    if (viewId === 'view-history')   loadHistory();
+    if (viewId === 'view-schedule')  loadSchedule();
+
+    window.scrollTo(0, 0);
+  }
+
+  // Nav bar click
+  document.querySelectorAll('.nav-item').forEach(btn => {
+    btn.addEventListener('click', () => showView(btn.dataset.view));
+  });
+
+  // ─── Toast ───────────────────────────────────────────────────────────────
+  function showToast(msg, type = 'success') {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = `toast ${type} show`;
+    setTimeout(() => t.classList.remove('show'), 3000);
+  }
+
+  // ─── API helper ──────────────────────────────────────────────────────────
+  async function api(path, options = {}) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+    const res = await fetch(API + path, { ...options, headers });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Request failed');
+    return data;
+  }
+
+  // ─── Login ───────────────────────────────────────────────────────────────
+  document.getElementById('btn-login').addEventListener('click', async () => {
+    const identifier = document.getElementById('login-identifier').value.trim();
+    const password = document.getElementById('login-password').value;
+    const errEl = document.getElementById('login-error');
+    errEl.textContent = '';
+
+    if (!identifier || !password) { errEl.textContent = 'Please fill in all fields'; return; }
+
+    const btn = document.getElementById('btn-login');
+    btn.innerHTML = '<span class="spinner"></span> Logging in…'; btn.disabled = true;
+
+    try {
+      const body = { email: identifier, appPassword: password };
+
+      const data = await api('/api/auth/driver/login', { method: 'POST', body: JSON.stringify(body) });
+      authToken = data.token;
+      localStorage.setItem('driverToken', authToken);
+      driverProfile = data.driver;
+      showView('view-dashboard');
+    } catch (err) {
+      errEl.textContent = err.message;
+    } finally {
+      btn.innerHTML = 'Log In'; btn.disabled = false;
+    }
+  });
+
+  // ─── Register ────────────────────────────────────────────────────────────
+  document.getElementById('btn-register').addEventListener('click', async () => {
+    const name = document.getElementById('reg-name').value.trim();
+    const phone = document.getElementById('reg-phone').value.trim();
+    const email = document.getElementById('reg-email').value.trim();
+    const appPassword = document.getElementById('reg-app-password').value;
+    const sanUsername = document.getElementById('reg-san-username').value.trim();
+    const sanPassword = document.getElementById('reg-san-password').value;
+    const vehicleNumber = document.getElementById('reg-vehicle').value.trim();
+    const hour = document.getElementById('reg-time-hour').value;
+    const min  = document.getElementById('reg-time-min').value;
+    const scheduledTime = `${hour}:${min}`;
+    const errEl = document.getElementById('reg-error');
+    errEl.textContent = '';
+
+    if (!name || !appPassword || !sanUsername || !sanPassword || !vehicleNumber || !scheduledTime) {
+      errEl.textContent = 'Please fill in all required fields'; return;
+    }
+
+    const btn = document.getElementById('btn-register');
+    btn.innerHTML = '<span class="spinner"></span> Creating account…'; btn.disabled = true;
+
+    try {
+      const data = await api('/api/auth/driver/register', {
+        method: 'POST',
+        body: JSON.stringify({ name, phone, email, appPassword, sanUsername, sanPassword, vehicleNumber, scheduledTime })
+      });
+      authToken = data.token;
+      localStorage.setItem('driverToken', authToken);
+      driverProfile = data.driver;
+      showToast('Account created! Welcome 🎉');
+      showView('view-dashboard');
+    } catch (err) {
+      errEl.textContent = err.message;
+    } finally {
+      btn.innerHTML = 'Create Account'; btn.disabled = false;
+    }
+  });
+
+  // ─── Logout ──────────────────────────────────────────────────────────────
+  document.getElementById('btn-logout-menu').addEventListener('click', () => {
+    if (!confirm('Log out?')) return;
+    localStorage.removeItem('driverToken');
+    authToken = null;
+    driverProfile = null;
+    showView('view-login');
+  });
+
+  // ─── Dashboard ───────────────────────────────────────────────────────────
+  async function loadDashboard() {
+    try {
+      if (!driverProfile) {
+        driverProfile = await api('/api/driver/profile');
+      }
+      document.getElementById('dash-name').textContent = driverProfile.name;
+      document.getElementById('stat-time').textContent = driverProfile.scheduled_time;
+      document.getElementById('stat-vehicle').textContent = driverProfile.vehicle_number;
+
+      const statusData = await api('/api/driver/status/today');
+      renderTodayStatus(statusData.todayLog);
+
+      const logsData = await api('/api/driver/logs?limit=5');
+      renderDashLogs(logsData.logs);
+    } catch (err) {
+      if (err.message.includes('token')) { localStorage.removeItem('driverToken'); showView('view-login'); }
+    }
+  }
+
+  function renderTodayStatus(log) {
+    const el = document.getElementById('today-status-content');
+    if (!log) {
+      el.innerHTML = `
+        <div style="display:flex;align-items:center;gap:12px;">
+          <div style="font-size:28px;">⏳</div>
+          <div>
+            <div style="font-weight:600;">Not yet queued today</div>
+            <div style="font-size:13px;color:var(--muted);">Scheduled for <strong style="color:var(--white);">${driverProfile?.scheduled_time || '--:--'}</strong> PT</div>
+          </div>
+        </div>`;
+      return;
+    }
+
+    const statusMap = {
+      success: { emoji: '✅', label: 'Success', cls: 'badge-success' },
+      already_queued: { emoji: '✅', label: 'Already Queued', cls: 'badge-success' },
+      failed: { emoji: '❌', label: 'Failed', cls: 'badge-failed' },
+      pending: { emoji: '⏳', label: 'Running…', cls: 'badge-pending' }
+    };
+    const s = statusMap[log.status] || statusMap.pending;
+
+    el.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+        <span class="status-badge ${s.cls}"><span class="badge-dot"></span>${s.label}</span>
+        <span style="font-size:12px;color:var(--muted);">${formatTime(log.triggered_at)}</span>
+      </div>
+      ${log.queue_position ? `
+        <div style="display:flex;gap:20px;">
+          <div><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;">Position</div>
+            <div style="font-family:'Syne',sans-serif;font-size:28px;font-weight:700;color:var(--teal);">${log.queue_position}</div></div>
+          <div><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;">Location</div>
+            <div style="font-size:16px;font-weight:600;margin-top:4px;">${log.queue_location || 'N/A'}</div></div>
+          <div><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;">Queue Time</div>
+            <div style="font-size:16px;font-weight:600;margin-top:4px;">${log.queue_time || 'N/A'}</div></div>
+        </div>` : ''}
+      ${log.error_message ? `<div style="font-size:13px;color:var(--red);margin-top:8px;">${log.error_message}</div>` : ''}`;
+  }
+
+  function renderDashLogs(logs) {
+    const el = document.getElementById('dash-logs');
+    if (!logs || logs.length === 0) {
+      el.innerHTML = '<div style="color:var(--muted);font-size:14px;text-align:center;padding:16px;">No activity yet</div>';
+      return;
+    }
+    el.innerHTML = logs.map(log => {
+      const iconMap = { success: '✅', already_queued: '✅', failed: '❌', pending: '⏳' };
+      const clsMap  = { success: 'success', already_queued: 'success', failed: 'failed', pending: 'pending' };
+      return `
+        <div class="log-item">
+          <div class="log-icon ${clsMap[log.status]}">${iconMap[log.status] || '⏳'}</div>
+          <div class="log-details">
+            <div class="log-date">${formatDate(log.triggered_at)}</div>
+            <div class="log-meta">${log.queue_location || log.error_message || log.status}</div>
+          </div>
+          ${log.queue_position ? `<div class="log-pos">#${log.queue_position}</div>` : ''}
+        </div>`;
+    }).join('');
+  }
+
+  // ─── Schedule ────────────────────────────────────────────────────────────
+  function loadSchedule() {
+    if (!driverProfile) return;
+    document.getElementById('sched-current-time').textContent = driverProfile.scheduled_time;
+    document.getElementById('sched-new-time').value = driverProfile.scheduled_time;
+    document.getElementById('sched-san-username').value = '';
+    document.getElementById('sched-san-password').value = '';
+    document.getElementById('sched-vehicle').value = '';
+  }
+
+  document.getElementById('btn-save-schedule').addEventListener('click', async () => {
+    const scheduledTime = document.getElementById('sched-new-time').value;
+    const sanUsername = document.getElementById('sched-san-username').value.trim() || undefined;
+    const sanPassword = document.getElementById('sched-san-password').value || undefined;
+    const vehicleNumber = document.getElementById('sched-vehicle').value.trim() || undefined;
+    const errEl = document.getElementById('sched-error');
+    errEl.textContent = '';
+
+    const btn = document.getElementById('btn-save-schedule');
+    btn.innerHTML = '<span class="spinner"></span> Saving…'; btn.disabled = true;
+
+    try {
+      const body = { scheduledTime };
+      if (sanUsername) body.sanUsername = sanUsername;
+      if (sanPassword) body.sanPassword = sanPassword;
+      if (vehicleNumber) body.vehicleNumber = vehicleNumber;
+
+      driverProfile = await api('/api/driver/profile', { method: 'PUT', body: JSON.stringify(body) });
+      document.getElementById('sched-current-time').textContent = driverProfile.scheduled_time;
+      document.getElementById('stat-time').textContent = driverProfile.scheduled_time;
+      showToast('Schedule updated ✓');
+    } catch (err) {
+      errEl.textContent = err.message;
+    } finally {
+      btn.innerHTML = 'Save Changes'; btn.disabled = false;
+    }
+  });
+
+  // ─── History ─────────────────────────────────────────────────────────────
+  async function loadHistory() {
+    const el = document.getElementById('history-list');
+    try {
+      const data = await api('/api/driver/logs?limit=30');
+      if (!data.logs.length) {
+        el.innerHTML = '<div style="color:var(--muted);text-align:center;padding:40px 0;">No history yet</div>';
+        return;
+      }
+      el.innerHTML = data.logs.map(log => {
+        const s = { success: ['✅','badge-success'], already_queued: ['✅','badge-success'], failed: ['❌','badge-failed'], pending: ['⏳','badge-pending'] }[log.status] || ['⏳','badge-pending'];
+        return `
+          <div style="background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px;margin-bottom:10px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+              <span style="font-weight:600;">${formatDate(log.triggered_at)}</span>
+              <span class="status-badge ${s[1]}"><span class="badge-dot"></span>${log.status.replace('_',' ')}</span>
+            </div>
+            ${log.queue_position ? `<div style="display:flex;gap:16px;margin-top:8px;">
+              <div><span style="font-size:11px;color:var(--muted);">POS </span><strong style="color:var(--teal)">#${log.queue_position}</strong></div>
+              <div><span style="font-size:11px;color:var(--muted);">LOC </span><strong>${log.queue_location || '—'}</strong></div>
+              <div><span style="font-size:11px;color:var(--muted);">TIME </span><strong>${log.queue_time || '—'}</strong></div>
+            </div>` : ''}
+            ${log.error_message ? `<div style="font-size:12px;color:var(--red);margin-top:6px;">${log.error_message}</div>` : ''}
+            <div style="font-size:11px;color:var(--muted);margin-top:8px;">${log.trigger_type === 'manual' ? '🔧 Manually triggered' : '🤖 Auto-scheduled'}</div>
+          </div>`;
+      }).join('');
+    } catch (err) {
+      el.innerHTML = `<div style="color:var(--red);text-align:center;padding:32px;">${err.message}</div>`;
+    }
+  }
+
+  // ─── Helpers ─────────────────────────────────────────────────────────────
+  function formatDate(iso) {
+    if (!iso) return '—';
+    return new Date(iso).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  }
+  function formatTime(iso) {
+    if (!iso) return '—';
+    return new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+  }
+
+  // ─── Boot ────────────────────────────────────────────────────────────────
+  if (authToken) {
+    showView('view-dashboard');
+  } else {
+    showView('view-login');
+  }
+</script>
+</body>
+</html>

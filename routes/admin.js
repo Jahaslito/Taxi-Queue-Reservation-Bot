@@ -178,8 +178,9 @@ router.get('/logs', (req, res) => {
   const limit  = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = parseInt(req.query.offset) || 0;
   const driverId = req.query.driverId;
-  const status = req.query.status;
-  const date = req.query.date; // YYYY-MM-DD
+  const status   = req.query.status;
+  const date     = req.query.date;   // YYYY-MM-DD
+  const search   = req.query.search; // driver name or vehicle number
 
   let query = `
     SELECT l.*, d.name as driver_name, d.vehicle_number
@@ -192,6 +193,7 @@ router.get('/logs', (req, res) => {
   if (driverId) { query += ' AND l.driver_id = ?'; params.push(driverId); }
   if (status)   { query += ' AND l.status = ?'; params.push(status); }
   if (date)     { query += ' AND date(l.triggered_at) = ?'; params.push(date); }
+  if (search)   { query += ' AND (d.name LIKE ? OR d.vehicle_number LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
 
   query += ' ORDER BY l.triggered_at DESC LIMIT ? OFFSET ?';
   params.push(limit, offset);

@@ -393,6 +393,7 @@
     </div>
 
     <div class="filter-bar">
+      <input class="search-input" id="log-search" placeholder="Driver name or taxi number…" />
       <input class="search-input" id="log-date-filter" type="date" style="max-width:180px;" />
       <select class="search-input" id="log-status-filter" style="max-width:160px;">
         <option value="">All Statuses</option>
@@ -633,6 +634,12 @@
     searchTimeout = setTimeout(loadDrivers, 300);
   });
 
+  let logSearchTimeout;
+  document.getElementById('log-search').addEventListener('input', () => {
+    clearTimeout(logSearchTimeout);
+    logSearchTimeout = setTimeout(loadLogs, 300);
+  });
+
   async function triggerDriver(id, name) {
     if (!confirm(`Run bot now for ${name}?`)) return;
     try {
@@ -735,11 +742,13 @@
     const container = document.getElementById('logs-container');
     container.innerHTML = '<div style="color:var(--muted2);text-align:center;padding:32px;"><span class="spinner"></span></div>';
 
-    const date = document.getElementById('log-date-filter').value;
+    const search = document.getElementById('log-search').value.trim();
+    const date   = document.getElementById('log-date-filter').value;
     const status = document.getElementById('log-status-filter').value;
 
     let url = '/api/admin/logs?limit=50';
-    if (date) url += `&date=${date}`;
+    if (search) url += `&search=${encodeURIComponent(search)}`;
+    if (date)   url += `&date=${date}`;
     if (status) url += `&status=${status}`;
 
     try {

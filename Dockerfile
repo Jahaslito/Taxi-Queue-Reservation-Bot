@@ -1,19 +1,16 @@
-# Use the official Playwright image — has all browser deps pre-installed
+# Use the official Playwright image — has all Chromium dependencies pre-installed
 FROM mcr.microsoft.com/playwright:v1.42.1-jammy
 
 WORKDIR /app
 
-# Install dependencies first (cache layer)
+# Install Node dependencies first (separate layer for better caching)
 COPY package*.json ./
-RUN npm install
+RUN npm ci --omit=dev
 
-# Copy application code
+# Copy application source
 COPY . .
 
-# Create persistent data directory for SQLite
-RUN mkdir -p data
-
-# Expose port
+# Expose HTTP port
 EXPOSE 3000
 
 CMD ["node", "server.js"]

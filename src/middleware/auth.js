@@ -1,6 +1,6 @@
 const jwt = require('jsonwebtoken');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'change-this-jwt-secret-in-production';
+const JWT_SECRET = process.env.JWT_SECRET;
 
 function authenticateDriver(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];

@@ -5,7 +5,7 @@ const TABLE = 'drivers';
 // Columns safe to return to API consumers (excludes credentials)
 const PUBLIC_FIELDS = [
   'id', 'name', 'phone', 'email', 'san_username',
-  'vehicle_number', 'scheduled_time', 'is_active', 'notes', 'created_at',
+  'vehicle_number', 'scheduled_time', 'scheduled_days', 'day_schedules', 'is_active', 'notes', 'created_at',
 ];
 
 class Driver {
@@ -30,6 +30,11 @@ class Driver {
   /** Used by the scheduler — returns all columns so san_password is available for decryption */
   static findActiveByScheduledTime(scheduledTime) {
     return db(TABLE).where({ is_active: true, scheduled_time: scheduledTime });
+  }
+
+  /** Returns all active drivers (all columns) for the new day_schedules-based scheduler */
+  static findAllActive() {
+    return db(TABLE).select(PUBLIC_FIELDS.concat(['san_password'])).where({ is_active: true });
   }
 
   static async create(data) {
@@ -72,7 +77,7 @@ class Driver {
     return db('drivers as d')
       .select(
         'd.id', 'd.name', 'd.phone', 'd.email', 'd.san_username',
-        'd.vehicle_number', 'd.scheduled_time', 'd.is_active', 'd.notes', 'd.created_at',
+        'd.vehicle_number', 'd.scheduled_time', 'd.scheduled_days', 'd.day_schedules', 'd.is_active', 'd.notes', 'd.created_at',
         'l.status         as last_status',
         'l.queue_position as last_position',
         'l.triggered_at   as last_run',

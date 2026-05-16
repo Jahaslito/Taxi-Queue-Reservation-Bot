@@ -132,26 +132,42 @@ function startScheduler() {
 
   cron.schedule('* * * * *', async () => {
     try {
-      // Resolve current HH:MM in Pacific Time
-      const now       = new Date();
+      // Get current HH:MM and day-of-week in Pacific Time
+      const now = new Date();
       const formatter = new Intl.DateTimeFormat('en-US', {
-        hour:     '2-digit',
-        minute:   '2-digit',
-        hour12:   false,
-        timeZone: 'America/Los_Angeles',
+        hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'America/Los_Angeles',
       });
-      const parts       = formatter.formatToParts(now);
-      const hour        = parts.find((p) => p.type === 'hour').value;
-      const minute      = parts.find((p) => p.type === 'minute').value;
+      const parts = formatter.formatToParts(now);
+      const hour = parts.find(p => p.type === 'hour').value;
+      const minute = parts.find(p => p.type === 'minute').value;
       const currentTime = `${hour}:${minute}`;
 
-      const drivers = await Driver.findActiveByScheduledTime(currentTime);
+      const dayOfWeekStr = new Date().toLocaleDateString('en-US', {
+        weekday: 'short', timeZone: 'America/Los_Angeles',
+      });
+      const dayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+      const todayDay = String(dayMap[dayOfWeekStr]);
+      const today = now.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+
+      // Fetch all active drivers
+      const allDrivers = await Driver.findAllActive();
+
+      // Filter to those scheduled right now
+      const drivers = allDrivers.filter(driver => {
+        if (driver.day_schedules) {
+          try {
+            const ds = JSON.parse(driver.day_schedules);
+            return ds[todayDay] === currentTime;
+          } catch { return false; }
+        }
+        // Legacy fallback: use scheduled_time + scheduled_days
+        const activeDays = (driver.scheduled_days || '0,1,2,3,4,5,6').split(',').map(String);
+        return activeDays.includes(todayDay) && driver.scheduled_time === currentTime;
+      });
+
       if (!drivers.length) return;
 
       console.log(`[Scheduler] ${currentTime} PT — Found ${drivers.length} driver(s) to process`);
-
-      // "Today" in Pacific Time — consistent with how logs are queried
-      const today = now.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
 
       const driversToRun = [];
       for (const driver of drivers) {

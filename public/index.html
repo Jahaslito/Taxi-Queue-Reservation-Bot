@@ -19,8 +19,12 @@
       --red:    #F05A5B;
       --white:  #F0F4FF;
       --muted:  #7A8AB5;
+      --muted2: #8A94B8;
       --card:   rgba(255,255,255,0.04);
+      --card2:  rgba(255,255,255,0.08);
       --border: rgba(255,255,255,0.08);
+      --text:   #F0F4FF;
+      --accent: #00C2D4;
     }
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -272,11 +276,66 @@
     }
     @keyframes spin { to { transform: rotate(360deg); } }
     .error-msg { color: var(--red); font-size: 13px; margin-top: 8px; }
+    .success-msg { color: var(--green); font-size: 13px; margin-bottom: 12px; }
+    .btn-link { background: none; border: none; color: var(--muted); font-size: 13px; cursor: pointer; padding: 0; text-decoration: underline; text-underline-offset: 3px; }
+    .btn-link:hover { color: var(--text); }
     .info-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 14px; }
     .info-row:last-child { border-bottom: none; }
     .info-row .lbl { color: var(--muted); }
     .info-row .val { font-weight: 500; }
     .big-time { font-family: 'Syne', sans-serif; font-size: 48px; font-weight: 800; color: var(--teal); text-align: center; margin: 16px 0; }
+    .day-picker { display: flex; gap: 8px; margin-top: 4px; }
+    .day-btn {
+      width: 38px; height: 38px; border-radius: 50%;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--muted); font-size: 13px; font-weight: 600;
+      cursor: pointer; transition: all .15s;
+    }
+    .day-btn.active {
+      background: var(--teal);
+      border-color: var(--teal);
+      color: #fff;
+    }
+
+    /* ── Modal overlay (shared) ── */
+    .modal-overlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.7); z-index: 900;
+      align-items: center; justify-content: center;
+    }
+    .modal-overlay.open { display: flex; }
+    .modal {
+      background: var(--navy2); border: 1px solid var(--border);
+      border-radius: 20px; padding: 28px; width: 100%; max-width: 480px;
+      max-height: 90vh; overflow-y: auto;
+    }
+    .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+
+    /* ── Per-day schedule rows ── */
+    .day-sched-row {
+      display: flex; align-items: center; gap: 12px;
+      padding: 10px 0; border-bottom: 1px solid var(--border);
+    }
+    .day-sched-row:last-child { border-bottom: none; }
+    .day-sched-toggle {
+      width: 40px; height: 22px; border-radius: 11px;
+      background: var(--card2); border: 1px solid var(--border);
+      cursor: pointer; position: relative; flex-shrink: 0; transition: background .2s;
+    }
+    .day-sched-toggle.on { background: var(--accent); border-color: var(--accent); }
+    .day-sched-toggle::after {
+      content: ''; position: absolute; top: 2px; left: 2px;
+      width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left .2s;
+    }
+    .day-sched-toggle.on::after { left: 20px; }
+    .day-sched-name { width: 90px; font-size: 14px; font-weight: 600; color: var(--text); }
+    .day-sched-time {
+      flex: 1; padding: 6px 10px; border-radius: 8px;
+      background: var(--card2); border: 1px solid var(--border);
+      color: var(--text); font-size: 14px;
+    }
+    .day-sched-time:disabled { opacity: 0.35; }
   </style>
 </head>
 <body>
@@ -309,8 +368,39 @@
     <div class="mt-4">
       <button class="btn btn-primary" id="btn-login">Log In</button>
     </div>
+    <div style="text-align:center;margin-top:12px;">
+      <button class="btn-link" id="btn-show-forgot">Forgot password?</button>
+    </div>
     <div class="form-divider">or</div>
-    <button class="btn btn-ghost" onclick="showView('view-register')">Create Account</button>
+    <button class="btn btn-ghost" id="btn-show-register">Create Account</button>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════ FORGOT PASSWORD VIEW ════ -->
+<div class="view" id="view-forgot">
+  <header class="app-header">
+    <div class="logo">
+      <div class="logo-dot"></div>
+      <div class="logo-text">SAN <span>Queue</span></div>
+    </div>
+  </header>
+
+  <div style="padding:28px 0 8px;">
+    <h2 style="font-family:'Syne',sans-serif;font-size:24px;font-weight:800;">Reset Password</h2>
+    <p style="color:var(--muted);font-size:14px;margin-top:6px;">Your password will be reset to your vehicle number.</p>
+  </div>
+
+  <div class="form-section">
+    <div class="form-group">
+      <label>Email</label>
+      <input type="email" id="forgot-email" placeholder="your@email.com" autocomplete="email" />
+    </div>
+    <div class="error-msg" id="forgot-error"></div>
+    <div class="success-msg" id="forgot-success" style="display:none;color:var(--green);font-size:13px;margin-bottom:12px;"></div>
+    <button class="btn btn-primary" id="btn-forgot-submit">Reset Password</button>
+    <div style="text-align:center;margin-top:16px;">
+      <button class="btn-link" id="btn-forgot-back">← Back to Login</button>
+    </div>
   </div>
 </div>
 
@@ -384,9 +474,22 @@
       🤖 The bot will automatically add you to the San Diego queue at this time every day.
     </p>
 
+    <div class="form-group">
+      <label class="label">Active Days</label>
+      <div class="day-picker" id="reg-day-picker">
+        <button type="button" class="day-btn active" data-day="0">S</button>
+        <button type="button" class="day-btn active" data-day="1">M</button>
+        <button type="button" class="day-btn active" data-day="2">T</button>
+        <button type="button" class="day-btn active" data-day="3">W</button>
+        <button type="button" class="day-btn active" data-day="4">T</button>
+        <button type="button" class="day-btn active" data-day="5">F</button>
+        <button type="button" class="day-btn active" data-day="6">S</button>
+      </div>
+    </div>
+
     <div class="error-msg" id="reg-error"></div>
     <button class="btn btn-primary" id="btn-register">Create Account</button>
-    <button class="btn btn-ghost mt-4" onclick="showView('view-login')">← Back to Login</button>
+    <button class="btn btn-ghost mt-4" id="btn-back-login">← Back to Login</button>
   </div>
 </div>
 
@@ -403,6 +506,13 @@
   <div class="dash-greeting">
     <div class="sub">Welcome back</div>
     <h2 id="dash-name">Loading…</h2>
+    <div id="dash-date" style="font-size:13px;color:var(--muted2);margin-top:6px;margin-bottom:16px;"></div>
+  </div>
+
+  <!-- Deactivation banner -->
+  <div id="dash-inactive-banner" style="display:none;background:rgba(240,90,91,0.12);border:1px solid rgba(240,90,91,0.35);border-radius:14px;padding:14px 16px;margin-bottom:16px;display:none;">
+    <div style="font-weight:700;color:#F05A5B;margin-bottom:4px;">Account Deactivated</div>
+    <div style="font-size:13px;color:var(--muted2);">Your account has been deactivated. The bot will not run until an admin reactivates it. Contact your administrator for help.</div>
   </div>
 
   <!-- Today's Status -->
@@ -450,16 +560,15 @@
 
   <div class="status-card">
     <div class="card-label">Current Schedule</div>
-    <div class="big-time" id="sched-current-time">--:--</div>
-    <p style="text-align:center;font-size:13px;color:var(--muted);">Pacific Time · Every Day</p>
+    <div id="sched-summary" style="font-size:14px;color:var(--muted);padding:8px 0;">Loading…</div>
   </div>
 
-  <div class="form-group" style="margin-top:20px;">
-    <label>New Check-In Time (Pacific Time)</label>
-    <input type="time" id="sched-new-time" />
-  </div>
+  <button class="btn btn-ghost" id="btn-open-day-sched" style="width:100%;margin-bottom:16px;margin-top:16px;">
+    📅 Configure Weekly Schedule
+  </button>
+  <div class="success-msg" id="sched-success" style="display:none;"></div>
 
-  <div class="section-label" style="margin-top:16px;">Update SAN Credentials</div>
+  <div class="section-label" style="margin-top:8px;">Update SAN Credentials</div>
   <p style="font-size:12px;color:var(--muted);margin-bottom:12px;margin-top:-8px;">Leave blank to keep existing credentials</p>
 
   <div class="form-group">
@@ -497,6 +606,41 @@
   </div>
 </div>
 
+<!-- ════════════════════════════════════════════════ ACCOUNT VIEW ════ -->
+<div class="view with-nav" id="view-account">
+  <header class="app-header">
+    <div class="logo">
+      <div class="logo-dot"></div>
+      <div class="logo-text">SAN <span>Queue</span></div>
+    </div>
+    <button class="menu-btn visible" id="btn-logout-account" title="Logout">⎋</button>
+  </header>
+
+  <div style="padding:28px 0 20px;">
+    <h2 style="font-family:'Syne',sans-serif;font-size:24px;font-weight:800;">Account</h2>
+    <p style="color:var(--muted);font-size:14px;margin-top:6px;">Manage your login password</p>
+  </div>
+
+  <div class="status-card">
+    <div class="card-label">Change Password</div>
+    <div class="form-group" style="margin-top:12px;">
+      <label>Current Password</label>
+      <input type="password" id="cp-current" placeholder="Your current password" autocomplete="current-password" />
+    </div>
+    <div class="form-group">
+      <label>New Password</label>
+      <input type="password" id="cp-new" placeholder="At least 6 characters" autocomplete="new-password" />
+    </div>
+    <div class="form-group">
+      <label>Confirm New Password</label>
+      <input type="password" id="cp-confirm" placeholder="Repeat new password" autocomplete="new-password" />
+    </div>
+    <div class="error-msg" id="cp-error"></div>
+    <div class="success-msg" id="cp-success" style="display:none;color:var(--green);font-size:13px;margin-bottom:12px;"></div>
+    <button class="btn btn-primary" id="btn-change-password">Update Password</button>
+  </div>
+</div>
+
 <!-- ════════════════════════════════════════════════ NAV BAR ════ -->
 <nav class="nav-bar" id="main-nav" style="display:none;">
   <button class="nav-item active" data-view="view-dashboard">
@@ -511,22 +655,48 @@
     <span class="nav-icon">📋</span>
     History
   </button>
+  <button class="nav-item" data-view="view-account">
+    <span class="nav-icon">👤</span>
+    Account
+  </button>
 </nav>
+
+<!-- Per-day schedule modal -->
+<div class="modal-overlay" id="day-schedule-modal">
+  <div class="modal" style="max-width:380px;width:100%;">
+    <h2 style="margin-bottom:4px;">Weekly Schedule</h2>
+    <p style="font-size:13px;color:var(--muted2);margin-bottom:20px;">Set your login time for each day. Toggle a day off to skip it.</p>
+    <div id="day-schedule-rows"></div>
+    <div class="modal-actions" style="margin-top:20px;">
+      <button class="btn btn-ghost" id="btn-day-sched-cancel">Cancel</button>
+      <button class="btn btn-primary" id="btn-day-sched-save">Save Schedule</button>
+    </div>
+  </div>
+</div>
 
 <!-- Toast -->
 <div class="toast" id="toast"></div>
 
 <script>
   const API = '';  // Same origin
-  let authToken = localStorage.getItem('driverToken');
   let driverProfile = null;
+
+  function esc(s) {
+    if (s == null) return '';
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
 
   // ─── Navigation ──────────────────────────────────────────────────────────
   function showView(viewId) {
     document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
     document.getElementById(viewId).classList.add('active');
 
-    const isLoggedIn = ['view-dashboard', 'view-schedule', 'view-history'].includes(viewId);
+    const isLoggedIn = ['view-dashboard', 'view-schedule', 'view-history', 'view-account'].includes(viewId);
     document.getElementById('main-nav').style.display = isLoggedIn ? 'flex' : 'none';
 
     // Update nav active state
@@ -555,14 +725,100 @@
   }
 
   // ─── API helper ──────────────────────────────────────────────────────────
+  function friendlyNetworkError() {
+    if (location.protocol === 'https:') {
+      return 'Connection failed — please open this page using http:// instead of https://';
+    }
+    return 'Cannot connect to the server. Please make sure the server is running.';
+  }
+
+  function friendlyHttpError(status, serverMsg) {
+    if (status === 401) return 'Invalid email or password.';
+    if (status === 429) return 'Too many attempts. Please wait 15 minutes and try again.';
+    if (status === 403) return 'Access denied.';
+    if (status === 404) return 'Resource not found.';
+    if (status >= 500)  return 'Server error. Please try again in a moment.';
+    return serverMsg || 'Something went wrong. Please try again.';
+  }
+
   async function api(path, options = {}) {
-    const headers = { 'Content-Type': 'application/json' };
-    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
-    const res = await fetch(API + path, { ...options, headers });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Request failed');
+    let res;
+    try {
+      res = await fetch(API + path, {
+        ...options,
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+      });
+    } catch {
+      throw new Error(friendlyNetworkError());
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(friendlyHttpError(res.status, data.error));
     return data;
   }
+
+  // ─── Day picker helpers ───────────────────────────────────────────────────
+  function getDayPickerValue(pickerId) {
+    const btns = document.querySelectorAll(`#${pickerId} .day-btn`);
+    const active = [];
+    btns.forEach(btn => { if (btn.classList.contains('active')) active.push(btn.dataset.day); });
+    return active.join(',') || '0,1,2,3,4,5,6';
+  }
+
+  function setDayPickerValue(pickerId, value) {
+    const days = (value || '0,1,2,3,4,5,6').split(',').map(Number);
+    const btns = document.querySelectorAll(`#${pickerId} .day-btn`);
+    btns.forEach(btn => {
+      btn.classList.toggle('active', days.includes(Number(btn.dataset.day)));
+    });
+  }
+
+  // Wire day-btn clicks (event delegation on each picker)
+  ['reg-day-picker', 'sched-day-picker'].forEach(pickerId => {
+    const picker = document.getElementById(pickerId);
+    if (picker) {
+      picker.addEventListener('click', e => {
+        const btn = e.target.closest('.day-btn');
+        if (btn) btn.classList.toggle('active');
+      });
+    }
+  });
+
+  document.getElementById('btn-show-register').addEventListener('click', () => showView('view-register'));
+  document.getElementById('btn-back-login').addEventListener('click', () => showView('view-login'));
+  document.getElementById('btn-show-forgot').addEventListener('click', () => {
+    document.getElementById('forgot-error').textContent = '';
+    document.getElementById('forgot-success').style.display = 'none';
+    document.getElementById('forgot-email').value = '';
+    showView('view-forgot');
+  });
+  document.getElementById('btn-forgot-back').addEventListener('click', () => showView('view-login'));
+
+  // ─── Forgot Password ─────────────────────────────────────────────────────
+  document.getElementById('btn-forgot-submit').addEventListener('click', async () => {
+    const email  = document.getElementById('forgot-email').value.trim();
+    const errEl  = document.getElementById('forgot-error');
+    const okEl   = document.getElementById('forgot-success');
+    errEl.textContent = ''; okEl.style.display = 'none';
+
+    if (!email) { errEl.textContent = 'Please enter your email address.'; return; }
+
+    const btn = document.getElementById('btn-forgot-submit');
+    btn.innerHTML = '<span class="spinner"></span> Sending…'; btn.disabled = true;
+
+    try {
+      const data = await api('/api/auth/driver/reset-password', {
+        method: 'POST', body: JSON.stringify({ email }),
+      });
+      okEl.textContent = data.message + ' Your new password is your vehicle number.';
+      okEl.style.display = 'block';
+      document.getElementById('forgot-email').value = '';
+    } catch (err) {
+      errEl.textContent = err.message;
+    } finally {
+      btn.innerHTML = 'Reset Password'; btn.disabled = false;
+    }
+  });
 
   // ─── Login ───────────────────────────────────────────────────────────────
   document.getElementById('btn-login').addEventListener('click', async () => {
@@ -578,10 +834,7 @@
 
     try {
       const body = { email: identifier, appPassword: password };
-
       const data = await api('/api/auth/driver/login', { method: 'POST', body: JSON.stringify(body) });
-      authToken = data.token;
-      localStorage.setItem('driverToken', authToken);
       driverProfile = data.driver;
       showView('view-dashboard');
     } catch (err) {
@@ -603,6 +856,7 @@
     const hour = document.getElementById('reg-time-hour').value;
     const min  = document.getElementById('reg-time-min').value;
     const scheduledTime = `${hour}:${min}`;
+    const scheduledDays = getDayPickerValue('reg-day-picker');
     const errEl = document.getElementById('reg-error');
     errEl.textContent = '';
 
@@ -616,10 +870,8 @@
     try {
       const data = await api('/api/auth/driver/register', {
         method: 'POST',
-        body: JSON.stringify({ name, phone, email, appPassword, sanUsername, sanPassword, vehicleNumber, scheduledTime })
+        body: JSON.stringify({ name, phone, email, appPassword, sanUsername, sanPassword, vehicleNumber, scheduledTime, scheduledDays })
       });
-      authToken = data.token;
-      localStorage.setItem('driverToken', authToken);
       driverProfile = data.driver;
       showToast('Account created! Welcome 🎉');
       showView('view-dashboard');
@@ -631,12 +883,45 @@
   });
 
   // ─── Logout ──────────────────────────────────────────────────────────────
-  document.getElementById('btn-logout-menu').addEventListener('click', () => {
-    if (!confirm('Log out?')) return;
-    localStorage.removeItem('driverToken');
-    authToken = null;
+  async function doLogout() {
+    await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' }).catch(() => {});
     driverProfile = null;
     showView('view-login');
+  }
+  document.getElementById('btn-logout-menu').addEventListener('click', doLogout);
+  document.getElementById('btn-logout-account').addEventListener('click', doLogout);
+
+  // ─── Change Password ─────────────────────────────────────────────────────
+  document.getElementById('btn-change-password').addEventListener('click', async () => {
+    const current  = document.getElementById('cp-current').value;
+    const newPass  = document.getElementById('cp-new').value;
+    const confirm  = document.getElementById('cp-confirm').value;
+    const errEl    = document.getElementById('cp-error');
+    const okEl     = document.getElementById('cp-success');
+    errEl.textContent = ''; okEl.style.display = 'none';
+
+    if (!current || !newPass || !confirm) { errEl.textContent = 'Please fill in all fields.'; return; }
+    if (newPass.length < 6)               { errEl.textContent = 'New password must be at least 6 characters.'; return; }
+    if (newPass !== confirm)              { errEl.textContent = 'Passwords do not match.'; return; }
+
+    const btn = document.getElementById('btn-change-password');
+    btn.innerHTML = '<span class="spinner"></span>'; btn.disabled = true;
+
+    try {
+      await api('/api/driver/profile', {
+        method: 'PUT',
+        body: JSON.stringify({ currentPassword: current, newAppPassword: newPass }),
+      });
+      okEl.textContent = 'Password updated successfully.';
+      okEl.style.display = 'block';
+      document.getElementById('cp-current').value = '';
+      document.getElementById('cp-new').value = '';
+      document.getElementById('cp-confirm').value = '';
+    } catch (err) {
+      errEl.textContent = err.message;
+    } finally {
+      btn.innerHTML = 'Update Password'; btn.disabled = false;
+    }
   });
 
   // ─── Dashboard ───────────────────────────────────────────────────────────
@@ -646,8 +931,12 @@
         driverProfile = await api('/api/driver/profile');
       }
       document.getElementById('dash-name').textContent = driverProfile.name;
-      document.getElementById('stat-time').textContent = driverProfile.scheduled_time;
+      document.getElementById('dash-date').textContent = new Date().toLocaleDateString('en-GB', {
+        weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'
+      });
+      document.getElementById('stat-time').textContent = driverProfile.scheduled_time || '--:--';
       document.getElementById('stat-vehicle').textContent = driverProfile.vehicle_number;
+      document.getElementById('dash-inactive-banner').style.display = driverProfile.is_active ? 'none' : 'block';
 
       const statusData = await api('/api/driver/status/today');
       renderTodayStatus(statusData.todayLog);
@@ -689,13 +978,13 @@
       ${log.queue_position ? `
         <div style="display:flex;gap:20px;">
           <div><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;">Position</div>
-            <div style="font-family:'Syne',sans-serif;font-size:28px;font-weight:700;color:var(--teal);">${log.queue_position}</div></div>
+            <div style="font-family:'Syne',sans-serif;font-size:28px;font-weight:700;color:var(--teal);">${esc(log.queue_position)}</div></div>
           <div><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;">Location</div>
-            <div style="font-size:16px;font-weight:600;margin-top:4px;">${log.queue_location || 'N/A'}</div></div>
+            <div style="font-size:16px;font-weight:600;margin-top:4px;">${esc(log.queue_location) || 'N/A'}</div></div>
           <div><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;">Queue Time</div>
-            <div style="font-size:16px;font-weight:600;margin-top:4px;">${log.queue_time || 'N/A'}</div></div>
+            <div style="font-size:16px;font-weight:600;margin-top:4px;">${esc(log.queue_time) || 'N/A'}</div></div>
         </div>` : ''}
-      ${log.error_message ? `<div style="font-size:13px;color:var(--red);margin-top:8px;">${log.error_message}</div>` : ''}`;
+      ${log.error_message ? `<div style="font-size:13px;color:var(--red);margin-top:8px;">${esc(log.error_message)}</div>` : ''}`;
   }
 
   function renderDashLogs(logs) {
@@ -712,7 +1001,7 @@
           <div class="log-icon ${clsMap[log.status]}">${iconMap[log.status] || '⏳'}</div>
           <div class="log-details">
             <div class="log-date">${formatDate(log.triggered_at)}</div>
-            <div class="log-meta">${log.queue_location || log.error_message || log.status}</div>
+            <div class="log-meta">${esc(log.queue_location || log.error_message || log.status)}</div>
           </div>
           ${log.queue_position ? `<div class="log-pos">#${log.queue_position}</div>` : ''}
         </div>`;
@@ -720,17 +1009,43 @@
   }
 
   // ─── Schedule ────────────────────────────────────────────────────────────
+  const DAY_NAMES = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+  const DAY_SHORT = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+  function renderSchedSummary() {
+    const el = document.getElementById('sched-summary');
+    if (!driverProfile) { el.textContent = 'Loading…'; return; }
+    if (driverProfile.day_schedules) {
+      try {
+        const ds = JSON.parse(driverProfile.day_schedules);
+        const lines = [];
+        for (let d = 0; d < 7; d++) {
+          const t = ds[String(d)];
+          if (t) lines.push(`<span style="color:var(--white);font-weight:600;">${DAY_SHORT[d]}</span> <span style="color:var(--teal);">${t}</span> PT`);
+        }
+        el.innerHTML = lines.length ? lines.join(' &nbsp;·&nbsp; ') : '<span style="color:var(--muted);">No active days configured</span>';
+        return;
+      } catch { /* fall through */ }
+    }
+    // Legacy fallback
+    const time = driverProfile.scheduled_time || '--:--';
+    const days = (driverProfile.scheduled_days || '0,1,2,3,4,5,6').split(',').map(n => DAY_SHORT[Number(n)]).filter(Boolean);
+    el.innerHTML = `<span style="color:var(--teal);font-weight:700;">${time}</span> PT &nbsp;·&nbsp; ${days.join(', ')}`;
+  }
+
   function loadSchedule() {
     if (!driverProfile) return;
-    document.getElementById('sched-current-time').textContent = driverProfile.scheduled_time;
-    document.getElementById('sched-new-time').value = driverProfile.scheduled_time;
+    renderSchedSummary();
     document.getElementById('sched-san-username').value = '';
     document.getElementById('sched-san-password').value = '';
     document.getElementById('sched-vehicle').value = '';
   }
 
+  document.getElementById('btn-open-day-sched').addEventListener('click', () => {
+    openDayScheduleModal(driverProfile || null);
+  });
+
   document.getElementById('btn-save-schedule').addEventListener('click', async () => {
-    const scheduledTime = document.getElementById('sched-new-time').value;
     const sanUsername = document.getElementById('sched-san-username').value.trim() || undefined;
     const sanPassword = document.getElementById('sched-san-password').value || undefined;
     const vehicleNumber = document.getElementById('sched-vehicle').value.trim() || undefined;
@@ -741,21 +1056,110 @@
     btn.innerHTML = '<span class="spinner"></span> Saving…'; btn.disabled = true;
 
     try {
-      const body = { scheduledTime };
+      const body = {};
       if (sanUsername) body.sanUsername = sanUsername;
       if (sanPassword) body.sanPassword = sanPassword;
       if (vehicleNumber) body.vehicleNumber = vehicleNumber;
 
       driverProfile = await api('/api/driver/profile', { method: 'PUT', body: JSON.stringify(body) });
-      document.getElementById('sched-current-time').textContent = driverProfile.scheduled_time;
-      document.getElementById('stat-time').textContent = driverProfile.scheduled_time;
-      showToast('Schedule updated ✓');
+      document.getElementById('stat-time').textContent = driverProfile.scheduled_time || '--:--';
+      showToast('Credentials updated ✓');
     } catch (err) {
       errEl.textContent = err.message;
     } finally {
       btn.innerHTML = 'Save Changes'; btn.disabled = false;
     }
   });
+
+  // ─── Per-day schedule modal ───────────────────────────────────────────────
+  function buildDayScheduleRows(daySchedules) {
+    const container = document.getElementById('day-schedule-rows');
+    container.innerHTML = '';
+    for (let d = 0; d < 7; d++) {
+      const key = String(d);
+      const time = daySchedules[key];
+      const active = time !== null && time !== undefined;
+      const row = document.createElement('div');
+      row.className = 'day-sched-row';
+      row.innerHTML = `
+        <div class="day-sched-toggle ${active ? 'on' : ''}" data-day="${d}"></div>
+        <span class="day-sched-name">${DAY_NAMES[d]}</span>
+        <input type="time" class="day-sched-time" data-day="${d}" value="${time || '05:00'}" ${active ? '' : 'disabled'}>
+      `;
+      container.appendChild(row);
+      row.querySelector('.day-sched-toggle').addEventListener('click', function() {
+        this.classList.toggle('on');
+        const input = row.querySelector('.day-sched-time');
+        input.disabled = !this.classList.contains('on');
+      });
+    }
+  }
+
+  function readDayScheduleRows() {
+    const ds = {};
+    document.querySelectorAll('.day-sched-row').forEach(row => {
+      const toggle = row.querySelector('.day-sched-toggle');
+      const input  = row.querySelector('.day-sched-time');
+      const d = toggle.dataset.day;
+      ds[d] = toggle.classList.contains('on') ? input.value : null;
+    });
+    return JSON.stringify(ds);
+  }
+
+  function openDayScheduleModal(profile) {
+    let ds = {};
+    const daySchedulesStr = typeof profile === 'string' ? profile : (profile && profile.day_schedules);
+    if (daySchedulesStr) {
+      try { ds = JSON.parse(daySchedulesStr); } catch {}
+    } else if (profile && typeof profile === 'object') {
+      // Legacy fallback: build from scheduled_days + scheduled_time
+      const activeDays = (profile.scheduled_days || '0,1,2,3,4,5,6').split(',').map(String);
+      for (let d = 0; d < 7; d++) {
+        ds[String(d)] = activeDays.includes(String(d)) ? (profile.scheduled_time || '05:00') : null;
+      }
+    }
+    buildDayScheduleRows(ds);
+    document.getElementById('day-schedule-modal').classList.add('open');
+  }
+
+  document.getElementById('btn-day-sched-cancel').addEventListener('click', () => {
+    document.getElementById('day-schedule-modal').classList.remove('open');
+  });
+
+  document.getElementById('btn-day-sched-save').addEventListener('click', async () => {
+    const daySchedules = readDayScheduleRows();
+    const ds = JSON.parse(daySchedules);
+    const activeDays = Object.keys(ds).filter(k => ds[k] !== null);
+    const times = activeDays.map(k => ds[k]).filter(Boolean);
+    const scheduledTime = times[0] || '05:00';
+    const scheduledDays = activeDays.join(',') || '0,1,2,3,4,5,6';
+    try {
+      setError('sched-error', '');
+      driverProfile = await api('/api/driver/profile', {
+        method: 'PUT',
+        body: JSON.stringify({ daySchedules, scheduledTime, scheduledDays }),
+      });
+      document.getElementById('day-schedule-modal').classList.remove('open');
+      showSuccess('sched-success', 'Schedule saved!');
+      renderSchedSummary();
+      document.getElementById('stat-time').textContent = driverProfile.scheduled_time || '--:--';
+    } catch (err) {
+      setError('sched-error', err.message);
+    }
+  });
+
+  function setError(id, msg) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = msg;
+  }
+
+  function showSuccess(id, msg) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = msg;
+    el.style.display = 'block';
+    setTimeout(() => { el.style.display = 'none'; }, 3000);
+  }
 
   // ─── History ─────────────────────────────────────────────────────────────
   async function loadHistory() {
@@ -775,11 +1179,11 @@
               <span class="status-badge ${s[1]}"><span class="badge-dot"></span>${log.status.replace('_',' ')}</span>
             </div>
             ${log.queue_position ? `<div style="display:flex;gap:16px;margin-top:8px;">
-              <div><span style="font-size:11px;color:var(--muted);">POS </span><strong style="color:var(--teal)">#${log.queue_position}</strong></div>
-              <div><span style="font-size:11px;color:var(--muted);">LOC </span><strong>${log.queue_location || '—'}</strong></div>
-              <div><span style="font-size:11px;color:var(--muted);">TIME </span><strong>${log.queue_time || '—'}</strong></div>
+              <div><span style="font-size:11px;color:var(--muted);">POS </span><strong style="color:var(--teal)">#${esc(log.queue_position)}</strong></div>
+              <div><span style="font-size:11px;color:var(--muted);">LOC </span><strong>${esc(log.queue_location) || '—'}</strong></div>
+              <div><span style="font-size:11px;color:var(--muted);">TIME </span><strong>${esc(log.queue_time) || '—'}</strong></div>
             </div>` : ''}
-            ${log.error_message ? `<div style="font-size:12px;color:var(--red);margin-top:6px;">${log.error_message}</div>` : ''}
+            ${log.error_message ? `<div style="font-size:12px;color:var(--red);margin-top:6px;">${esc(log.error_message)}</div>` : ''}
             <div style="font-size:11px;color:var(--muted);margin-top:8px;">${log.trigger_type === 'manual' ? '🔧 Manually triggered' : '🤖 Auto-scheduled'}</div>
           </div>`;
       }).join('');
@@ -799,11 +1203,14 @@
   }
 
   // ─── Boot ────────────────────────────────────────────────────────────────
-  if (authToken) {
-    showView('view-dashboard');
-  } else {
-    showView('view-login');
-  }
+  (async () => {
+    try {
+      driverProfile = await api('/api/driver/profile');
+      showView('view-dashboard');
+    } catch {
+      showView('view-login');
+    }
+  })();
 </script>
 </body>
 </html>

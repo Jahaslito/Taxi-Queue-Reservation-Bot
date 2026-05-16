@@ -1,9 +1,12 @@
 const jwt = require('jsonwebtoken');
+const { jwtSecret: JWT_SECRET } = require('../config/env');
 
-const JWT_SECRET = process.env.JWT_SECRET;
+function extractToken(req) {
+  return req.cookies?.token || req.headers.authorization?.split(' ')[1];
+}
 
 function authenticateDriver(req, res, next) {
-  const token = req.headers.authorization?.split(' ')[1];
+  const token = extractToken(req);
   if (!token) return res.status(401).json({ error: 'No token provided' });
 
   try {
@@ -17,7 +20,7 @@ function authenticateDriver(req, res, next) {
 }
 
 function authenticateAdmin(req, res, next) {
-  const token = req.headers.authorization?.split(' ')[1];
+  const token = extractToken(req);
   if (!token) return res.status(401).json({ error: 'No token provided' });
 
   try {

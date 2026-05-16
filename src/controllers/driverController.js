@@ -26,12 +26,43 @@ async function updateProfile(req, res, next) {
       throw err;
     }
 
-    const { name, phone, scheduledTime, sanUsername, sanPassword, vehicleNumber, newAppPassword } = req.body;
+    const { name, phone, scheduledTime, scheduledDays, daySchedules, sanUsername, sanPassword, vehicleNumber, currentPassword, newAppPassword } = req.body;
+
+    if (newAppPassword) {
+      if (!currentPassword) {
+        const err = new Error('Current password is required to set a new password');
+        err.statusCode = 400;
+        throw err;
+      }
+      const match = await bcrypt.compare(currentPassword, driver.app_password);
+      if (!match) {
+        const err = new Error('Current password is incorrect');
+        err.statusCode = 400;
+        throw err;
+      }
+    }
+
+    // Derive legacy fields from daySchedules for backward compatibility
+    let derivedScheduledTime = scheduledTime || driver.scheduled_time;
+    let derivedScheduledDays = scheduledDays !== undefined ? scheduledDays : driver.scheduled_days;
+    let derivedDaySchedules = daySchedules !== undefined ? daySchedules : driver.day_schedules;
+
+    if (daySchedules !== undefined) {
+      try {
+        const ds = JSON.parse(daySchedules);
+        const activeDays = Object.keys(ds).filter(k => ds[k] !== null);
+        const times = activeDays.map(k => ds[k]).filter(Boolean);
+        derivedScheduledTime = times[0] || driver.scheduled_time || '05:00';
+        derivedScheduledDays = activeDays.join(',') || driver.scheduled_days || '0,1,2,3,4,5,6';
+      } catch { /* keep existing values */ }
+    }
 
     const updated = await Driver.update(req.driverId, {
       name:           name           || driver.name,
       phone:          phone          !== undefined ? phone : driver.phone,
-      scheduled_time: scheduledTime  || driver.scheduled_time,
+      scheduled_time: derivedScheduledTime,
+      scheduled_days: derivedScheduledDays,
+      day_schedules:  derivedDaySchedules,
       san_username:   sanUsername    || driver.san_username,
       san_password:   sanPassword    ? encrypt(sanPassword)                  : driver.san_password,
       vehicle_number: vehicleNumber  || driver.vehicle_number,

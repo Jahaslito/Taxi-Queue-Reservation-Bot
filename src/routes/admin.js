@@ -1,5 +1,5 @@
 const { Router } = require('express');
-const { body }   = require('express-validator');
+const { body, param, query } = require('express-validator');
 
 const { authenticateAdmin }  = require('../middleware/auth');
 const { triggerLimiter }     = require('../middleware/rateLimiter');
@@ -10,10 +10,23 @@ const router = Router();
 
 router.use(authenticateAdmin);
 
+const idParam = param('id').isInt({ min: 1 }).withMessage('Driver ID must be a positive integer');
+
 router.get('/stats', adminController.getStats);
 
-router.get('/drivers',     adminController.listDrivers);
-router.get('/drivers/:id', adminController.getDriver);
+router.get(
+  '/drivers',
+  [query('search').optional().trim().isLength({ max: 100 })],
+  validate,
+  adminController.listDrivers,
+);
+
+router.get(
+  '/drivers/:id',
+  [idParam],
+  validate,
+  adminController.getDriver,
+);
 
 router.post(
   '/drivers',
@@ -22,17 +35,56 @@ router.post(
     body('sanUsername').trim().notEmpty().withMessage('SAN username is required'),
     body('sanPassword').notEmpty().withMessage('SAN password is required'),
     body('vehicleNumber').trim().notEmpty().withMessage('Vehicle number is required'),
-    body('scheduledTime').matches(/^\d{2}:\d{2}$/).withMessage('scheduledTime must be HH:MM format'),
+    body('scheduledTime').matches(/^([01]\d|2[0-3]):[0-5]\d$/).withMessage('scheduledTime must be a valid HH:MM time (00:00–23:59)'),
+    body('scheduledDays')
+      .optional({ checkFalsy: true })
+      .matches(/^[0-6](,[0-6]){0,6}$/)
+      .withMessage('scheduledDays must be comma-separated day numbers 0–6'),
   ],
   validate,
   adminController.addDriver,
 );
 
-router.put('/drivers/:id',    adminController.updateDriver);
-router.delete('/drivers/:id', adminController.deactivateDriver);
+router.put(
+  '/drivers/:id',
+  [
+    idParam,
+    body('scheduledDays')
+      .optional({ checkFalsy: true })
+      .matches(/^[0-6](,[0-6]){0,6}$/)
+      .withMessage('scheduledDays must be comma-separated day numbers 0–6'),
+  ],
+  validate,
+  adminController.updateDriver,
+);
 
-router.post('/drivers/:id/trigger', triggerLimiter, adminController.triggerDriver);
+router.delete(
+  '/drivers/:id',
+  [idParam],
+  validate,
+  adminController.deactivateDriver,
+);
 
-router.get('/logs', adminController.getLogs);
+router.post(
+  '/drivers/:id/trigger',
+  [idParam],
+  validate,
+  triggerLimiter,
+  adminController.triggerDriver,
+);
+
+router.get(
+  '/logs',
+  [
+    query('limit').optional().isInt({ min: 1, max: 200 }).toInt(),
+    query('offset').optional().isInt({ min: 0 }).toInt(),
+    query('search').optional().trim().isLength({ max: 100 }),
+    query('date').optional().isDate().withMessage('date must be YYYY-MM-DD'),
+    query('status').optional().isIn(['success', 'already_queued', 'failed', 'pending'])
+      .withMessage('Invalid status value'),
+  ],
+  validate,
+  adminController.getLogs,
+);
 
 module.exports = router;

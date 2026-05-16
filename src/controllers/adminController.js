@@ -78,7 +78,20 @@ async function getDriver(req, res, next) {
 
 async function addDriver(req, res, next) {
   try {
-    const { name, phone, email, sanUsername, sanPassword, vehicleNumber, scheduledTime, notes } = req.body;
+    const { name, phone, email, sanUsername, sanPassword, vehicleNumber, scheduledTime, scheduledDays, daySchedules, notes } = req.body;
+
+    // Build day_schedules JSON
+    let daySchedulesJson;
+    if (daySchedules) {
+      daySchedulesJson = daySchedules;
+    } else {
+      const activeDays = (scheduledDays || '0,1,2,3,4,5,6').split(',').map(String);
+      const ds = {};
+      for (let d = 0; d < 7; d++) {
+        ds[String(d)] = activeDays.includes(String(d)) ? (scheduledTime || '05:00') : null;
+      }
+      daySchedulesJson = JSON.stringify(ds);
+    }
 
     // Admin-added drivers get vehicle number as default app password
     const driver = await Driver.create({
@@ -90,6 +103,8 @@ async function addDriver(req, res, next) {
       san_password:   encrypt(sanPassword),
       vehicle_number: vehicleNumber,
       scheduled_time: scheduledTime,
+      scheduled_days: scheduledDays || '0,1,2,3,4,5,6',
+      day_schedules:  daySchedulesJson,
       notes:          notes  || null,
     });
 
@@ -108,16 +123,34 @@ async function updateDriver(req, res, next) {
       throw err;
     }
 
-    const { name, phone, email, sanUsername, sanPassword, vehicleNumber, scheduledTime, isActive, notes } = req.body;
+    const { name, phone, email, sanUsername, sanPassword, appPassword, vehicleNumber, scheduledTime, scheduledDays, daySchedules, isActive, notes } = req.body;
+
+    // Derive legacy fields from daySchedules for backward compatibility
+    let derivedScheduledTime = scheduledTime ?? driver.scheduled_time;
+    let derivedScheduledDays = scheduledDays !== undefined ? scheduledDays : driver.scheduled_days;
+    let derivedDaySchedules = daySchedules !== undefined ? daySchedules : driver.day_schedules;
+
+    if (daySchedules !== undefined) {
+      try {
+        const ds = JSON.parse(daySchedules);
+        const activeDays = Object.keys(ds).filter(k => ds[k] !== null);
+        const times = activeDays.map(k => ds[k]).filter(Boolean);
+        derivedScheduledTime = times[0] || driver.scheduled_time || '05:00';
+        derivedScheduledDays = activeDays.join(',') || driver.scheduled_days || '0,1,2,3,4,5,6';
+      } catch { /* keep existing values */ }
+    }
 
     const updated = await Driver.update(req.params.id, {
       name:           name           ?? driver.name,
       phone:          phone          ?? driver.phone,
       email:          email          ?? driver.email,
+      app_password:   appPassword    ? await bcrypt.hash(appPassword, 10) : driver.app_password,
       san_username:   sanUsername    ?? driver.san_username,
       san_password:   sanPassword    ? encrypt(sanPassword) : driver.san_password,
       vehicle_number: vehicleNumber  ?? driver.vehicle_number,
-      scheduled_time: scheduledTime  ?? driver.scheduled_time,
+      scheduled_time: derivedScheduledTime,
+      scheduled_days: derivedScheduledDays,
+      day_schedules:  derivedDaySchedules,
       is_active:      isActive       !== undefined ? isActive : driver.is_active,
       notes:          notes          ?? driver.notes,
     });

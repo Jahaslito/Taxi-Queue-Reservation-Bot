@@ -7,6 +7,7 @@ const env = require('./src/config/env');
 const express      = require('express');
 const helmet       = require('helmet');
 const cors         = require('cors');
+const cookieParser = require('cookie-parser');
 const path         = require('path');
 
 const errorHandler = require('./src/middleware/errorHandler');
@@ -14,11 +15,29 @@ const errorHandler = require('./src/middleware/errorHandler');
 const app = express();
 
 // ─── Security middleware ───────────────────────────────────────────────────────
-app.use(helmet());
-app.use(cors({ origin: env.allowedOrigin }));
+app.use(helmet({
+  // HSTS must be disabled for HTTP servers — sending it over HTTP causes
+  // browsers to cache it and then refuse to connect via HTTP.
+  hsts: false,
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc:  ["'self'", "'unsafe-inline'"],
+      styleSrc:   ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+      fontSrc:    ["'self'", 'https://fonts.gstatic.com'],
+      imgSrc:     ["'self'", 'data:'],
+      connectSrc: ["'self'"],
+    },
+  },
+}));
+app.use(cors({
+  origin:      env.allowedOrigin,
+  credentials: true,
+}));
 
 // ─── Body parsing + static files ──────────────────────────────────────────────
 app.use(express.json());
+app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ─── API routes ───────────────────────────────────────────────────────────────

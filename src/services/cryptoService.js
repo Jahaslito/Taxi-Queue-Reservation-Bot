@@ -1,10 +1,10 @@
 const crypto = require('crypto');
+const { encryptionKey } = require('../config/env');
 
 const ALGORITHM = 'aes-256-cbc';
 
 function getKey() {
-  const secret = process.env.ENCRYPTION_KEY;
-  return crypto.scryptSync(secret, 'san-queue-salt', 32);
+  return crypto.scryptSync(encryptionKey, 'san-queue-salt', 32);
 }
 
 function encrypt(text) {

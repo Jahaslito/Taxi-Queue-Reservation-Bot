@@ -6,7 +6,13 @@ const { runBotForDriver }     = require('../services/schedulerService');
 
 async function getStats(req, res, next) {
   try {
-    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+    const now   = new Date();
+    const today = now.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+
+    // Day-of-week index (0=Sun … 6=Sat) in Pacific Time
+    const dayAbbr  = now.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/Los_Angeles' });
+    const DAY_MAP  = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+    const todayDay = String(DAY_MAP[dayAbbr]);
 
     const [
       totalDrivers,
@@ -16,17 +22,41 @@ async function getStats(req, res, next) {
       todayTotal,
       allTimeSuccess,
       allTimeFailed,
-      scheduleBreakdown,
+      allActiveDrivers,
     ] = await Promise.all([
       Driver.count(),
       Driver.count({ activeOnly: true }),
-      Log.countByStatusAndDate('success',        today),
-      Log.countByStatusAndDate('failed',         today),
+      Log.countByStatusAndDate('success', today),
+      Log.countByStatusAndDate('failed',  today),
       Log.countByDate(today),
       Log.countAllByStatus('success'),
       Log.countAllByStatus('failed'),
-      Driver.scheduleBreakdown(),
+      Driver.findAllActive(),          // replaces scheduleBreakdown()
     ]);
+
+    // Build a day-aware breakdown: only count drivers actually scheduled today
+    const timeGroups = {};
+    for (const driver of allActiveDrivers) {
+      let timeForToday = null;
+
+      if (driver.day_schedules) {
+        try {
+          const ds = JSON.parse(driver.day_schedules);
+          timeForToday = ds[todayDay] || null;   // null means not scheduled today
+        } catch { /* malformed JSON — skip */ }
+      } else {
+        // Legacy: scheduled_days comma list + scheduled_time
+        const activeDays = (driver.scheduled_days || '0,1,2,3,4,5,6').split(',').map(String);
+        if (activeDays.includes(todayDay)) timeForToday = driver.scheduled_time;
+      }
+
+      if (!timeForToday) continue;
+      timeGroups[timeForToday] = (timeGroups[timeForToday] || 0) + 1;
+    }
+
+    const scheduleBreakdown = Object.keys(timeGroups)
+      .sort()
+      .map(time => ({ scheduled_time: time, count: timeGroups[time] }));
 
     res.json({
       totalDrivers:  parseInt(totalDrivers.count,  10),
@@ -50,8 +80,16 @@ async function getStats(req, res, next) {
 async function listDrivers(req, res, next) {
   try {
     const { search, active } = req.query;
-    const drivers = await Driver.search({ search, activeOnly: active === 'true' });
-    res.json(drivers);
+    const limit  = Math.min(parseInt(req.query.limit,  10) || 25, 100);
+    const offset = parseInt(req.query.offset, 10) || 0;
+    const filters = { search, activeOnly: active === 'true' };
+
+    const [drivers, countResult] = await Promise.all([
+      Driver.search({ ...filters, limit, offset }),
+      Driver.searchCount(filters),
+    ]);
+
+    res.json({ drivers, total: parseInt(countResult.count, 10), limit, offset });
   } catch (err) {
     next(err);
   }

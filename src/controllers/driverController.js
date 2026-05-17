@@ -2,6 +2,7 @@ const bcrypt        = require('bcryptjs');
 const Driver        = require('../models/Driver');
 const Log           = require('../models/Log');
 const { encrypt }   = require('../services/cryptoService');
+const { runBotForDriver } = require('../services/schedulerService');
 
 async function getProfile(req, res, next) {
   try {
@@ -107,4 +108,21 @@ async function getTodayStatus(req, res, next) {
   }
 }
 
-module.exports = { getProfile, updateProfile, getLogs, getTodayStatus };
+async function triggerSelf(req, res, next) {
+  try {
+    const driver = await Driver.findByIdWithCredentials(req.driverId);
+    if (!driver) {
+      const err = new Error('Driver not found'); err.statusCode = 404; throw err;
+    }
+    if (!driver.is_active) {
+      const err = new Error('Your account is inactive'); err.statusCode = 400; throw err;
+    }
+    // Respond immediately — bot runs in the background
+    res.json({ message: 'Bot triggered — check your History tab for the result.' });
+    runBotForDriver(driver, 'manual').catch(console.error);
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { getProfile, updateProfile, getLogs, getTodayStatus, triggerSelf };

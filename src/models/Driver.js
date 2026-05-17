@@ -67,7 +67,7 @@ class Driver {
    * Full-text search across drivers with their latest log status joined.
    * Used by the admin drivers list endpoint.
    */
-  static search({ search, activeOnly = false } = {}) {
+  static search({ search, activeOnly = false, limit = 25, offset = 0 } = {}) {
     const latestLogSubquery = db('logs')
       .select('id')
       .whereRaw('driver_id = d.id')
@@ -95,7 +95,27 @@ class Driver {
         if (activeOnly) q.where('d.is_active', true);
       })
       .orderBy('d.scheduled_time', 'asc')
-      .orderBy('d.name',           'asc');
+      .orderBy('d.name',           'asc')
+      .limit(limit)
+      .offset(offset);
+  }
+
+  /** Count matching drivers — mirrors the filters from search() for pagination totals */
+  static searchCount({ search, activeOnly = false } = {}) {
+    return db('drivers as d')
+      .modify((q) => {
+        if (search) {
+          q.where((builder) => {
+            builder
+              .whereILike('d.name',           `%${search}%`)
+              .orWhereILike('d.vehicle_number', `%${search}%`)
+              .orWhereILike('d.san_username',   `%${search}%`);
+          });
+        }
+        if (activeOnly) q.where('d.is_active', true);
+      })
+      .count('* as count')
+      .first();
   }
 
   /** Counts active drivers grouped by scheduled_time for the overview dashboard */

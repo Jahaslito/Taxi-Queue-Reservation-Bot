@@ -523,6 +523,25 @@
     </div>
   </div>
 
+  <!-- Re-queue button -->
+  <button id="btn-requeue" style="
+    width:100%; margin-bottom:16px;
+    background:linear-gradient(135deg,rgba(0,180,255,0.18),rgba(108,99,255,0.18));
+    border:1px solid rgba(0,180,255,0.5); border-radius:16px;
+    padding:16px 20px; display:flex; align-items:center; gap:14px;
+    cursor:pointer; text-align:left;
+    box-shadow:0 4px 20px rgba(0,180,255,0.2), 0 2px 0 rgba(0,180,255,0.35), 0 1px 0 rgba(255,255,255,0.06) inset;
+    transition:transform .1s, box-shadow .1s, opacity .15s;
+    -webkit-tap-highlight-color: transparent;">
+    <div id="btn-requeue-icon" style="font-size:26px;line-height:1;flex-shrink:0;">⚡</div>
+    <div style="flex:1;">
+      <div id="btn-requeue-label" style="font-weight:700;color:var(--white);font-size:15px;">Get Back in Queue</div>
+      <div id="btn-requeue-sub" style="font-size:12px;color:rgba(0,180,255,0.8);margin-top:3px;">Run the bot now — no need to wait for your schedule</div>
+    </div>
+    <div id="btn-requeue-chevron" style="font-size:18px;color:rgba(0,180,255,0.6);flex-shrink:0;">›</div>
+    <div id="btn-requeue-spinner" style="display:none;flex-shrink:0;"><span class="spinner"></span></div>
+  </button>
+
   <!-- Schedule -->
   <div class="stats-row">
     <div class="stat-mini">
@@ -717,11 +736,11 @@
   });
 
   // ─── Toast ───────────────────────────────────────────────────────────────
-  function showToast(msg, type = 'success') {
+  function showToast(msg, type = 'success', duration = 3500) {
     const t = document.getElementById('toast');
     t.textContent = msg;
     t.className = `toast ${type} show`;
-    setTimeout(() => t.classList.remove('show'), 3000);
+    setTimeout(() => t.classList.remove('show'), duration);
   }
 
   // ─── API helper ──────────────────────────────────────────────────────────
@@ -986,6 +1005,155 @@
         </div>` : ''}
       ${log.error_message ? `<div style="font-size:13px;color:var(--red);margin-top:8px;">${esc(log.error_message)}</div>` : ''}`;
   }
+
+  // ─── Re-queue (Get Back in Queue) ───────────────────────────────────────
+  let requeueCooldown = false;
+  let requeuePollTimer = null;
+
+  function setRequeueBusy(busy) {
+    const btn      = document.getElementById('btn-requeue');
+    const icon     = document.getElementById('btn-requeue-icon');
+    const label    = document.getElementById('btn-requeue-label');
+    const sub      = document.getElementById('btn-requeue-sub');
+    const chevron  = document.getElementById('btn-requeue-chevron');
+    const spinner  = document.getElementById('btn-requeue-spinner');
+
+    if (busy) {
+      icon.textContent               = '⏳';
+      label.textContent              = 'Running…';
+      sub.textContent                = 'The bot is connecting to eDispatch — hold tight';
+      chevron.style.display          = 'none';
+      spinner.style.display          = 'block';
+      btn.style.opacity              = '0.65';
+      btn.style.cursor               = 'not-allowed';
+      btn.style.pointerEvents        = 'none';
+      btn.style.boxShadow            = '0 2px 8px rgba(0,180,255,0.1)';
+      btn.style.transform            = 'translateY(1px)';
+    } else {
+      icon.textContent               = '⚡';
+      label.textContent              = 'Get Back in Queue';
+      sub.textContent                = 'Run the bot now — no need to wait for your schedule';
+      chevron.style.display          = '';
+      spinner.style.display          = 'none';
+      btn.style.opacity              = '1';
+      btn.style.cursor               = 'pointer';
+      btn.style.pointerEvents        = '';
+      btn.style.boxShadow            = '0 4px 20px rgba(0,180,255,0.2), 0 2px 0 rgba(0,180,255,0.35), 0 1px 0 rgba(255,255,255,0.06) inset';
+      btn.style.transform            = '';
+    }
+  }
+
+  async function triggerRequeue() {
+    if (requeueCooldown) return;
+    requeueCooldown = true;
+    setRequeueBusy(true);
+
+    // `settled` at function scope so the safety-valve setTimeout can see it
+    // (let inside a try-block is invisible to finally — JS scoping pitfall)
+    let settled = false;
+
+    // Snapshot current log state before triggering so we can detect completion
+    let preLogId         = null;
+    let startedWithPending = false;
+    try {
+      const pre = await api('/api/driver/status/today');
+      if (pre.todayLog) {
+        preLogId           = pre.todayLog.id;
+        startedWithPending = pre.todayLog.status === 'pending';
+      }
+    } catch { /* best-effort — nulls are safe */ }
+
+    try {
+      await api('/api/driver/trigger', { method: 'POST' });
+      showToast('⚡ Bot is running — results will appear in your history shortly');
+
+      let polls      = 0;
+      let sawPending = startedWithPending; // treat a pre-existing pending log as "ours" too
+      clearInterval(requeuePollTimer);
+      requeuePollTimer = setInterval(async () => {
+        polls++;
+
+        // ── Fetch ────────────────────────────────────────────────────────────
+        let statusData, logsData;
+        try {
+          [statusData, logsData] = await Promise.all([
+            api('/api/driver/status/today'),
+            api('/api/driver/logs?limit=5'),
+          ]);
+        } catch {
+          // Network blip — skip this tick, keep the interval alive
+          return;
+        }
+
+        // ── Update UI (isolated so a render error never swallows the toast) ──
+        try { renderTodayStatus(statusData.todayLog); } catch {}
+        try { renderDashLogs(logsData.logs);           } catch {}
+
+        // ── Decide if we're done ─────────────────────────────────────────────
+        const log = statusData.todayLog;
+
+        if (log && log.status === 'pending') sawPending = true;
+        const isNewLog = log && String(log.id) !== String(preLogId);
+        const done     = (sawPending || isNewLog) && log && log.status !== 'pending';
+        const timedOut = polls >= 18;
+
+
+        if (done || timedOut) {
+          clearInterval(requeuePollTimer);
+          settled = true;
+
+          if (done) {
+            const s   = log.status;
+            const pos = log.queue_position ? ` at position #${log.queue_position}` : '';
+            if (s === 'success' || s === 'already_queued') {
+              showToast(`✅ You're back in the queue${pos}!`, 'success', 5000);
+            } else if (s === 'failed') {
+              showToast('❌ Bot ran but failed to queue — check your History for details', 'error', 5000);
+            } else {
+              showToast(`Bot finished (${s})`, 'success', 5000);
+            }
+          } else {
+            showToast('⏱ Still waiting on a result — check your History tab shortly', 'error', 5000);
+          }
+
+          // Restore the button 2s after the toast so users read it first
+          setTimeout(() => {
+            requeueCooldown = false;
+            setRequeueBusy(false);
+          }, 2000);
+        }
+      }, 5000);
+
+    } catch (err) {
+      showToast('Failed to trigger bot: ' + err.message, 'error');
+      settled = true;
+      requeueCooldown = false;
+      setRequeueBusy(false);
+    }
+
+    // Safety valve — restores button after 2 min if something goes silently wrong
+    setTimeout(() => {
+      if (!settled) {
+        requeueCooldown = false;
+        setRequeueBusy(false);
+      }
+    }, 120000);
+  }
+
+  // Wire button — must use addEventListener (CSP blocks inline onclick)
+  document.getElementById('btn-requeue').addEventListener('click', triggerRequeue);
+
+  // Press effect: sink the button on mousedown/touchstart, lift on release
+  (function() {
+    const btn = document.getElementById('btn-requeue');
+    function press()   { if (!requeueCooldown) { btn.style.transform = 'translateY(2px)'; btn.style.boxShadow = '0 1px 6px rgba(0,180,255,0.15)'; } }
+    function release() { if (!requeueCooldown) { btn.style.transform = ''; btn.style.boxShadow = ''; } }
+    btn.addEventListener('mousedown',  press);
+    btn.addEventListener('touchstart', press,   { passive: true });
+    btn.addEventListener('mouseup',    release);
+    btn.addEventListener('touchend',   release);
+    btn.addEventListener('mouseleave', release);
+  })();
 
   function renderDashLogs(logs) {
     const el = document.getElementById('dash-logs');

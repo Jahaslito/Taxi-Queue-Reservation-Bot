@@ -3,7 +3,7 @@ const { body }   = require('express-validator');
 
 const { authenticateDriver }                            = require('../middleware/auth');
 const validate                                          = require('../middleware/validate');
-const { getProfile, updateProfile, getLogs, getTodayStatus } = require('../controllers/driverController');
+const { getProfile, updateProfile, getLogs, getTodayStatus, triggerSelf } = require('../controllers/driverController');
 
 const router = Router();
 
@@ -36,5 +36,6 @@ router.put(
 
 router.get('/logs',         getLogs);
 router.get('/status/today', getTodayStatus);
+router.post('/trigger',     triggerSelf);
 
 module.exports = router;

@@ -295,7 +295,7 @@
 
   <div class="nav-group">
     <div class="nav-group-label">Overview</div>
-    <button class="nav-link active" data-page="page-overview">
+    <button class="nav-link" data-page="page-overview">
       <span class="icon">📊</span><span>Dashboard</span>
     </button>
   </div>
@@ -325,7 +325,7 @@
 <main class="main" id="main-area">
 
   <!-- ══════════ LOGIN PAGE ══════════ -->
-  <div class="page active" id="page-login">
+  <div class="page" id="page-login">
     <div style="width:100%;max-width:360px;">
       <div style="text-align:center;margin-bottom:32px;">
         <div style="font-size:48px;margin-bottom:12px;">🛡️</div>
@@ -425,6 +425,17 @@
         </tbody>
       </table>
     </div>
+
+    <!-- Drivers pagination bar -->
+    <div id="drivers-pagination" style="display:none; align-items:center; justify-content:space-between;
+         padding:14px 24px 20px; gap:12px; flex-wrap:wrap;">
+      <span id="drivers-page-info" style="font-size:13px;color:var(--muted2);"></span>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button class="btn btn-ghost btn-sm" id="drivers-prev" disabled>← Prev</button>
+        <span id="drivers-page-label" style="font-size:13px;color:var(--muted2);white-space:nowrap;min-width:80px;text-align:center;"></span>
+        <button class="btn btn-ghost btn-sm" id="drivers-next" disabled>Next →</button>
+      </div>
+    </div>
   </div>
 
   <!-- ══════════ LOGS PAGE ══════════ -->
@@ -449,6 +460,17 @@
 
     <div class="table-wrap" style="padding:8px 20px;" id="logs-container">
       <div style="color:var(--muted2);text-align:center;padding:32px;">Loading…</div>
+    </div>
+
+    <!-- Pagination bar -->
+    <div id="logs-pagination" style="display:none; align-items:center; justify-content:space-between;
+         padding:14px 24px 20px; gap:12px; flex-wrap:wrap;">
+      <span id="logs-page-info" style="font-size:13px;color:var(--muted2);"></span>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button class="btn btn-ghost btn-sm" id="logs-prev" disabled>← Prev</button>
+        <span id="logs-page-label" style="font-size:13px;color:var(--muted2);white-space:nowrap;min-width:80px;text-align:center;"></span>
+        <button class="btn btn-ghost btn-sm" id="logs-next" disabled>Next →</button>
+      </div>
     </div>
   </div>
 
@@ -729,11 +751,18 @@
   });
 
   // ─── Navigation ──────────────────────────────────────────────────────────
+  const CONTENT_PAGES = ['page-overview', 'page-drivers', 'page-logs'];
+
   function showPage(pageId) {
     document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
     document.querySelectorAll('.nav-link').forEach(n => n.classList.remove('active'));
     document.getElementById(pageId).classList.add('active');
     document.querySelector(`[data-page="${pageId}"]`)?.classList.add('active');
+
+    // Persist the active content tab so it survives page refreshes
+    if (CONTENT_PAGES.includes(pageId)) {
+      localStorage.setItem('adminActivePage', pageId);
+    }
 
     if (pageId === 'page-overview') loadOverview();
     if (pageId === 'page-drivers')  loadDrivers();
@@ -816,11 +845,19 @@
 
   document.getElementById('btn-logout').addEventListener('click', async () => {
     await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' }).catch(() => {});
+    localStorage.removeItem('adminActivePage');
     showLoginPage();
   });
 
   // ─── Overview ────────────────────────────────────────────────────────────
   async function loadOverview() {
+    const btn = document.getElementById('btn-refresh-overview');
+    const isManual = btn && !btn.disabled; // only animate on manual clicks, not boot load
+    if (isManual) {
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Refreshing…';
+    }
+
     try {
       const s = await api('/api/admin/stats');
       document.getElementById('stat-total').textContent = s.totalDrivers;
@@ -832,11 +869,12 @@
 
       document.getElementById('sched-breakdown-date').textContent = new Date().toLocaleDateString('en-GB', {
         weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
-      });
+        timeZone: 'America/Los_Angeles',
+      }) + ' PT';
 
       const tbody = document.getElementById('schedule-breakdown-body');
       if (!s.scheduleBreakdown.length) {
-        tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--muted2);padding:20px;">No drivers scheduled yet</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--muted2);padding:20px;">No drivers scheduled today</td></tr>';
       } else {
         tbody.innerHTML = s.scheduleBreakdown.map(row => `
           <tr>
@@ -848,8 +886,23 @@
             </td>
           </tr>`).join('');
       }
+
+      if (isManual) {
+        btn.innerHTML = '✓ Done';
+        btn.style.color = 'var(--green)';
+        setTimeout(() => {
+          btn.innerHTML = '↺ Refresh';
+          btn.style.color = '';
+          btn.disabled = false;
+        }, 1500);
+      }
     } catch (err) {
       showToast(err.message, 'error');
+      if (isManual) {
+        btn.innerHTML = '↺ Refresh';
+        btn.style.color = '';
+        btn.disabled = false;
+      }
     }
   }
 
@@ -858,26 +911,50 @@
   }
 
   // ─── Drivers ─────────────────────────────────────────────────────────────
-  async function loadDrivers() {
+  // ─── Drivers pagination state ─────────────────────────────────────────────
+  let driversPage   = 1;
+  const DRIVERS_PER = 25;
+
+  function setDriversPagination(total) {
+    const bar        = document.getElementById('drivers-pagination');
+    const info       = document.getElementById('drivers-page-info');
+    const label      = document.getElementById('drivers-page-label');
+    const prevBtn    = document.getElementById('drivers-prev');
+    const nextBtn    = document.getElementById('drivers-next');
+    const totalPages = Math.ceil(total / DRIVERS_PER) || 1;
+    const from       = Math.min((driversPage - 1) * DRIVERS_PER + 1, total);
+    const to         = Math.min(driversPage * DRIVERS_PER, total);
+
+    bar.style.display  = total > 0 ? 'flex' : 'none';
+    info.textContent   = total > 0 ? `Showing ${from}–${to} of ${total} driver${total !== 1 ? 's' : ''}` : '';
+    label.textContent  = `Page ${driversPage} of ${totalPages}`;
+    prevBtn.disabled   = driversPage <= 1;
+    nextBtn.disabled   = driversPage >= totalPages;
+  }
+
+  async function loadDrivers(page) {
+    if (page !== undefined) driversPage = page;
+    const offset = (driversPage - 1) * DRIVERS_PER;
     const search = document.getElementById('driver-search').value;
-    const tbody = document.getElementById('drivers-table-body');
-    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted2);padding:24px;"><span class="spinner"></span></td></tr>';
+    const tbody  = document.getElementById('drivers-table-body');
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted2);padding:24px;"><span class="spinner"></span></td></tr>';
+    document.getElementById('drivers-pagination').style.display = 'none';
 
     try {
-      const drivers = await api(`/api/admin/drivers?search=${encodeURIComponent(search)}`);
-      if (!drivers.length) {
+      const data = await api(`/api/admin/drivers?limit=${DRIVERS_PER}&offset=${offset}&search=${encodeURIComponent(search)}`);
+      if (!data.drivers.length) {
         tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted2);padding:32px;">No drivers found</td></tr>';
+        setDriversPagination(0);
         return;
       }
 
-      tbody.innerHTML = drivers.map(d => {
-        const statusCls  = { success: 'success', already_queued: 'queued', failed: 'failed', pending: 'pending' }[d.last_status] || 'inactive';
-        const statusLbl  = d.last_status ? d.last_status.replace('_',' ') : 'never run';
+      const dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+      tbody.innerHTML = data.drivers.map(d => {
+        const statusCls   = { success: 'success', already_queued: 'queued', failed: 'failed', pending: 'pending' }[d.last_status] || 'inactive';
+        const statusLbl   = d.last_status ? d.last_status.replace('_',' ') : 'never run';
         const activeBadge = d.is_active
           ? '<span class="badge success"><span class="badge-dot"></span>Active</span>'
           : '<span class="badge inactive">Inactive</span>';
-
-        const dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
         const activeDaysLabel = (d.scheduled_days || '0,1,2,3,4,5,6')
           .split(',').map(n => dayNames[Number(n)]).filter(Boolean).join(', ');
 
@@ -903,21 +980,31 @@
             </td>
           </tr>`;
       }).join('');
+
+      setDriversPagination(data.total);
     } catch (err) {
-      tbody.innerHTML = `<tr><td colspan="6" style="color:var(--red);text-align:center;padding:24px;">${err.message}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="7" style="color:var(--red);text-align:center;padding:24px;">${err.message}</td></tr>`;
     }
   }
+
+  // Drivers pagination button listeners
+  document.getElementById('drivers-prev').addEventListener('click', () => {
+    if (driversPage > 1) loadDrivers(driversPage - 1);
+  });
+  document.getElementById('drivers-next').addEventListener('click', () => {
+    loadDrivers(driversPage + 1);
+  });
 
   let searchTimeout;
   document.getElementById('driver-search').addEventListener('input', () => {
     clearTimeout(searchTimeout);
-    searchTimeout = setTimeout(loadDrivers, 300);
+    searchTimeout = setTimeout(() => loadDrivers(1), 300);
   });
 
   let logSearchTimeout;
   document.getElementById('log-search').addEventListener('input', () => {
     clearTimeout(logSearchTimeout);
-    logSearchTimeout = setTimeout(loadLogs, 300);
+    logSearchTimeout = setTimeout(() => loadLogs(1), 300);
   });
 
   function showConfirm(message) {
@@ -1008,7 +1095,7 @@
   // ─── Static button listeners (replaces onclick= attributes) ──────────────
   document.getElementById('btn-refresh-overview').addEventListener('click', loadOverview);
   document.getElementById('btn-add-driver').addEventListener('click', openAddDriverModal);
-  document.getElementById('btn-filter-logs').addEventListener('click', loadLogs);
+  document.getElementById('btn-filter-logs').addEventListener('click', () => loadLogs(1));
   document.getElementById('btn-cancel-modal').addEventListener('click', closeModal);
 
   // ─── Event delegation for dynamically-generated table rows ───────────────
@@ -1025,25 +1112,34 @@
   let sdfFiltered   = [];
   let sdfPage       = 1;
 
+  function todayDayIndex() {
+    const abbr   = new Date().toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/Los_Angeles' });
+    const dayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+    return String(dayMap[abbr]);
+  }
+
   function effectiveTime(driver) {
-    // Prefer today's per-day schedule if available
+    const d = todayDayIndex();
     if (driver.day_schedules) {
       try {
         const ds = JSON.parse(driver.day_schedules);
-        const today = new Date().toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/Los_Angeles' });
-        const dayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
-        const t = ds[String(dayMap[today])];
-        if (t) return t;
+        // Return the time for today, or '—' if the driver is not scheduled today.
+        // Do NOT fall back to scheduled_time — that field reflects a different day.
+        return ds[d] || '—';
       } catch {}
     }
+    // Legacy: check scheduled_days before using scheduled_time
+    const activeDays = (driver.scheduled_days || '0,1,2,3,4,5,6').split(',').map(String);
+    if (!activeDays.includes(d)) return '—';
     return driver.scheduled_time || '—';
   }
 
   async function openSchedDriversModal(time) {
     const dateStr = new Date().toLocaleDateString('en-GB', {
       weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+      timeZone: 'America/Los_Angeles',
     });
-    document.getElementById('sdf-subtitle').textContent = `${time} PT  ·  ${dateStr}`;
+    document.getElementById('sdf-subtitle').textContent = `${time} PT  ·  ${dateStr} PT`;
     document.getElementById('sdf-filter-name').value = '';
     document.getElementById('sdf-filter-car').value  = '';
     document.getElementById('sdf-filter-time').value = time;
@@ -1192,15 +1288,39 @@
   });
 
   // ─── Logs ────────────────────────────────────────────────────────────────
-  async function loadLogs() {
+  // ─── Logs pagination state ───────────────────────────────────────────────
+  let logsPage    = 1;
+  const LOGS_PER  = 25;
+
+  function setLogsPagination(total) {
+    const bar       = document.getElementById('logs-pagination');
+    const info      = document.getElementById('logs-page-info');
+    const label     = document.getElementById('logs-page-label');
+    const prevBtn   = document.getElementById('logs-prev');
+    const nextBtn   = document.getElementById('logs-next');
+    const totalPages = Math.ceil(total / LOGS_PER) || 1;
+    const from      = Math.min((logsPage - 1) * LOGS_PER + 1, total);
+    const to        = Math.min(logsPage * LOGS_PER, total);
+
+    bar.style.display  = total > 0 ? 'flex' : 'none';
+    info.textContent   = total > 0 ? `Showing ${from}–${to} of ${total} result${total !== 1 ? 's' : ''}` : '';
+    label.textContent  = `Page ${logsPage} of ${totalPages}`;
+    prevBtn.disabled   = logsPage <= 1;
+    nextBtn.disabled   = logsPage >= totalPages;
+  }
+
+  async function loadLogs(page) {
+    if (page !== undefined) logsPage = page;
+    const offset    = (logsPage - 1) * LOGS_PER;
     const container = document.getElementById('logs-container');
     container.innerHTML = '<div style="color:var(--muted2);text-align:center;padding:32px;"><span class="spinner"></span></div>';
+    document.getElementById('logs-pagination').style.display = 'none';
 
     const search = document.getElementById('log-search').value.trim();
     const date   = document.getElementById('log-date-filter').value;
     const status = document.getElementById('log-status-filter').value;
 
-    let url = '/api/admin/logs?limit=50';
+    let url = `/api/admin/logs?limit=${LOGS_PER}&offset=${offset}`;
     if (search) url += `&search=${encodeURIComponent(search)}`;
     if (date)   url += `&date=${date}`;
     if (status) url += `&status=${status}`;
@@ -1209,6 +1329,7 @@
       const data = await api(url);
       if (!data.logs.length) {
         container.innerHTML = '<div class="empty-state"><div class="icon">📭</div>No logs found for the selected filters</div>';
+        setLogsPagination(0);
         return;
       }
 
@@ -1235,10 +1356,20 @@
             </div>
           </div>`;
       }).join('');
+
+      setLogsPagination(data.total);
     } catch (err) {
       container.innerHTML = `<div style="color:var(--red);text-align:center;padding:32px;">${err.message}</div>`;
     }
   }
+
+  // Pagination button listeners
+  document.getElementById('logs-prev').addEventListener('click', () => {
+    if (logsPage > 1) loadLogs(logsPage - 1);
+  });
+  document.getElementById('logs-next').addEventListener('click', () => {
+    loadLogs(logsPage + 1);
+  });
 
   // ─── Helpers ─────────────────────────────────────────────────────────────
   function formatDateTime(iso) {
@@ -1261,7 +1392,9 @@
       const data = await api('/api/admin/stats');
       if (data) {
         document.getElementById('sidebar').style.display = 'flex';
-        showPage('page-overview');
+        // Restore whichever tab was active before the refresh, default to overview
+        const saved = localStorage.getItem('adminActivePage');
+        showPage(CONTENT_PAGES.includes(saved) ? saved : 'page-overview');
       } else {
         showLoginPage();
       }

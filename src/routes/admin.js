@@ -1,13 +1,14 @@
 const { Router } = require('express');
 const { body, param, query } = require('express-validator');
 
-const { authenticateAdmin }  = require('../middleware/auth');
-const { triggerLimiter }     = require('../middleware/rateLimiter');
+const { authenticateAdmin }          = require('../middleware/auth');
+const { triggerLimiter, apiLimiter } = require('../middleware/rateLimiter');
 const validate               = require('../middleware/validate');
 const adminController        = require('../controllers/adminController');
 
 const router = Router();
 
+router.use(apiLimiter);
 router.use(authenticateAdmin);
 
 const idParam = param('id').isInt({ min: 1 }).withMessage('Driver ID must be a positive integer');

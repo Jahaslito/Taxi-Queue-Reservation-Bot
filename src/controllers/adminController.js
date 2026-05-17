@@ -1,4 +1,5 @@
 const bcrypt                  = require('bcryptjs');
+const crypto                  = require('crypto');
 const Driver                  = require('../models/Driver');
 const Log                     = require('../models/Log');
 const { encrypt }             = require('../services/cryptoService');
@@ -131,12 +132,14 @@ async function addDriver(req, res, next) {
       daySchedulesJson = JSON.stringify(ds);
     }
 
-    // Admin-added drivers get vehicle number as default app password
+    // Generate a secure random temporary password the admin can share with the driver
+    const tempPassword = crypto.randomBytes(6).toString('base64url'); // 8-char URL-safe string
+
     const driver = await Driver.create({
       name,
       phone:          phone  || null,
       email:          email  || null,
-      app_password:   await bcrypt.hash(vehicleNumber, 10),
+      app_password:   await bcrypt.hash(tempPassword, 10),
       san_username:   sanUsername,
       san_password:   encrypt(sanPassword),
       vehicle_number: vehicleNumber,
@@ -146,7 +149,8 @@ async function addDriver(req, res, next) {
       notes:          notes  || null,
     });
 
-    res.status(201).json(driver);
+    // Return tempPassword once so the admin can hand it to the driver — never stored in plain text
+    res.status(201).json({ ...driver, tempPassword });
   } catch (err) {
     next(err);
   }

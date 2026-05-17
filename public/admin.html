@@ -780,6 +780,43 @@
     setTimeout(() => t.classList.remove('show'), 3500);
   }
 
+  // ─── Temp-password reveal ─────────────────────────────────────────────────
+  function showTempPasswordAlert(driverName, tempPassword) {
+    // Reuse the existing modal overlay, replacing content temporarily
+    const overlay = document.createElement('div');
+    overlay.id = 'temp-pw-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center;';
+
+    const box = document.createElement('div');
+    box.style.cssText = 'background:var(--surface);border-radius:12px;padding:32px 28px;max-width:420px;width:90%;box-shadow:0 8px 40px rgba(0,0,0,.4);text-align:center;';
+    box.innerHTML = `
+      <div style="font-size:36px;margin-bottom:12px;">🔑</div>
+      <h3 style="margin:0 0 8px;font-size:18px;">Driver Created</h3>
+      <p style="color:var(--muted2);font-size:13px;margin:0 0 20px;">
+        Share this one-time password with <strong>${driverName}</strong>.<br>
+        It is not stored and cannot be recovered.
+      </p>
+      <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;gap:12px;">
+        <code id="tmp-pw-text" style="font-size:20px;letter-spacing:2px;color:var(--fg);font-family:monospace;">${tempPassword}</code>
+        <button id="tmp-pw-copy" style="flex-shrink:0;padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--fg);cursor:pointer;font-size:13px;">Copy</button>
+      </div>
+      <button id="tmp-pw-done" class="btn btn-primary" style="width:100%;">Done — I've noted it</button>
+    `;
+
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    document.getElementById('tmp-pw-copy').addEventListener('click', () => {
+      navigator.clipboard.writeText(tempPassword).then(() => {
+        document.getElementById('tmp-pw-copy').textContent = '✓ Copied';
+      });
+    });
+
+    const close = () => overlay.remove();
+    document.getElementById('tmp-pw-done').addEventListener('click', close);
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  }
+
   // ─── API ─────────────────────────────────────────────────────────────────
   function friendlyNetworkError() {
     if (location.protocol === 'https:') {
@@ -1270,8 +1307,12 @@
           throw new Error('Name, SAN username, password, and vehicle number are required');
         }
         body.sanPassword = sanPass;
-        await api('/api/admin/drivers', { method: 'POST', body: JSON.stringify(body) });
-        showToast('Driver added ✓');
+        const created = await api('/api/admin/drivers', { method: 'POST', body: JSON.stringify(body) });
+        closeModal();
+        loadDrivers();
+        // Show temp password in a dismissable overlay so admin can copy it
+        showTempPasswordAlert(created.name, created.tempPassword);
+        return; // skip the generic closeModal() below
       }
       closeModal();
       loadDrivers();

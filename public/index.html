@@ -387,7 +387,7 @@
 
   <div style="padding:28px 0 8px;">
     <h2 style="font-family:'Syne',sans-serif;font-size:24px;font-weight:800;">Reset Password</h2>
-    <p style="color:var(--muted);font-size:14px;margin-top:6px;">Your password will be reset to your vehicle number.</p>
+    <p style="color:var(--muted);font-size:14px;margin-top:6px;">Enter your email and we'll generate a temporary password for you.</p>
   </div>
 
   <div class="form-section">
@@ -396,7 +396,15 @@
       <input type="email" id="forgot-email" placeholder="your@email.com" autocomplete="email" />
     </div>
     <div class="error-msg" id="forgot-error"></div>
-    <div class="success-msg" id="forgot-success" style="display:none;color:var(--green);font-size:13px;margin-bottom:12px;"></div>
+    <div id="forgot-success-box" style="display:none;background:var(--surface-2,#1e2a1e);border:1px solid var(--green);border-radius:10px;padding:16px;margin-bottom:12px;">
+      <p style="color:var(--green);font-size:13px;margin:0 0 10px;font-weight:600;">✅ Password reset!</p>
+      <p style="color:var(--muted);font-size:13px;margin:0 0 10px;">Your temporary password is:</p>
+      <div style="display:flex;align-items:center;gap:10px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px;">
+        <code id="forgot-temp-pw" style="font-size:18px;letter-spacing:2px;color:var(--fg);flex:1;font-family:monospace;"></code>
+        <button id="btn-forgot-copy" style="padding:5px 12px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--fg);cursor:pointer;font-size:12px;white-space:nowrap;">Copy</button>
+      </div>
+      <p style="color:var(--muted);font-size:12px;margin:10px 0 0;">Log in with this password, then change it in your profile settings.</p>
+    </div>
     <button class="btn btn-primary" id="btn-forgot-submit">Reset Password</button>
     <div style="text-align:center;margin-top:16px;">
       <button class="btn-link" id="btn-forgot-back">← Back to Login</button>
@@ -807,7 +815,7 @@
   document.getElementById('btn-back-login').addEventListener('click', () => showView('view-login'));
   document.getElementById('btn-show-forgot').addEventListener('click', () => {
     document.getElementById('forgot-error').textContent = '';
-    document.getElementById('forgot-success').style.display = 'none';
+    document.getElementById('forgot-success-box').style.display = 'none';
     document.getElementById('forgot-email').value = '';
     showView('view-forgot');
   });
@@ -817,8 +825,8 @@
   document.getElementById('btn-forgot-submit').addEventListener('click', async () => {
     const email  = document.getElementById('forgot-email').value.trim();
     const errEl  = document.getElementById('forgot-error');
-    const okEl   = document.getElementById('forgot-success');
-    errEl.textContent = ''; okEl.style.display = 'none';
+    errEl.textContent = '';
+    document.getElementById('forgot-success-box').style.display = 'none';
 
     if (!email) { errEl.textContent = 'Please enter your email address.'; return; }
 
@@ -829,9 +837,19 @@
       const data = await api('/api/auth/driver/reset-password', {
         method: 'POST', body: JSON.stringify({ email }),
       });
-      okEl.textContent = data.message + ' Your new password is your vehicle number.';
-      okEl.style.display = 'block';
       document.getElementById('forgot-email').value = '';
+      if (data.tempPassword) {
+        document.getElementById('forgot-temp-pw').textContent = data.tempPassword;
+        document.getElementById('forgot-success-box').style.display = 'block';
+        document.getElementById('btn-forgot-copy').onclick = () => {
+          navigator.clipboard.writeText(data.tempPassword).then(() => {
+            document.getElementById('btn-forgot-copy').textContent = '✓ Copied';
+          });
+        };
+      } else {
+        // Fallback: email not found (server returns same message to avoid enumeration)
+        errEl.textContent = 'No account found with that email address.';
+      }
     } catch (err) {
       errEl.textContent = err.message;
     } finally {

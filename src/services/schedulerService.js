@@ -9,7 +9,9 @@ const runningJobs = new Set();
 
 const MAX_CONCURRENT = 5;
 const MAX_RETRIES    = 3;
-const BASE_RETRY_MS  = 5000; // 5s → 10s → 20s per attempt, plus up to 2s jitter
+// Both values are overridable via env so tests can set them to 0 for speed
+const BASE_RETRY_MS  = parseInt(process.env.RETRY_BASE_MS  ?? '5000', 10); // 5s → 10s → 20s
+const MAX_JITTER_MS  = parseInt(process.env.RETRY_JITTER_MS ?? '2000', 10); // up to 2s jitter
 
 /**
  * Returns false for permanent failures that are not worth retrying
@@ -78,7 +80,7 @@ async function runBotForDriver(driver, triggerType = 'scheduled') {
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       if (attempt > 1) {
-        const jitter = Math.random() * 2000;
+        const jitter = Math.random() * MAX_JITTER_MS;
         const delay  = BASE_RETRY_MS * Math.pow(2, attempt - 2) + jitter;
         console.log(`[Scheduler] ↺ ${driver.name} — retry ${attempt}/${MAX_RETRIES} in ${Math.round(delay / 1000)}s…`);
         await new Promise((resolve) => setTimeout(resolve, delay));

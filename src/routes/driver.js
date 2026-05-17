@@ -2,11 +2,13 @@ const { Router } = require('express');
 const { body }   = require('express-validator');
 
 const { authenticateDriver }                            = require('../middleware/auth');
+const { apiLimiter }                                    = require('../middleware/rateLimiter');
 const validate                                          = require('../middleware/validate');
 const { getProfile, updateProfile, getLogs, getTodayStatus, triggerSelf } = require('../controllers/driverController');
 
 const router = Router();
 
+router.use(apiLimiter);
 router.use(authenticateDriver);
 
 router.get('/profile', getProfile);

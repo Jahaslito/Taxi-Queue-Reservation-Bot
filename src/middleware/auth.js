@@ -2,7 +2,7 @@ const jwt = require('jsonwebtoken');
 const { jwtSecret: JWT_SECRET } = require('../config/env');
 
 function extractToken(req) {
-  return req.cookies?.token || req.headers.authorization?.split(' ')[1];
+  return req.cookies?.token ?? null;
 }
 
 function authenticateDriver(req, res, next) {

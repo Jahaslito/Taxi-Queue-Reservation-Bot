@@ -2,6 +2,8 @@ node_modules/
 data/
 .env
 .env.example
+.env.test
+.github/
 *.db
 *.db-shm
 *.db-wal
@@ -9,3 +11,4 @@ data/
 README.md
 .DS_Store
 flyers/
+jest.config.js

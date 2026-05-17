@@ -16,6 +16,12 @@ module.exports = {
     pool: { min: 2, max: 10 },
   },
 
+  test: {
+    ...base,
+    connection: process.env.DATABASE_URL, // env.js points this at TEST_DATABASE_URL
+    pool: { min: 1, max: 5 },
+  },
+
   production: {
     ...base,
     connection: {

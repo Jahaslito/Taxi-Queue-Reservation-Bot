@@ -1,4 +1,5 @@
 const bcrypt            = require('bcryptjs');
+const crypto            = require('crypto');
 const Driver            = require('../models/Driver');
 const Admin             = require('../models/Admin');
 const { encrypt }       = require('../services/cryptoService');
@@ -117,11 +118,15 @@ async function resetDriverPassword(req, res, next) {
     }
 
     const full = await Driver.findByIdWithCredentials(driver.id);
+
+    // Generate a secure random temporary password — never derived from driver data
+    const tempPassword = crypto.randomBytes(6).toString('base64url');
+
     await Driver.update(driver.id, {
       name:           full.name,
       phone:          full.phone,
       email:          full.email,
-      app_password:   await bcrypt.hash(full.vehicle_number, 10),
+      app_password:   await bcrypt.hash(tempPassword, 10),
       san_username:   full.san_username,
       san_password:   full.san_password,
       vehicle_number: full.vehicle_number,
@@ -130,7 +135,8 @@ async function resetDriverPassword(req, res, next) {
       notes:          full.notes,
     });
 
-    res.json({ message: 'If that email is registered, the password has been reset.' });
+    // Return the temp password so the driver can log in with it and set a new one
+    res.json({ message: 'Password reset successfully.', tempPassword });
   } catch (err) {
     next(err);
   }

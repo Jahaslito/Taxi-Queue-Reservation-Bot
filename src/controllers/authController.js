@@ -5,6 +5,11 @@ const Admin             = require('../models/Admin');
 const { encrypt }       = require('../services/cryptoService');
 const { generateToken } = require('../middleware/auth');
 const { nodeEnv }       = require('../config/env');
+const { sendVerificationEmail, sendPasswordResetEmail, APP_URL } = require('../services/emailService');
+
+// ─── Token helpers ────────────────────────────────────────────────────────────
+function makeToken()  { return crypto.randomBytes(32).toString('hex'); }
+function hoursFromNow(h) { return new Date(Date.now() + h * 60 * 60 * 1000); }
 
 const COOKIE_OPTS = {
   httpOnly: true,
@@ -38,18 +43,31 @@ async function registerDriver(req, res, next) {
       daySchedulesJson = JSON.stringify(ds);
     }
 
+    // Build verification token if email supplied
+    const verificationToken   = email ? makeToken()       : null;
+    const verificationExpires = email ? hoursFromNow(24)  : null;
+
     const driver = await Driver.create({
       name,
-      phone:          phone        || null,
-      email:          email        || null,
-      app_password:   await bcrypt.hash(appPassword, 10),
-      san_username:   sanUsername,
-      san_password:   encrypt(sanPassword),
-      vehicle_number: vehicleNumber,
-      scheduled_time: scheduledTime,
-      scheduled_days: scheduledDays || '0,1,2,3,4,5,6',
-      day_schedules:  daySchedulesJson,
+      phone:                          phone        || null,
+      email:                          email        || null,
+      app_password:                   await bcrypt.hash(appPassword, 10),
+      san_username:                   sanUsername,
+      san_password:                   encrypt(sanPassword),
+      vehicle_number:                 vehicleNumber,
+      scheduled_time:                 scheduledTime,
+      scheduled_days:                 scheduledDays || '0,1,2,3,4,5,6',
+      day_schedules:                  daySchedulesJson,
+      email_verification_token:       verificationToken,
+      email_verification_expires_at:  verificationExpires,
     });
+
+    // Send verification email (non-blocking — a failure here shouldn't break registration)
+    if (email && verificationToken) {
+      sendVerificationEmail(driver, verificationToken).catch((err) =>
+        console.error('[Email] Failed to send verification email:', err.message),
+      );
+    }
 
     const token = generateToken(driver.id, 'driver');
     res.cookie('token', token, { ...COOKIE_OPTS, maxAge: 30 * 24 * 60 * 60 * 1000 });
@@ -107,36 +125,102 @@ async function loginAdmin(req, res, next) {
   }
 }
 
-async function resetDriverPassword(req, res, next) {
+// ─── Forgot password — send reset link via email ──────────────────────────────
+async function forgotPassword(req, res, next) {
   try {
     const { email } = req.body;
     const driver = await Driver.findByEmail(email);
 
-    // Always respond the same way — don't reveal whether the email exists
-    if (!driver) {
-      return res.json({ message: 'If that email is registered, the password has been reset.' });
-    }
+    // Always return the same response to prevent email enumeration
+    const genericOk = { message: 'If that email is registered, you will receive a reset link shortly.' };
 
-    const full = await Driver.findByIdWithCredentials(driver.id);
+    if (!driver) return res.json(genericOk);
 
-    // Generate a secure random temporary password — never derived from driver data
-    const tempPassword = crypto.randomBytes(6).toString('base64url');
+    const resetToken   = makeToken();
+    const resetExpires = hoursFromNow(1);
 
     await Driver.update(driver.id, {
-      name:           full.name,
-      phone:          full.phone,
-      email:          full.email,
-      app_password:   await bcrypt.hash(tempPassword, 10),
-      san_username:   full.san_username,
-      san_password:   full.san_password,
-      vehicle_number: full.vehicle_number,
-      scheduled_time: full.scheduled_time,
-      is_active:      full.is_active,
-      notes:          full.notes,
+      password_reset_token:      resetToken,
+      password_reset_expires_at: resetExpires,
     });
 
-    // Return the temp password so the driver can log in with it and set a new one
-    res.json({ message: 'Password reset successfully.', tempPassword });
+    sendPasswordResetEmail(driver, resetToken).catch((err) =>
+      console.error('[Email] Failed to send reset email:', err.message),
+    );
+
+    res.json(genericOk);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ─── Reset password — confirm with token + new password ──────────────────────
+async function resetDriverPassword(req, res, next) {
+  try {
+    const { token, newPassword } = req.body;
+
+    const driver = token ? await Driver.findByResetToken(token) : null;
+
+    if (!driver || !driver.password_reset_expires_at || new Date() > new Date(driver.password_reset_expires_at)) {
+      const err = new Error('Reset link is invalid or has expired.');
+      err.statusCode = 400;
+      throw err;
+    }
+
+    await Driver.update(driver.id, {
+      app_password:              await bcrypt.hash(newPassword, 10),
+      password_reset_token:      null,
+      password_reset_expires_at: null,
+    });
+
+    res.json({ message: 'Password updated successfully. You can now log in.' });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ─── Verify email — called via link in the verification email ─────────────────
+async function verifyEmail(req, res) {
+  const { token } = req.query;
+  const driver = token ? await Driver.findByVerificationToken(token) : null;
+
+  if (!driver || !driver.email_verification_expires_at || new Date() > new Date(driver.email_verification_expires_at)) {
+    return res.redirect(`${APP_URL}/?verified=expired`);
+  }
+
+  await Driver.update(driver.id, {
+    email_verified_at:              new Date(),
+    email_verification_token:       null,
+    email_verification_expires_at:  null,
+  });
+
+  res.redirect(`${APP_URL}/?verified=success`);
+}
+
+// ─── Resend verification email (requires driver to be logged in) ──────────────
+async function resendVerification(req, res, next) {
+  try {
+    const driver = await Driver.findById(req.user.id);
+
+    if (!driver.email) {
+      const err = new Error('No email address on your account.');
+      err.statusCode = 400;
+      throw err;
+    }
+    if (driver.email_verified_at) {
+      return res.json({ message: 'Email is already verified.' });
+    }
+
+    const verificationToken   = makeToken();
+    const verificationExpires = hoursFromNow(24);
+
+    await Driver.update(driver.id, {
+      email_verification_token:      verificationToken,
+      email_verification_expires_at: verificationExpires,
+    });
+
+    await sendVerificationEmail(driver, verificationToken);
+    res.json({ message: 'Verification email sent.' });
   } catch (err) {
     next(err);
   }
@@ -147,4 +231,13 @@ function logout(req, res) {
   res.json({ ok: true });
 }
 
-module.exports = { registerDriver, loginDriver, loginAdmin, logout, resetDriverPassword };
+module.exports = {
+  registerDriver,
+  loginDriver,
+  loginAdmin,
+  logout,
+  forgotPassword,
+  resetDriverPassword,
+  verifyEmail,
+  resendVerification,
+};

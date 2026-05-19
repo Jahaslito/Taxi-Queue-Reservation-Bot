@@ -14,11 +14,16 @@ const errorHandler = require('./src/middleware/errorHandler');
 
 const app = express();
 
+// ─── Trust Railway / reverse-proxy headers ────────────────────────────────────
+// Railway terminates TLS at the edge and forwards HTTP internally.
+// Without this, req.ip returns the proxy IP and rate limiting breaks.
+if (env.nodeEnv === 'production') app.set('trust proxy', 1);
+
 // ─── Security middleware ───────────────────────────────────────────────────────
 app.use(helmet({
-  // HSTS must be disabled for HTTP servers — sending it over HTTP causes
-  // browsers to cache it and then refuse to connect via HTTP.
-  hsts: false,
+  // Enable HSTS in production (Railway serves via HTTPS at the edge).
+  // Keep it off in dev/test so plain HTTP still works locally.
+  hsts: env.nodeEnv === 'production' ? { maxAge: 31536000, includeSubDomains: true } : false,
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
@@ -41,9 +46,11 @@ app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ─── API routes ───────────────────────────────────────────────────────────────
-app.use('/api/auth',   require('./src/routes/auth'));
-app.use('/api/driver', require('./src/routes/driver'));
-app.use('/api/admin',  require('./src/routes/admin'));
+app.use('/api/auth',         require('./src/routes/auth'));
+app.use('/api/driver',      require('./src/routes/driver'));
+app.use('/api/admin',       require('./src/routes/admin'));
+app.use('/api/admin/monitor',   require('./src/routes/monitor'));
+app.use('/api/admin/watchlist', require('./src/routes/watchlist'));
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
@@ -87,6 +94,9 @@ async function bootstrap() {
 
     const { startScheduler } = require('./src/services/schedulerService');
     startScheduler();
+
+    const { startMonitor } = require('./src/services/monitorService');
+    startMonitor().catch((err) => console.error('[Monitor] Failed to start:', err.message));
   });
 }
 

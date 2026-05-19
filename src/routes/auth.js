@@ -1,12 +1,23 @@
 const { Router } = require('express');
 const { body }   = require('express-validator');
 
-const { loginLimiter }                                                      = require('../middleware/rateLimiter');
-const validate                                                              = require('../middleware/validate');
-const { registerDriver, loginDriver, loginAdmin, logout, resetDriverPassword } = require('../controllers/authController');
+const { loginLimiter }           = require('../middleware/rateLimiter');
+const { authenticateDriver }     = require('../middleware/auth');
+const validate                   = require('../middleware/validate');
+const {
+  registerDriver,
+  loginDriver,
+  loginAdmin,
+  logout,
+  forgotPassword,
+  resetDriverPassword,
+  verifyEmail,
+  resendVerification,
+} = require('../controllers/authController');
 
 const router = Router();
 
+// ─── Driver register ──────────────────────────────────────────────────────────
 router.post(
   '/driver/register',
   loginLimiter,
@@ -27,6 +38,7 @@ router.post(
   registerDriver,
 );
 
+// ─── Driver login ─────────────────────────────────────────────────────────────
 router.post(
   '/driver/login',
   loginLimiter,
@@ -38,6 +50,7 @@ router.post(
   loginDriver,
 );
 
+// ─── Admin login ──────────────────────────────────────────────────────────────
 router.post(
   '/admin/login',
   loginLimiter,
@@ -49,14 +62,36 @@ router.post(
   loginAdmin,
 );
 
+// ─── Email verification ───────────────────────────────────────────────────────
+// GET link clicked from email — redirects back to the SPA with ?verified=success|expired
+router.get('/driver/verify-email', verifyEmail);
+
+// Resend verification (driver must be logged in)
+router.post('/driver/resend-verification', authenticateDriver, resendVerification);
+
+// ─── Password reset ───────────────────────────────────────────────────────────
+// Step 1: request — sends email with reset link
+router.post(
+  '/driver/forgot-password',
+  loginLimiter,
+  [body('email').isEmail().withMessage('Valid email is required')],
+  validate,
+  forgotPassword,
+);
+
+// Step 2: confirm — token + new password (linked from the reset email)
 router.post(
   '/driver/reset-password',
   loginLimiter,
-  [body('email').isEmail().withMessage('Valid email is required')],
+  [
+    body('token').notEmpty().withMessage('Reset token is required'),
+    body('newPassword').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
+  ],
   validate,
   resetDriverPassword,
 );
 
+// ─── Logout ───────────────────────────────────────────────────────────────────
 router.post('/logout', logout);
 
 module.exports = router;

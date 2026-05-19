@@ -176,6 +176,15 @@
     .search-input:focus { border-color: var(--teal); }
     .search-input::placeholder { color: var(--muted); }
 
+    /* ── Watchlist stat cards ── */
+    .wl-stat-card {
+      background: var(--bg2); border: 1px solid var(--border);
+      border-radius: 12px; padding: 16px 18px;
+      transition: border-color 0.3s;
+    }
+    .wl-stat-num   { font-family: 'IBM Plex Mono', monospace; font-size: 28px; font-weight: 700; line-height: 1; margin-bottom: 4px; }
+    .wl-stat-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+
     /* ── Modal ── */
     .modal-overlay {
       display: none; position: fixed; inset: 0;
@@ -306,6 +315,17 @@
     </button>
     <button class="nav-link" data-page="page-logs">
       <span class="icon">📋</span><span>Activity Logs</span>
+    </button>
+  </div>
+  <div class="nav-group">
+    <div class="nav-group-label">Automation</div>
+    <button class="nav-link" data-page="page-watchlist">
+      <span class="icon">🤖</span><span>Watchlist</span>
+      <span id="watchlist-live-dot" style="display:none;margin-left:auto;width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);"></span>
+    </button>
+    <button class="nav-link" data-page="page-monitor">
+      <span class="icon">🔍</span><span>Queue Monitor</span>
+      <span id="monitor-live-dot" style="display:none;margin-left:auto;width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);"></span>
     </button>
   </div>
 
@@ -470,6 +490,183 @@
         <button class="btn btn-ghost btn-sm" id="logs-prev" disabled>← Prev</button>
         <span id="logs-page-label" style="font-size:13px;color:var(--muted2);white-space:nowrap;min-width:80px;text-align:center;"></span>
         <button class="btn btn-ghost btn-sm" id="logs-next" disabled>Next →</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════ WATCHLIST PAGE ══════════════════════════ -->
+  <div class="page" id="page-watchlist">
+    <div class="page-header">
+      <div>
+        <h1>Watchlist</h1>
+        <p>All active drivers are monitored automatically — re-queued the moment they leave.</p>
+      </div>
+    </div>
+
+    <!-- Live status bar -->
+    <div id="wl-status-bar" style="
+      display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+      background:var(--bg2); border:1px solid var(--border);
+      border-radius:12px; padding:12px 18px; margin-bottom:20px;
+      font-size:13px; color:var(--muted2);">
+      <span style="display:flex;align-items:center;gap:6px;">
+        <span id="wl-dot" style="width:8px;height:8px;border-radius:50%;background:var(--muted);display:inline-block;transition:background 0.3s;"></span>
+        <span id="wl-live-label" style="font-weight:600;">Connecting…</span>
+      </span>
+      <span>|</span>
+      <span>Last poll: <strong id="wl-last-poll" style="color:var(--white);">—</strong></span>
+      <span>|</span>
+      <span>Fetch: <strong id="wl-fetch-ms" style="color:var(--white);">—</strong></span>
+      <span>|</span>
+      <span>Bot queue: <strong id="wl-bot-active" style="color:var(--amber);">0</strong> active
+            &nbsp;·&nbsp;<strong id="wl-bot-pending" style="color:var(--muted2);">0</strong> pending</span>
+    </div>
+
+    <!-- Stats cards row -->
+    <div id="wl-stats-row" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px;margin-bottom:24px;">
+      <div class="wl-stat-card" id="wlsc-total">
+        <div class="wl-stat-num" id="wls-total">—</div>
+        <div class="wl-stat-label">Total Monitored</div>
+      </div>
+      <div class="wl-stat-card" id="wlsc-inqueue" style="border-color:var(--green)40;">
+        <div class="wl-stat-num" style="color:var(--green);" id="wls-inqueue">—</div>
+        <div class="wl-stat-label">In Queue</div>
+      </div>
+      <div class="wl-stat-card" id="wlsc-dispatched" style="border-color:var(--amber)40;">
+        <div class="wl-stat-num" style="color:var(--amber);" id="wls-dispatched">—</div>
+        <div class="wl-stat-label">Dispatched</div>
+      </div>
+      <div class="wl-stat-card" id="wlsc-gone" style="border-color:var(--red)40;">
+        <div class="wl-stat-num" style="color:var(--red);" id="wls-gone">—</div>
+        <div class="wl-stat-label">Gone / Re-queuing</div>
+      </div>
+      <div class="wl-stat-card" id="wlsc-today" style="border-color:var(--blue)40;">
+        <div class="wl-stat-num" style="color:var(--blue);" id="wls-today">—</div>
+        <div class="wl-stat-label">Re-queues Today</div>
+      </div>
+      <div class="wl-stat-card" id="wlsc-watching" style="border-color:var(--muted)40;">
+        <div class="wl-stat-num" style="color:var(--muted2);" id="wls-watching">—</div>
+        <div class="wl-stat-label">Not Yet Queued</div>
+      </div>
+    </div>
+
+    <!-- Filter bar -->
+    <div class="filter-bar" style="margin-bottom:16px;">
+      <input class="search-input" id="wl-search" placeholder="Vehicle # or driver name…" style="flex:1;min-width:180px;" />
+      <select class="search-input" id="wl-status-filter" style="max-width:160px;">
+        <option value="all">All States</option>
+        <option value="in_queue">In Queue</option>
+        <option value="dispatched">Dispatched</option>
+        <option value="gone">Gone</option>
+        <option value="requeuing">Re-queuing</option>
+        <option value="watching">Not Yet Queued</option>
+      </select>
+      <select class="search-input" id="wl-sort-by" style="max-width:160px;">
+        <option value="vehicleNumber">Sort: Vehicle #</option>
+        <option value="driverName">Sort: Name</option>
+        <option value="state">Sort: Status</option>
+        <option value="requeuedToday">Sort: Re-queues Today</option>
+        <option value="lastRequeuedAt">Sort: Last Re-queued</option>
+      </select>
+    </div>
+
+    <!-- Table -->
+    <div class="table-wrap" id="wl-table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Vehicle #</th>
+            <th>Driver</th>
+            <th>Status</th>
+            <th>In Queue Since</th>
+            <th>Last Dispatched</th>
+            <th>Last Re-queued</th>
+            <th style="text-align:center;">Today</th>
+            <th style="text-align:center;" title="Live position from last poll">Position</th>
+            <th style="text-align:center;">Last Result</th>
+            <th style="text-align:center;">Run</th>
+          </tr>
+        </thead>
+        <tbody id="wl-tbody">
+          <tr><td colspan="10" style="text-align:center;color:var(--muted2);padding:32px;">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Pagination -->
+    <div id="wl-pagination" style="display:none; align-items:center; justify-content:space-between;
+         padding:14px 24px 20px; gap:12px; flex-wrap:wrap;">
+      <span id="wl-page-info" style="font-size:13px;color:var(--muted2);"></span>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button class="btn btn-ghost btn-sm" id="wl-prev" disabled>← Prev</button>
+        <span id="wl-page-label" style="font-size:13px;color:var(--muted2);white-space:nowrap;min-width:80px;text-align:center;"></span>
+        <button class="btn btn-ghost btn-sm" id="wl-next" disabled>Next →</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════ MONITOR PAGE ══════════════════════════ -->
+  <div class="page" id="page-monitor">
+    <div class="page-header" style="display:flex;align-items:flex-start;justify-content:space-between;">
+      <div>
+        <h1>Queue Monitor</h1>
+        <p>Live watch of the V Holding queue — auto-requeues when a driver leaves.</p>
+      </div>
+      <button class="btn btn-primary" id="btn-add-watch">+ Watch Vehicle</button>
+    </div>
+
+    <!-- Poll status bar -->
+    <div id="monitor-status-bar" style="
+      display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+      background:var(--bg2); border:1px solid var(--border);
+      border-radius:12px; padding:12px 18px; margin-bottom:24px;
+      font-size:13px; color:var(--muted2);">
+      <span id="mon-live-indicator" style="display:flex;align-items:center;gap:6px;">
+        <span id="mon-dot" style="width:8px;height:8px;border-radius:50%;background:var(--muted);display:inline-block;"></span>
+        <span id="mon-live-label">Connecting…</span>
+      </span>
+      <span>|</span>
+      <span>Queue: <strong id="mon-waiting" style="color:var(--white);">—</strong> waiting
+            &nbsp;·&nbsp;<strong id="mon-dispatched" style="color:var(--amber);">—</strong> dispatched</span>
+      <span>|</span>
+      <span>Last poll: <strong id="mon-last-poll" style="color:var(--white);">—</strong></span>
+      <span>|</span>
+      <span>Fetch: <strong id="mon-fetch-ms" style="color:var(--white);">—</strong></span>
+      <span style="margin-left:auto;font-size:11px;color:var(--muted);" id="mon-queue-url"></span>
+    </div>
+
+    <!-- Watch cards -->
+    <div id="monitor-watches" style="display:flex;flex-direction:column;gap:14px;"></div>
+    <div id="monitor-empty" style="
+      display:none; text-align:center; padding:60px 20px;
+      color:var(--muted); font-size:14px;">
+      <div style="font-size:40px;margin-bottom:12px;">🔍</div>
+      <div style="font-weight:600;margin-bottom:6px;">No drivers being monitored</div>
+      <div>Click <strong>+ Watch Vehicle</strong> to start tracking a driver's queue position.</div>
+    </div>
+
+    <!-- Recent re-queue events log -->
+    <div id="monitor-events-wrap" style="margin-top:32px; display:none;">
+      <div class="table-wrap">
+        <div class="table-header">
+          <h3>Auto Re-Queue Events</h3>
+          <span style="font-size:12px;color:var(--muted2);">Most recent first</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Vehicle</th>
+              <th>Driver</th>
+              <th>Result</th>
+              <th>Position</th>
+              <th>Details</th>
+            </tr>
+          </thead>
+          <tbody id="monitor-events-body">
+            <tr><td colspan="6" style="text-align:center;color:var(--muted2);padding:20px;">No events yet</td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
   </div>
@@ -648,6 +845,8 @@
 <script src="/js/admin/drivers.controller.js"></script>
 <script src="/js/admin/logs.controller.js"></script>
 <script src="/js/admin/overview.controller.js"></script>
+<script src="/js/admin/watchlist.controller.js"></script>
+<script src="/js/admin/monitor.controller.js"></script>
 <script src="/js/admin/auth.controller.js"></script>
 <script src="/js/admin/app.js"></script>
 </body>

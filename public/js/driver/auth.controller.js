@@ -17,7 +17,7 @@ document.getElementById('btn-show-forgot').addEventListener('click', () => {
 
 document.getElementById('btn-forgot-back').addEventListener('click', () => showView('view-login'));
 
-// ─── Forgot password ─────────────────────────────────────────────────────────
+// ─── Forgot password — send reset link ───────────────────────────────────────
 document.getElementById('btn-forgot-submit').addEventListener('click', async () => {
   const email = document.getElementById('forgot-email').value.trim();
   const errEl = document.getElementById('forgot-error');
@@ -30,28 +30,52 @@ document.getElementById('btn-forgot-submit').addEventListener('click', async () 
   btn.innerHTML = '<span class="spinner"></span> Sending…'; btn.disabled = true;
 
   try {
-    const data = await api('/api/auth/driver/reset-password', {
+    await api('/api/auth/driver/forgot-password', {
       method: 'POST', body: JSON.stringify({ email }),
     });
     document.getElementById('forgot-email').value = '';
-    if (data.tempPassword) {
-      document.getElementById('forgot-temp-pw').textContent = data.tempPassword;
-      document.getElementById('forgot-success-box').style.display = 'block';
-      document.getElementById('btn-forgot-copy').onclick = () => {
-        navigator.clipboard.writeText(data.tempPassword).then(() => {
-          document.getElementById('btn-forgot-copy').textContent = '✓ Copied';
-        });
-      };
-    } else {
-      // Fallback: email not found (server returns same message to avoid enumeration)
-      errEl.textContent = 'No account found with that email address.';
-    }
+    document.getElementById('forgot-success-box').style.display = 'block';
   } catch (err) {
     errEl.textContent = err.message;
   } finally {
-    btn.innerHTML = 'Reset Password'; btn.disabled = false;
+    btn.innerHTML = 'Send Reset Link'; btn.disabled = false;
   }
 });
+
+// ─── Reset password — confirm new password (linked from email) ────────────────
+document.getElementById('btn-reset-submit').addEventListener('click', async () => {
+  const token       = document.getElementById('reset-token').value;
+  const newPassword = document.getElementById('reset-new-password').value;
+  const confirm     = document.getElementById('reset-confirm-password').value;
+  const errEl       = document.getElementById('reset-error');
+  errEl.textContent = '';
+  document.getElementById('reset-success-box').style.display = 'none';
+
+  if (!newPassword || !confirm)   { errEl.textContent = 'Please fill in both password fields.'; return; }
+  if (newPassword.length < 6)     { errEl.textContent = 'Password must be at least 6 characters.'; return; }
+  if (newPassword !== confirm)    { errEl.textContent = 'Passwords do not match.'; return; }
+
+  const btn = document.getElementById('btn-reset-submit');
+  btn.innerHTML = '<span class="spinner"></span> Updating…'; btn.disabled = true;
+
+  try {
+    await api('/api/auth/driver/reset-password', {
+      method: 'POST', body: JSON.stringify({ token, newPassword }),
+    });
+    document.getElementById('reset-new-password').value    = '';
+    document.getElementById('reset-confirm-password').value = '';
+    document.getElementById('reset-success-box').style.display = 'block';
+    btn.style.display = 'none';
+    // After 2.5 s take them to login
+    setTimeout(() => { btn.style.display = ''; showView('view-login'); }, 2500);
+  } catch (err) {
+    errEl.textContent = err.message;
+  } finally {
+    btn.innerHTML = 'Set New Password'; btn.disabled = false;
+  }
+});
+
+document.getElementById('btn-reset-back').addEventListener('click', () => showView('view-login'));
 
 // ─── Login ───────────────────────────────────────────────────────────────────
 document.getElementById('btn-login').addEventListener('click', async () => {

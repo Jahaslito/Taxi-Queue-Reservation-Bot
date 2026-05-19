@@ -93,6 +93,18 @@ class Log {
       .first();
   }
 
+  /**
+   * Count how many monitor_requeue logs a driver has today.
+   * Used on startup to restore requeueCountToday after a restart.
+   */
+  static findTodayMonitorRequeues(driverId, today) {
+    return db(TABLE)
+      .where({ driver_id: driverId, trigger_type: 'monitor_requeue', status: 'success' })
+      .whereRaw("DATE(triggered_at AT TIME ZONE 'America/Los_Angeles') = ?", [today])
+      .count('* as count')
+      .first();
+  }
+
   static countByStatusAndDate(status, date) {
     return db(TABLE)
       .where({ status })

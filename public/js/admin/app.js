@@ -36,13 +36,21 @@ async function api(path, options = {}) {
 }
 
 // ─── Navigation ───────────────────────────────────────────────────────────────
-const CONTENT_PAGES = ['page-overview', 'page-drivers', 'page-logs'];
+const CONTENT_PAGES = ['page-overview', 'page-drivers', 'page-logs', 'page-monitor', 'page-watchlist'];
+
+let _activePage = null; // track current page for hide callbacks
 
 function showPage(pageId) {
+  // Fire hide callbacks for the page we're leaving
+  if (_activePage === 'page-monitor'   && pageId !== 'page-monitor')   { if (typeof onMonitorPageHide   === 'function') onMonitorPageHide();   }
+  if (_activePage === 'page-watchlist' && pageId !== 'page-watchlist') { if (typeof onWatchlistPageHide === 'function') onWatchlistPageHide(); }
+
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-link').forEach(n => n.classList.remove('active'));
   document.getElementById(pageId).classList.add('active');
   document.querySelector(`[data-page="${pageId}"]`)?.classList.add('active');
+
+  _activePage = pageId;
 
   // Persist the active content tab so it survives page refreshes
   if (CONTENT_PAGES.includes(pageId)) {
@@ -52,6 +60,8 @@ function showPage(pageId) {
   if (pageId === 'page-overview') loadOverview();
   if (pageId === 'page-drivers')  loadDrivers();
   if (pageId === 'page-logs')     loadLogs();
+  if (pageId === 'page-monitor')   { if (typeof onMonitorPageShow   === 'function') onMonitorPageShow();   }
+  if (pageId === 'page-watchlist') { if (typeof onWatchlistPageShow === 'function') onWatchlistPageShow(); }
 }
 
 // Wire sidebar nav links

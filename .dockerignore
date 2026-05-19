@@ -6,3 +6,11 @@ data/
 *.db
 *.db-shm
 *.db-wal
+# Test & dev artefacts — not needed in the production image
+tests/
+coverage/
+jest.config.js
+# Local tooling
+.claude/
+# Flyers & design assets
+flyers/

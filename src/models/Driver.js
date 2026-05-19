@@ -2,10 +2,11 @@ const db = require('../config/database');
 
 const TABLE = 'drivers';
 
-// Columns safe to return to API consumers (excludes credentials)
+// Columns safe to return to API consumers (excludes credentials and tokens)
 const PUBLIC_FIELDS = [
   'id', 'name', 'phone', 'email', 'san_username',
-  'vehicle_number', 'scheduled_time', 'scheduled_days', 'day_schedules', 'is_active', 'notes', 'created_at',
+  'vehicle_number', 'scheduled_time', 'scheduled_days', 'day_schedules',
+  'is_active', 'monitor_enabled', 'notes', 'created_at', 'email_verified_at',
 ];
 
 class Driver {
@@ -35,6 +36,13 @@ class Driver {
   /** Returns all active drivers (all columns) for the new day_schedules-based scheduler */
   static findAllActive() {
     return db(TABLE).select(PUBLIC_FIELDS.concat(['san_password'])).where({ is_active: true });
+  }
+
+  /** Returns active drivers with monitor_enabled=true (includes san_password for re-queue) */
+  static findAllMonitored() {
+    return db(TABLE)
+      .select(PUBLIC_FIELDS.concat(['san_password']))
+      .where({ is_active: true, monitor_enabled: true });
   }
 
   static async create(data) {
@@ -115,6 +123,20 @@ class Driver {
         if (activeOnly) q.where('d.is_active', true);
       })
       .count('* as count')
+      .first();
+  }
+
+  /** Find a driver by their email verification token (includes token columns) */
+  static findByVerificationToken(token) {
+    return db(TABLE)
+      .where({ email_verification_token: token })
+      .first();
+  }
+
+  /** Find a driver by their password reset token (includes token columns) */
+  static findByResetToken(token) {
+    return db(TABLE)
+      .where({ password_reset_token: token })
       .first();
   }
 

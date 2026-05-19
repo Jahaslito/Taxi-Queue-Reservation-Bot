@@ -37,6 +37,10 @@ async function loadDashboard() {
     document.getElementById('dash-inactive-banner').style.display =
       driverProfile.is_active ? 'none' : 'block';
 
+    // Show email verification banner if driver has an email but hasn't verified it
+    const needsVerify = driverProfile.email && !driverProfile.email_verified_at;
+    document.getElementById('dash-verify-banner').style.display = needsVerify ? 'block' : 'none';
+
     const statusData = await api('/api/driver/status/today');
     renderTodayStatus(statusData.todayLog);
 

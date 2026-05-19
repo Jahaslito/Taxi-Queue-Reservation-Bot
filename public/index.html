@@ -386,8 +386,8 @@
   </header>
 
   <div style="padding:28px 0 8px;">
-    <h2 style="font-family:'Syne',sans-serif;font-size:24px;font-weight:800;">Reset Password</h2>
-    <p style="color:var(--muted);font-size:14px;margin-top:6px;">Enter your email and we'll generate a temporary password for you.</p>
+    <h2 style="font-family:'Syne',sans-serif;font-size:24px;font-weight:800;">Forgot Password</h2>
+    <p style="color:var(--muted);font-size:14px;margin-top:6px;">Enter your email and we'll send you a link to reset your password.</p>
   </div>
 
   <div class="form-section">
@@ -396,18 +396,49 @@
       <input type="email" id="forgot-email" placeholder="your@email.com" autocomplete="email" />
     </div>
     <div class="error-msg" id="forgot-error"></div>
-    <div id="forgot-success-box" style="display:none;background:var(--surface-2,#1e2a1e);border:1px solid var(--green);border-radius:10px;padding:16px;margin-bottom:12px;">
-      <p style="color:var(--green);font-size:13px;margin:0 0 10px;font-weight:600;">✅ Password reset!</p>
-      <p style="color:var(--muted);font-size:13px;margin:0 0 10px;">Your temporary password is:</p>
-      <div style="display:flex;align-items:center;gap:10px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px;">
-        <code id="forgot-temp-pw" style="font-size:18px;letter-spacing:2px;color:var(--fg);flex:1;font-family:monospace;"></code>
-        <button id="btn-forgot-copy" style="padding:5px 12px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--fg);cursor:pointer;font-size:12px;white-space:nowrap;">Copy</button>
-      </div>
-      <p style="color:var(--muted);font-size:12px;margin:10px 0 0;">Log in with this password, then change it in your profile settings.</p>
+    <div id="forgot-success-box" style="display:none;background:rgba(0,180,255,0.07);border:1px solid rgba(0,180,255,0.25);border-radius:12px;padding:18px 16px;margin-bottom:12px;">
+      <p style="color:#00b4ff;font-size:14px;font-weight:700;margin:0 0 6px;">📧 Check your email</p>
+      <p style="color:var(--muted);font-size:13px;margin:0;">If that email is registered, a reset link is on its way. It expires in <strong style="color:var(--fg);">1 hour</strong>.</p>
     </div>
-    <button class="btn btn-primary" id="btn-forgot-submit">Reset Password</button>
+    <button class="btn btn-primary" id="btn-forgot-submit">Send Reset Link</button>
     <div style="text-align:center;margin-top:16px;">
       <button class="btn-link" id="btn-forgot-back">← Back to Login</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════ RESET PASSWORD VIEW ════ -->
+<div class="view" id="view-reset-password">
+  <header class="app-header">
+    <div class="logo">
+      <div class="logo-dot"></div>
+      <div class="logo-text">SAN <span>Queue</span></div>
+    </div>
+  </header>
+
+  <div style="padding:28px 0 8px;">
+    <h2 style="font-family:'Syne',sans-serif;font-size:24px;font-weight:800;">Set New Password</h2>
+    <p style="color:var(--muted);font-size:14px;margin-top:6px;">Choose a new password for your account.</p>
+  </div>
+
+  <div class="form-section">
+    <input type="hidden" id="reset-token" />
+    <div class="form-group">
+      <label>New Password</label>
+      <input type="password" id="reset-new-password" placeholder="At least 6 characters" autocomplete="new-password" />
+    </div>
+    <div class="form-group">
+      <label>Confirm Password</label>
+      <input type="password" id="reset-confirm-password" placeholder="Repeat your new password" autocomplete="new-password" />
+    </div>
+    <div class="error-msg" id="reset-error"></div>
+    <div id="reset-success-box" style="display:none;background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.3);border-radius:12px;padding:14px 16px;margin-bottom:12px;">
+      <p style="color:#22c55e;font-size:13px;font-weight:700;margin:0 0 4px;">✅ Password updated!</p>
+      <p style="color:var(--muted);font-size:13px;margin:0;">You can now log in with your new password.</p>
+    </div>
+    <button class="btn btn-primary" id="btn-reset-submit">Set New Password</button>
+    <div style="text-align:center;margin-top:16px;">
+      <button class="btn-link" id="btn-reset-back">← Back to Login</button>
     </div>
   </div>
 </div>
@@ -518,9 +549,16 @@
   </div>
 
   <!-- Deactivation banner -->
-  <div id="dash-inactive-banner" style="display:none;background:rgba(240,90,91,0.12);border:1px solid rgba(240,90,91,0.35);border-radius:14px;padding:14px 16px;margin-bottom:16px;display:none;">
+  <div id="dash-inactive-banner" style="display:none;background:rgba(240,90,91,0.12);border:1px solid rgba(240,90,91,0.35);border-radius:14px;padding:14px 16px;margin-bottom:16px;">
     <div style="font-weight:700;color:#F05A5B;margin-bottom:4px;">Account Deactivated</div>
     <div style="font-size:13px;color:var(--muted2);">Your account has been deactivated. The bot will not run until an admin reactivates it. Contact your administrator for help.</div>
+  </div>
+
+  <!-- Email verification banner -->
+  <div id="dash-verify-banner" style="display:none;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.28);border-radius:14px;padding:14px 16px;margin-bottom:16px;">
+    <div style="font-weight:700;color:#fbbf24;margin-bottom:4px;">📧 Verify your email</div>
+    <div style="font-size:13px;color:var(--muted2);margin-bottom:10px;">Check your inbox for a verification link. Verifying your email lets us send you password reset links.</div>
+    <button id="btn-resend-verification" class="btn btn-ghost btn-sm" style="font-size:12px;">Resend verification email</button>
   </div>
 
   <!-- Today's Status -->

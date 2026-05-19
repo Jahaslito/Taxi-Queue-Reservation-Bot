@@ -1,4 +1,25 @@
 const { chromium } = require('playwright');
+const fs           = require('fs');
+const path         = require('path');
+
+const DEBUG_DIR = process.env.BOT_DEBUG_DIR ?? '/tmp/san-bot-debug';
+fs.mkdirSync(DEBUG_DIR, { recursive: true });
+
+async function debugCapture(page, vehicleNumber, label) {
+  const ts   = Date.now();
+  const slug = `${vehicleNumber}_${label}_${ts}`;
+  const img  = path.join(DEBUG_DIR, `${slug}.png`);
+  const txt  = path.join(DEBUG_DIR, `${slug}.txt`);
+  try {
+    await page.screenshot({ path: img, fullPage: true });
+    const body = await page.textContent('body').catch(() => '(no body)');
+    const content = `URL: ${page.url()}\n\n${body}`;
+    fs.writeFileSync(txt, content, 'utf8');
+    console.log(`[Bot:debug] ${vehicleNumber} — ${label}\n  screenshot: ${img}\n  text:       ${txt}\n  url:        ${page.url()}\n  body(200):  ${body.replace(/\s+/g, ' ').slice(0, 200)}`);
+  } catch (e) {
+    console.warn(`[Bot:debug] capture failed (${label}): ${e.message}`);
+  }
+}
 
 // Entry point — redirects to OIDC login, then back to the app after auth
 const SAN_URL     = 'https://san.gtcvms.com/gsidispatch.edispatch';
@@ -21,6 +42,7 @@ const NAV_TIMEOUT = 60000;   // Extra time for full page-navigation round-trips
 async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
   const startTime = Date.now();
   let browser = null;
+  let page    = null;
 
   try {
     browser = await chromium.launch({
@@ -42,7 +64,7 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
       acceptDownloads: false
     });
 
-    const page = await context.newPage();
+    page = await context.newPage();
 
     // ─── STEP 1: Navigate ─────────────────────────────────────────────────────
     // Navigating to the app URL triggers an OIDC redirect to:
@@ -74,6 +96,9 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
     // Let the SPA fully hydrate before querying the DOM
     await page.waitForLoadState('networkidle', { timeout: TIMEOUT }).catch(() => {});
 
+    // Debug: capture what the page looks like right after login, before any waitForFunction
+    await debugCapture(page, vehicleNumber, 'after_login');
+
     // ─── STEP 3: Check for wrong-credentials error ────────────────────────────
     // If the URL is still on the identity server, login failed
     if (page.url().includes(OIDC_HOST)) {
@@ -92,6 +117,7 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
         const onWaitScreen = document.body.innerText.includes('Remove From Queue');
         return hasSearch || onWaitScreen;
       },
+      null,
       { timeout: TIMEOUT }
     );
 
@@ -119,6 +145,7 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
             document.body.innerText.includes('not found')         ||
             document.body.innerText.includes('No vehicle')        ||
             document.body.innerText.includes('No results'),
+      null,
       { timeout: TIMEOUT }
     );
 
@@ -147,6 +174,7 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
     // Wait for WAIT confirmation screen — "Remove From Queue" is unique to this screen
     await page.waitForFunction(
       () => document.body.innerText.includes('Remove From Queue'),
+      null,
       { timeout: TIMEOUT }
     );
     console.log(`[Bot] ${vehicleNumber} → ✓ Successfully added to queue!`);
@@ -163,6 +191,8 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
 
   } catch (err) {
     console.error(`[Bot] ${vehicleNumber} → ERROR: ${err.message}`);
+    // Capture page state at the moment of failure so we can see what the bot was looking at
+    if (page) await debugCapture(page, vehicleNumber, 'error');
     return {
       success: false,
       durationMs: Date.now() - startTime,

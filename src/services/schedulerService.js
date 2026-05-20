@@ -7,7 +7,7 @@ const { addToQueue } = require('./botService');
 // In-memory set prevents the same driver from running twice simultaneously
 const runningJobs = new Set();
 
-const MAX_CONCURRENT = 5;
+const MAX_CONCURRENT = parseInt(process.env.SCHEDULER_CONCURRENCY ?? '5', 10);
 const MAX_RETRIES    = 3;
 // Both values are overridable via env so tests can set them to 0 for speed
 const BASE_RETRY_MS  = parseInt(process.env.RETRY_BASE_MS  ?? '5000', 10); // 5s → 10s → 20s
@@ -18,6 +18,7 @@ const MAX_JITTER_MS  = parseInt(process.env.RETRY_JITTER_MS ?? '2000', 10); // u
  * (wrong credentials, vehicle not found). Everything else is transient.
  */
 function isTransientError(result) {
+  if (result.dispatched) return false;
   const msg = (result.error || result.message || '').toLowerCase();
   if (msg.includes('invalid san') || msg.includes('check credentials') || msg.includes('login failed')) return false;
   if (msg.includes('not found')) return false;
@@ -156,6 +157,9 @@ function startScheduler() {
 
       // Filter to those scheduled right now
       const drivers = allDrivers.filter(driver => {
+        // Position-scheduled drivers are triggered by the monitor, not cron
+        if (driver.scheduled_position || driver.day_positions) return false;
+
         if (driver.day_schedules) {
           try {
             const ds = JSON.parse(driver.day_schedules);

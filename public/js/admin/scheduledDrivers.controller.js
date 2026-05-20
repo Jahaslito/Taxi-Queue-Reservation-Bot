@@ -20,6 +20,7 @@ function todayDayIndex() {
 // Returns the per-day time if configured, or the legacy scheduled_time.
 // Returns '—' if the driver is not scheduled today.
 function effectiveTime(driver) {
+  if (driver.scheduled_position || driver.day_positions) return null;
   const d = todayDayIndex();
   if (driver.day_schedules) {
     try {
@@ -69,9 +70,11 @@ function applySDFFilters() {
   const time = document.getElementById('sdf-filter-time').value.trim();
 
   sdfFiltered = sdfAllDrivers.filter(d => {
-    if (name && !d.name.toLowerCase().includes(name))               return false;
-    if (car  && !d.vehicle_number.toLowerCase().includes(car))      return false;
-    if (time && !effectiveTime(d).includes(time))                   return false;
+    const et = effectiveTime(d);
+    if (!et) return false; // position-scheduled — never shown in the time modal
+    if (name && !d.name.toLowerCase().includes(name))          return false;
+    if (car  && !d.vehicle_number.toLowerCase().includes(car)) return false;
+    if (time && !et.includes(time))                            return false;
     return true;
   });
 

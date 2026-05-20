@@ -18,22 +18,25 @@ function relTime(iso) {
   const secs = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
   if (secs < 60)  return `${secs}s ago`;
   if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
-  return new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+  return new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Los_Angeles' });
 }
 
 function fmtTime(iso) {
   if (!iso) return '—';
-  return new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'America/Los_Angeles' });
 }
 
 // ─── State badge ─────────────────────────────────────────────────────────────
-function stateBadge(state) {
+function stateBadge(s) {
+  const state = typeof s === 'string' ? s : s.state;
   const map = {
-    watching:   ['var(--muted2)',  '👁',  'WATCHING'],
-    in_queue:   ['var(--green)',   '✅', 'IN QUEUE'],
-    dispatched: ['var(--amber)',   '🚖', 'DISPATCHED'],
-    gone:       ['var(--red)',     '🔴', 'GONE'],
-    requeuing:  ['var(--blue)',    '⚡', 'RE-QUEUING'],
+    watching:        ['var(--muted2)',  '👁',  'WATCHING'],
+    in_queue:        ['var(--green)',   '✅', 'IN QUEUE'],
+    dispatched:      ['var(--amber)',   '🚖', 'DISPATCHED'],
+    at_terminal:     ['var(--purple)',  '🏁', 'AT TERMINAL'],
+    gone:            ['var(--red)',     '🔴', 'GONE'],
+    requeuing:       ['var(--blue)',    '⚡', 'RE-QUEUING'],
+    not_authorized:  ['var(--red)',     '🚫', 'NOT AUTHORIZED'],
   };
   const [color, icon, label] = map[state] || ['var(--muted)', '?', state.toUpperCase()];
   return `<span style="
@@ -47,11 +50,13 @@ function stateBadge(state) {
 // ─── Render a single watch card ───────────────────────────────────────────────
 function renderCard(s) {
   const stateColor = {
-    watching:   'var(--muted)',
-    in_queue:   'var(--green)',
-    dispatched: 'var(--amber)',
-    gone:       'var(--red)',
-    requeuing:  'var(--blue)',
+    watching:        'var(--muted)',
+    in_queue:        'var(--green)',
+    dispatched:      'var(--amber)',
+    at_terminal:     'var(--purple)',
+    gone:            'var(--red)',
+    requeuing:       'var(--blue)',
+    not_authorized:  'var(--red)',
   }[s.state] || 'var(--muted)';
 
   // Recent events for this driver
@@ -69,13 +74,22 @@ function renderCard(s) {
       }).join('')
     : '<div style="font-size:12px;color:var(--muted);margin-top:6px;">No re-queue events yet</div>';
 
-  const posHtml = s.currentPosition != null
-    ? `<div title="Last placed at #${s.lastPosition ?? '—'}" style="
-        font-family:'IBM Plex Mono',monospace;font-size:20px;font-weight:700;
-        color:${stateColor};min-width:60px;text-align:right;cursor:default;">
-        #${s.currentPosition}
+  // Position display: show terminal position when at_terminal, V Holding pos otherwise
+  const posHtml = s.state === 'at_terminal' && s.terminalName
+    ? `<div style="text-align:right;cursor:default;">
+        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:var(--purple);margin-bottom:2px;">${esc(s.terminalName)}</div>
+        <div title="Position in ${esc(s.terminalName)} list" style="
+            font-family:'IBM Plex Mono',monospace;font-size:20px;font-weight:700;color:var(--purple);">
+          ${s.terminalPosition != null ? `#${s.terminalPosition}` : '…'}
+        </div>
       </div>`
-    : '';
+    : s.currentPosition != null
+      ? `<div title="Last placed at #${s.lastPosition ?? '—'}" style="
+            font-family:'IBM Plex Mono',monospace;font-size:20px;font-weight:700;
+            color:${stateColor};min-width:60px;text-align:right;cursor:default;">
+            #${s.currentPosition}
+          </div>`
+      : '';
 
   return `<div class="mon-card" data-driver-id="${s.driverId}" style="
       background:var(--bg2);border:1px solid ${stateColor}40;
@@ -97,10 +111,10 @@ function renderCard(s) {
 
     <div style="display:flex;gap:24px;flex-wrap:wrap;margin-top:14px;font-size:13px;color:var(--muted2);">
       <span>Watching since: <strong style="color:var(--white);">${fmtTime(s.addedAt)}</strong></span>
-      ${s.lastSeenAt     ? `<span>Last in queue: <strong style="color:var(--white);">${fmtTime(s.lastSeenAt)}</strong></span>` : ''}
-      ${s.lastDispatchAt ? `<span>Dispatched at: <strong style="color:var(--amber);">${fmtTime(s.lastDispatchAt)}</strong></span>` : ''}
-      ${s.lastGoneAt     ? `<span>Gone at: <strong style="color:var(--red);">${fmtTime(s.lastGoneAt)}</strong></span>` : ''}
-      ${s.lastRequeuedAt ? `<span>Last re-queue: <strong style="color:var(--blue);">${fmtTime(s.lastRequeuedAt)}</strong></span>` : ''}
+      ${s.lastSeenAt      ? `<span>Last in queue: <strong style="color:var(--white);">${fmtTime(s.lastSeenAt)}</strong></span>` : ''}
+      ${s.lastDispatchAt  ? `<span>Dispatched at: <strong style="color:var(--amber);">${fmtTime(s.lastDispatchAt)}</strong></span>` : ''}
+      ${s.atTerminalSince ? `<span>At terminal: <strong style="color:var(--purple);">${fmtTime(s.atTerminalSince)}</strong></span>` : ''}
+      ${s.lastRequeuedAt  ? `<span>Last re-queue: <strong style="color:var(--blue);">${fmtTime(s.lastRequeuedAt)}</strong></span>` : ''}
     </div>
 
     <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border);">

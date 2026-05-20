@@ -105,6 +105,73 @@ class Log {
       .first();
   }
 
+  static findTodayByTriggerType(driverId, triggerType, today) {
+    return db(TABLE)
+      .where({ driver_id: driverId, trigger_type: triggerType })
+      .whereRaw("DATE(triggered_at AT TIME ZONE 'America/Los_Angeles') = ?", [today])
+      .first();
+  }
+
+  /**
+   * Batch-load all startup context for many drivers in 3 parallel queries.
+   * Replaces the O(n × 3) sequential per-driver queries in watchAllActive().
+   *
+   * Returns:
+   *   latestByDriver        Map<driverId, log>    — most recent log today
+   *   requeueCountByDriver  Map<driverId, number> — successful monitor_requeue count today
+   *   positionLogByDriver   Map<driverId, log>    — most recent position_schedule log today
+   */
+  static async loadTodayContext(driverIds, today) {
+    if (!driverIds.length) {
+      return {
+        latestByDriver:       new Map(),
+        requeueCountByDriver: new Map(),
+        positionLogByDriver:  new Map(),
+      };
+    }
+
+    const dateFilter = "DATE(triggered_at AT TIME ZONE 'America/Los_Angeles') = ?";
+
+    const [allToday, requeues, positionLogs] = await Promise.all([
+      db(TABLE)
+        .whereIn('driver_id', driverIds)
+        .whereRaw(dateFilter, [today])
+        .orderBy('triggered_at', 'desc'),
+
+      db(TABLE)
+        .whereIn('driver_id', driverIds)
+        .where({ trigger_type: 'monitor_requeue', status: 'success' })
+        .whereRaw(dateFilter, [today])
+        .groupBy('driver_id')
+        .select('driver_id')
+        .count('* as count'),
+
+      db(TABLE)
+        .whereIn('driver_id', driverIds)
+        .where({ trigger_type: 'position_schedule' })
+        .whereRaw(dateFilter, [today])
+        .orderBy('triggered_at', 'desc'),
+    ]);
+
+    // First occurrence per driver_id = most recent (rows are ordered desc)
+    const latestByDriver = new Map();
+    for (const row of allToday) {
+      if (!latestByDriver.has(row.driver_id)) latestByDriver.set(row.driver_id, row);
+    }
+
+    const requeueCountByDriver = new Map();
+    for (const row of requeues) {
+      requeueCountByDriver.set(row.driver_id, parseInt(row.count, 10));
+    }
+
+    const positionLogByDriver = new Map();
+    for (const row of positionLogs) {
+      if (!positionLogByDriver.has(row.driver_id)) positionLogByDriver.set(row.driver_id, row);
+    }
+
+    return { latestByDriver, requeueCountByDriver, positionLogByDriver };
+  }
+
   static countByStatusAndDate(status, date) {
     return db(TABLE)
       .where({ status })

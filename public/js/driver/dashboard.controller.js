@@ -5,17 +5,34 @@
 //               loads after this file.
 
 // ─── Date/time formatters ────────────────────────────────────────────────────
+const PT = 'America/Los_Angeles';
+
 function formatDate(iso) {
   if (!iso) return '—';
   return new Date(iso).toLocaleDateString('en-US', {
     weekday: 'short', month: 'short', day: 'numeric',
-    hour: '2-digit', minute: '2-digit',
+    hour: '2-digit', minute: '2-digit', timeZone: PT,
   });
 }
 
 function formatTime(iso) {
   if (!iso) return '—';
-  return new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+  return new Date(iso).toLocaleTimeString('en-US', {
+    hour: '2-digit', minute: '2-digit', timeZone: PT,
+  });
+}
+
+// ─── Position schedule helpers ────────────────────────────────────────────────
+function getTodayPosition(profile) {
+  if (profile.day_positions) {
+    try {
+      const dp      = JSON.parse(profile.day_positions);
+      const abbr    = new Date().toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/Los_Angeles' });
+      const dayMap  = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+      return dp[String(dayMap[abbr])] ?? null;
+    } catch { return null; }
+  }
+  return profile.scheduled_position ?? null;
 }
 
 // ─── Requeue state ───────────────────────────────────────────────────────────
@@ -30,9 +47,16 @@ async function loadDashboard() {
     }
     document.getElementById('dash-name').textContent  = driverProfile.name;
     document.getElementById('dash-date').textContent  = new Date().toLocaleDateString('en-GB', {
-      weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+      weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: PT,
     });
-    document.getElementById('stat-time').textContent    = driverProfile.scheduled_time || '--:--';
+    if (driverProfile.day_positions || driverProfile.scheduled_position) {
+      const todayPos = getTodayPosition(driverProfile);
+      document.getElementById('stat-time').textContent     = todayPos ? `~${todayPos}` : '—';
+      document.getElementById('stat-time-lbl').textContent = 'Target Position';
+    } else {
+      document.getElementById('stat-time').textContent     = driverProfile.scheduled_time || '--:--';
+      document.getElementById('stat-time-lbl').textContent = 'Scheduled Time';
+    }
     document.getElementById('stat-vehicle').textContent = driverProfile.vehicle_number;
     document.getElementById('dash-inactive-banner').style.display =
       driverProfile.is_active ? 'none' : 'block';
@@ -59,12 +83,18 @@ function renderTodayStatus(log) {
   const el = document.getElementById('today-status-content');
 
   if (!log) {
+    const todayPos  = driverProfile ? getTodayPosition(driverProfile) : null;
+    const schedInfo = todayPos
+      ? `📍 position <strong style="color:var(--white);">~${todayPos}</strong>`
+      : (driverProfile?.day_positions || driverProfile?.scheduled_position)
+        ? '📍 position-based schedule (no target for today)'
+        : `<strong style="color:var(--white);">${driverProfile?.scheduled_time || '--:--'}</strong> PT`;
     el.innerHTML = `
       <div style="display:flex;align-items:center;gap:12px;">
         <div style="font-size:28px;">⏳</div>
         <div>
           <div style="font-weight:600;">Not yet queued today</div>
-          <div style="font-size:13px;color:var(--muted);">Scheduled for <strong style="color:var(--white);">${driverProfile?.scheduled_time || '--:--'}</strong> PT</div>
+          <div style="font-size:13px;color:var(--muted);">Scheduled by ${schedInfo}</div>
         </div>
       </div>`;
     return;

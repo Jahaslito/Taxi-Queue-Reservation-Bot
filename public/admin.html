@@ -17,6 +17,7 @@
       --red:     #F05A5B;
       --green:   #27C083;
       --blue:    #4F8EF7;
+      --purple:  #A78BFA;
       --white:   #E8EDF8;
       --muted:   #5A6585;
       --muted2:  #8A94B8;
@@ -415,6 +416,24 @@
         </tbody>
       </table>
     </div>
+
+    <!-- Position-scheduled drivers -->
+    <div class="table-wrap" id="position-breakdown-wrap" style="margin-top:16px;display:none;">
+      <div class="table-header">
+        <div>
+          <h3>📍 Position-Scheduled</h3>
+          <div style="font-size:12px;color:var(--muted2);margin-top:2px;">Triggered by queue depth — no fixed time</div>
+        </div>
+      </div>
+      <table>
+        <thead><tr>
+          <th>Driver</th>
+          <th>Vehicle</th>
+          <th>Target Position Today</th>
+        </tr></thead>
+        <tbody id="position-breakdown-body"></tbody>
+      </table>
+    </div>
   </div>
 
   <!-- ══════════ DRIVERS PAGE ══════════ -->
@@ -720,10 +739,6 @@
 
     <div class="form-row">
       <div class="form-group">
-        <label>Queue Time (PT) *</label>
-        <input type="time" id="m-time" value="05:00" />
-      </div>
-      <div class="form-group">
         <label>Active</label>
         <select id="m-active">
           <option value="1">Active</option>
@@ -733,11 +748,35 @@
     </div>
 
     <div class="form-group">
-      <label>Weekly Schedule</label>
-      <button type="button" class="btn btn-ghost" id="btn-open-admin-day-sched" style="width:100%;">
-        📅 Configure Weekly Schedule
-      </button>
-      <div id="admin-sched-summary" style="font-size:12px;color:var(--muted2);margin-top:6px;"></div>
+      <label>Schedule Type</label>
+      <div style="display:flex;gap:8px;margin-top:4px;">
+        <button type="button" id="m-sched-type-time" class="btn btn-primary" style="flex:1;font-size:13px;">⏰ Time</button>
+        <button type="button" id="m-sched-type-pos"  class="btn btn-ghost"   style="flex:1;font-size:13px;">📍 Position</button>
+      </div>
+    </div>
+
+    <div id="m-sched-time-block">
+      <div class="form-group">
+        <label>Queue Time (PT)</label>
+        <input type="time" id="m-time" value="05:00" />
+      </div>
+      <div class="form-group">
+        <label>Weekly Schedule</label>
+        <button type="button" class="btn btn-ghost" id="btn-open-admin-day-sched" style="width:100%;">
+          📅 Configure Weekly Schedule
+        </button>
+        <div id="admin-sched-summary" style="font-size:12px;color:var(--muted2);margin-top:6px;"></div>
+      </div>
+    </div>
+
+    <div id="m-sched-pos-block" style="display:none;">
+      <div class="form-group">
+        <label>Per-Day Position Schedule</label>
+        <button type="button" class="btn btn-ghost" id="btn-open-admin-pos-sched" style="width:100%;">
+          📅 Configure Per-Day Positions
+        </button>
+        <div id="admin-pos-summary" style="font-size:12px;color:var(--muted2);margin-top:6px;"></div>
+      </div>
     </div>
 
     <div class="form-group">
@@ -749,6 +788,19 @@
     <div class="modal-actions">
       <button class="btn btn-ghost" id="btn-cancel-modal">Cancel</button>
       <button class="btn btn-primary" id="btn-save-driver">Save Driver</button>
+    </div>
+  </div>
+</div>
+
+<!-- Admin per-day position modal -->
+<div class="modal-overlay" id="admin-pos-schedule-modal" style="z-index:950;">
+  <div class="modal" style="max-width:380px;width:100%;">
+    <h3 style="margin-bottom:4px;">Position Schedule</h3>
+    <p style="font-size:13px;color:var(--muted2);margin-bottom:20px;">Set target queue position for each day. Toggle a day off to skip it.</p>
+    <div id="admin-pos-schedule-rows"></div>
+    <div class="modal-actions" style="margin-top:20px;">
+      <button class="btn btn-ghost" id="btn-admin-pos-sched-cancel">Cancel</button>
+      <button class="btn btn-primary" id="btn-admin-pos-sched-confirm">Apply</button>
     </div>
   </div>
 </div>

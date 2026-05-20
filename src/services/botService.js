@@ -1,6 +1,26 @@
 const { chromium } = require('playwright');
+const crypto       = require('crypto');
 const fs           = require('fs');
 const path         = require('path');
+
+// ─── Proxy rotation ───────────────────────────────────────────────────────────
+// Returns a Playwright-compatible proxy config with a fresh session ID, or null
+// if PROXY_SERVER is not set (proxy disabled — all traffic goes via server IP).
+//
+// Supported providers and their username formats:
+//   Bright Data:  brd-customer-XXXX-zone-residential-session-{session}
+//   Oxylabs:      customer-XXXX-sessid-{session}
+//   Smartproxy:   user-XXXX-sessionid-{session}
+//
+// Set PROXY_USERNAME with {session} where the random ID should be inserted.
+// Each addToQueue() call gets a unique session → a different residential IP.
+function getProxyConfig() {
+  const server = process.env.PROXY_SERVER;
+  if (!server) return null;
+  const sessionId = crypto.randomBytes(8).toString('hex');
+  const username  = (process.env.PROXY_USERNAME || '').replace('{session}', sessionId);
+  return { server, username, password: process.env.PROXY_PASSWORD || '' };
+}
 
 const DEBUG_DIR = process.env.BOT_DEBUG_DIR ?? '/tmp/san-bot-debug';
 fs.mkdirSync(DEBUG_DIR, { recursive: true });
@@ -56,12 +76,18 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
       ]
     });
 
+    const proxyConfig = getProxyConfig();
+    if (proxyConfig) {
+      console.log(`[Bot] ${vehicleNumber} → Using proxy session ${proxyConfig.username.split('-session-')[1] ?? '?'}`);
+    }
+
     const context = await browser.newContext({
       // Mobile UA matches what the site expects (optimised for mobile)
       userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
-      viewport: { width: 390, height: 844 },
-      permissions: [],
-      acceptDownloads: false
+      viewport:  { width: 390, height: 844 },
+      permissions:     [],
+      acceptDownloads: false,
+      ...(proxyConfig ? { proxy: proxyConfig } : {}),
     });
 
     page = await context.newPage();
@@ -110,16 +136,36 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
     }
 
     // ─── STEP 4: Wait for either the search page OR the WAIT screen ─────────────
-    // When already queued, SAN skips the search page and shows the WAIT screen directly
+    // When already queued, SAN skips the search page and shows the WAIT screen directly.
+    // When dispatched to a terminal, SAN shows a /status page — detect and bail early.
     await page.waitForFunction(
       () => {
-        const hasSearch = document.querySelector('input[placeholder="Vehicle Dispatch Name"]') !== null;
+        const hasSearch    = document.querySelector('input[placeholder="Vehicle Dispatch Name"]') !== null;
         const onWaitScreen = document.body.innerText.includes('Remove From Queue');
-        return hasSearch || onWaitScreen;
+        const onDispatch   = document.body.innerText.includes('Dispatched: T');
+        return hasSearch || onWaitScreen || onDispatch;
       },
       null,
       { timeout: TIMEOUT }
     );
+
+    // If SAN shows the driver is dispatched to a terminal, we cannot re-queue yet
+    const isDispatched = await page.evaluate(() =>
+      document.body.innerText.includes('Dispatched: T')
+    ).catch(() => false);
+    if (isDispatched) {
+      const bodyText = await page.textContent('body').catch(() => '');
+      const termMatch = bodyText.match(/Dispatched:\s*(T\d+)/i);
+      const terminal = termMatch ? termMatch[1] : 'terminal';
+      console.log(`[Bot] ${vehicleNumber} → Dispatched to ${terminal} — cannot re-queue yet.`);
+      return {
+        success: false,
+        dispatched: true,
+        durationMs: Date.now() - startTime,
+        error: `Vehicle dispatched to ${terminal} — cannot re-queue while at terminal`,
+        message: `Vehicle ${vehicleNumber} is currently dispatched to ${terminal}`,
+      };
+    }
 
     // If we landed on the WAIT screen directly → already queued
     if (await isWaitScreen(page)) {

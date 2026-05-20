@@ -6,7 +6,7 @@
 function formatDateTime(iso) {
   if (!iso) return '—';
   return new Date(iso).toLocaleString('en-US', {
-    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'America/Los_Angeles',
   });
 }
 

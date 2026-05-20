@@ -45,6 +45,25 @@ app.use(express.json());
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ─── Bot debug screenshots (admin only — local dev) ───────────────────────────
+const DEBUG_DIR = process.env.BOT_DEBUG_DIR ?? '/tmp/san-bot-debug';
+const fs = require('fs');
+app.get('/admin/bot-debug', (req, res) => {
+  const files = fs.readdirSync(DEBUG_DIR).filter(f => f.endsWith('.png')).sort().reverse();
+  const items = files.map(f =>
+    `<div style="margin-bottom:32px">
+       <div style="font-family:monospace;font-size:12px;color:#aaa;margin-bottom:6px;">${f}</div>
+       <img src="/admin/bot-debug/${f}" style="max-width:390px;border:1px solid #333;border-radius:8px;">
+     </div>`
+  ).join('');
+  res.send(`<!DOCTYPE html><html><body style="background:#111;padding:24px;color:#fff;font-family:sans-serif">
+    <h2>Bot Debug Screenshots</h2><p style="color:#aaa">${files.length} screenshot(s) — newest first</p>
+    <a href="javascript:location.reload()" style="color:#4af;font-size:13px;">↻ Refresh</a>
+    <div style="margin-top:24px">${items}</div>
+  </body></html>`);
+});
+app.use('/admin/bot-debug', express.static(DEBUG_DIR));
+
 // ─── API routes ───────────────────────────────────────────────────────────────
 app.use('/api/auth',         require('./src/routes/auth'));
 app.use('/api/driver',      require('./src/routes/driver'));

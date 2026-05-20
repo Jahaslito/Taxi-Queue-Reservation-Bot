@@ -27,7 +27,7 @@ async function updateProfile(req, res, next) {
       throw err;
     }
 
-    const { name, phone, scheduledTime, scheduledDays, daySchedules, sanUsername, sanPassword, vehicleNumber, currentPassword, newAppPassword } = req.body;
+    const { name, phone, scheduledTime, scheduledDays, daySchedules, scheduledPosition, dayPositions, sanUsername, sanPassword, vehicleNumber, currentPassword, newAppPassword } = req.body;
 
     if (newAppPassword) {
       if (!currentPassword) {
@@ -43,31 +43,52 @@ async function updateProfile(req, res, next) {
       }
     }
 
-    // Derive legacy fields from daySchedules for backward compatibility
-    let derivedScheduledTime = scheduledTime || driver.scheduled_time;
-    let derivedScheduledDays = scheduledDays !== undefined ? scheduledDays : driver.scheduled_days;
-    let derivedDaySchedules = daySchedules !== undefined ? daySchedules : driver.day_schedules;
+    // One-at-a-time: position-based and time-based scheduling are mutually exclusive.
+    let derivedScheduledTime     = scheduledTime || driver.scheduled_time;
+    let derivedScheduledDays     = scheduledDays   !== undefined ? scheduledDays   : driver.scheduled_days;
+    let derivedDaySchedules      = daySchedules    !== undefined ? daySchedules    : driver.day_schedules;
+    let derivedScheduledPosition = scheduledPosition !== undefined ? (scheduledPosition || null) : driver.scheduled_position;
+    let derivedDayPositions      = dayPositions    !== undefined ? dayPositions    : driver.day_positions;
 
-    if (daySchedules !== undefined) {
-      try {
-        const ds = JSON.parse(daySchedules);
-        const activeDays = Object.keys(ds).filter(k => ds[k] !== null);
-        const times = activeDays.map(k => ds[k]).filter(Boolean);
-        derivedScheduledTime = times[0] || driver.scheduled_time || '05:00';
-        derivedScheduledDays = activeDays.join(',') || driver.scheduled_days || '0,1,2,3,4,5,6';
-      } catch { /* keep existing values */ }
+    if (dayPositions !== undefined && dayPositions) {
+      // Per-day position mode — clear all time-based and single-position fields
+      derivedScheduledTime     = null;
+      derivedScheduledDays     = null;
+      derivedDaySchedules      = null;
+      derivedScheduledPosition = null;
+    } else if (scheduledPosition !== undefined && scheduledPosition) {
+      // Single position mode — clear time-based and day_positions fields
+      derivedScheduledTime     = null;
+      derivedScheduledDays     = null;
+      derivedDaySchedules      = null;
+      derivedDayPositions      = null;
+    } else if (daySchedules !== undefined || scheduledTime !== undefined) {
+      // Switching to time-based — wipe all position fields
+      derivedScheduledPosition = null;
+      derivedDayPositions      = null;
+      if (daySchedules !== undefined) {
+        try {
+          const ds         = JSON.parse(daySchedules);
+          const activeDays = Object.keys(ds).filter(k => ds[k] !== null);
+          const times      = activeDays.map(k => ds[k]).filter(Boolean);
+          derivedScheduledTime = times[0] || driver.scheduled_time || '05:00';
+          derivedScheduledDays = activeDays.join(',') || driver.scheduled_days || '0,1,2,3,4,5,6';
+        } catch { /* keep existing values */ }
+      }
     }
 
     const updated = await Driver.update(req.driverId, {
-      name:           name           || driver.name,
-      phone:          phone          !== undefined ? phone : driver.phone,
-      scheduled_time: derivedScheduledTime,
-      scheduled_days: derivedScheduledDays,
-      day_schedules:  derivedDaySchedules,
-      san_username:   sanUsername    || driver.san_username,
-      san_password:   sanPassword    ? encrypt(sanPassword)                  : driver.san_password,
-      vehicle_number: vehicleNumber  || driver.vehicle_number,
-      app_password:   newAppPassword ? await bcrypt.hash(newAppPassword, 10) : driver.app_password,
+      name:               name           || driver.name,
+      phone:              phone          !== undefined ? phone : driver.phone,
+      scheduled_time:     derivedScheduledTime,
+      scheduled_days:     derivedScheduledDays,
+      day_schedules:      derivedDaySchedules,
+      scheduled_position: derivedScheduledPosition,
+      day_positions:      derivedDayPositions,
+      san_username:       sanUsername    || driver.san_username,
+      san_password:       sanPassword    ? encrypt(sanPassword)                  : driver.san_password,
+      vehicle_number:     vehicleNumber  || driver.vehicle_number,
+      app_password:       newAppPassword ? await bcrypt.hash(newAppPassword, 10) : driver.app_password,
     });
 
     res.json(updated);

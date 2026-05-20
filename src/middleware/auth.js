@@ -1,17 +1,24 @@
-const jwt = require('jsonwebtoken');
+const jwt    = require('jsonwebtoken');
+const Driver = require('../models/Driver');
 const { jwtSecret: JWT_SECRET } = require('../config/env');
 
 function extractToken(req) {
   return req.cookies?.token ?? null;
 }
 
-function authenticateDriver(req, res, next) {
+async function authenticateDriver(req, res, next) {
   const token = extractToken(req);
   if (!token) return res.status(401).json({ error: 'No token provided' });
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     if (decoded.role !== 'driver') return res.status(403).json({ error: 'Access denied' });
+
+    const driver = await Driver.findById(decoded.id);
+    if (!driver || !driver.is_active) {
+      return res.status(401).json({ error: 'Account is inactive' });
+    }
+
     req.driverId = decoded.id;
     next();
   } catch {

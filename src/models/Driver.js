@@ -6,6 +6,7 @@ const TABLE = 'drivers';
 const PUBLIC_FIELDS = [
   'id', 'name', 'phone', 'email', 'san_username',
   'vehicle_number', 'scheduled_time', 'scheduled_days', 'day_schedules',
+  'scheduled_position', 'day_positions',
   'is_active', 'monitor_enabled', 'notes', 'created_at', 'email_verified_at',
 ];
 
@@ -85,7 +86,8 @@ class Driver {
     return db('drivers as d')
       .select(
         'd.id', 'd.name', 'd.phone', 'd.email', 'd.san_username',
-        'd.vehicle_number', 'd.scheduled_time', 'd.scheduled_days', 'd.day_schedules', 'd.is_active', 'd.notes', 'd.created_at',
+        'd.vehicle_number', 'd.scheduled_time', 'd.scheduled_days', 'd.day_schedules',
+        'd.scheduled_position', 'd.day_positions', 'd.is_active', 'd.notes', 'd.created_at',
         'l.status         as last_status',
         'l.queue_position as last_position',
         'l.triggered_at   as last_run',

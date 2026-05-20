@@ -30,22 +30,23 @@ function wlRelTime(iso) {
   const secs = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
   if (secs < 60)   return `${secs}s ago`;
   if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
-  return new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+  return new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Los_Angeles' });
 }
 
 function wlFmtTime(iso) {
   if (!iso) return '—';
-  return new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'America/Los_Angeles' });
 }
 
 // ─── State badge (compact) ───────────────────────────────────────────────────
 function wlBadge(state) {
   const map = {
-    watching:   ['var(--muted2)',  '👁',  'Watching'],
-    in_queue:   ['var(--green)',   '✅', 'In Queue'],
-    dispatched: ['var(--amber)',   '🚖', 'Dispatched'],
-    gone:       ['var(--red)',     '🔴', 'Gone'],
-    requeuing:  ['var(--blue)',    '⚡', 'Re-queuing'],
+    watching:        ['var(--muted2)',  '👁',  'Watching'],
+    in_queue:        ['var(--green)',   '✅', 'In Queue'],
+    dispatched:      ['var(--amber)',   '🚖', 'Dispatched'],
+    gone:            ['var(--red)',     '🔴', 'Gone'],
+    requeuing:       ['var(--blue)',    '⚡', 'Re-queuing'],
+    not_authorized:  ['var(--red)',     '🚫', 'Not Authorized'],
   };
   const [color, icon, label] = map[state] || ['var(--muted)', '?', state];
   return `<span style="

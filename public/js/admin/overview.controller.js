@@ -46,6 +46,21 @@ async function loadOverview() {
         </tr>`).join('');
     }
 
+    // Position-scheduled section
+    const posWrap  = document.getElementById('position-breakdown-wrap');
+    const posBody  = document.getElementById('position-breakdown-body');
+    if (s.positionDrivers && s.positionDrivers.length > 0) {
+      posBody.innerHTML = s.positionDrivers.map((d, i) => `
+        <tr style="${i % 2 !== 0 ? 'background:rgba(255,255,255,0.015);' : ''}">
+          <td style="padding:12px 14px;font-weight:600;">${esc(d.name)}</td>
+          <td style="padding:12px 14px;font-family:'IBM Plex Mono',monospace;font-size:13px;">${esc(d.vehicle_number)}</td>
+          <td style="padding:12px 14px;font-family:'IBM Plex Mono',monospace;font-weight:700;color:var(--amber);">~${esc(String(d.target_position))}</td>
+        </tr>`).join('');
+      posWrap.style.display = '';
+    } else {
+      posWrap.style.display = 'none';
+    }
+
     if (isManual) {
       btn.innerHTML   = '✓ Done';
       btn.style.color = 'var(--green)';

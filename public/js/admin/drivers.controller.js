@@ -64,8 +64,20 @@ async function loadDrivers(page) {
       const activeBadge = d.is_active
         ? '<span class="badge success"><span class="badge-dot"></span>Active</span>'
         : '<span class="badge inactive">Inactive</span>';
-      const activeDaysLabel = (d.scheduled_days || '0,1,2,3,4,5,6')
-        .split(',').map(n => dayNames[Number(n)]).filter(Boolean).join(', ');
+      const isPosSched = !!(d.scheduled_position || d.day_positions);
+      const schedCell  = isPosSched
+        ? `<span style="color:var(--amber);">📍 Position</span>`
+        : `<span style="font-family:'IBM Plex Mono',monospace;color:var(--teal);">${esc(d.scheduled_time || '--')}</span> <span style="font-size:11px;color:var(--muted);">PT</span>`;
+      let activeDaysLabel;
+      if (isPosSched) {
+        try {
+          const dp = JSON.parse(d.day_positions || '{}');
+          const active = Object.keys(dp).filter(k => dp[k] !== null && dp[k] !== undefined).sort((a, b) => Number(a) - Number(b));
+          activeDaysLabel = active.map(k => dayNames[Number(k)]).filter(Boolean).join(', ') || '—';
+        } catch { activeDaysLabel = '—'; }
+      } else {
+        activeDaysLabel = (d.scheduled_days || '0,1,2,3,4,5,6').split(',').map(n => dayNames[Number(n)]).filter(Boolean).join(', ');
+      }
 
       return `
         <tr>
@@ -74,7 +86,7 @@ async function loadDrivers(page) {
             <div style="font-size:12px;color:var(--muted2);">${esc(d.san_username)}</div>
           </td>
           <td><span class="mono">${esc(d.vehicle_number)}</span></td>
-          <td><span style="font-family:'IBM Plex Mono',monospace;color:var(--teal);">${esc(d.scheduled_time)}</span> <span style="font-size:11px;color:var(--muted);">PT</span></td>
+          <td>${schedCell}</td>
           <td><span style="font-size:12px;color:var(--muted2);">${esc(activeDaysLabel)}</span></td>
           <td>
             <span class="badge ${esc(statusCls)}"><span class="badge-dot"></span>${esc(statusLbl)}</span>
@@ -127,6 +139,94 @@ async function triggerDriver(id, name) {
   }
 }
 
+// ─── Admin per-day position modal ─────────────────────────────────────────────
+let adminCurrentDayPositions = '{}';
+
+const ADMIN_DAY_NAMES = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+
+function renderAdminPosSummary(dayPositionsStr) {
+  const el = document.getElementById('admin-pos-summary');
+  if (!el) return;
+  try {
+    const dp = JSON.parse(dayPositionsStr || '{}');
+    const parts = [];
+    for (let d = 0; d < 7; d++) {
+      const p = dp[String(d)];
+      if (p) parts.push(`${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d]} ~${p}`);
+    }
+    el.textContent = parts.length ? parts.join(' · ') : 'No active days';
+  } catch {
+    el.textContent = '';
+  }
+}
+
+function buildAdminDayPositionRows(dayPositions) {
+  const container = document.getElementById('admin-pos-schedule-rows');
+  container.innerHTML = '';
+
+  for (let d = 0; d < 7; d++) {
+    const key    = String(d);
+    const pos    = dayPositions[key];
+    const active = pos !== null && pos !== undefined;
+    const row    = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border);';
+    if (d === 6) row.style.borderBottom = 'none';
+    row.innerHTML = `
+      <div class="day-sched-toggle ${active ? 'on' : ''}" data-day="${d}" style="flex-shrink:0;"></div>
+      <span style="width:90px;font-size:14px;font-weight:600;">${ADMIN_DAY_NAMES[d]}</span>
+      <input type="number" value="${pos || 200}" min="1" step="1" placeholder="e.g. 200"
+             style="flex:1;padding:6px 10px;border-radius:8px;background:var(--bg3);border:1px solid var(--border);color:var(--white);font-size:14px;"
+             ${active ? '' : 'disabled'}>
+    `;
+    container.appendChild(row);
+
+    row.querySelector('.day-sched-toggle').addEventListener('click', function () {
+      this.classList.toggle('on');
+      const input = row.querySelector('input[type="number"]');
+      input.disabled = !this.classList.contains('on');
+    });
+  }
+}
+
+function readAdminDayPositionRows() {
+  const dp = {};
+  document.querySelectorAll('#admin-pos-schedule-rows > div').forEach((row, d) => {
+    const toggle = row.querySelector('.day-sched-toggle');
+    const input  = row.querySelector('input[type="number"]');
+    dp[String(d)] = toggle.classList.contains('on') ? (parseInt(input.value, 10) || null) : null;
+  });
+  return JSON.stringify(dp);
+}
+
+document.getElementById('btn-open-admin-pos-sched').addEventListener('click', () => {
+  let dp = {};
+  try { dp = JSON.parse(adminCurrentDayPositions || '{}'); } catch {}
+  buildAdminDayPositionRows(dp);
+  document.getElementById('admin-pos-schedule-modal').classList.add('open');
+});
+
+document.getElementById('btn-admin-pos-sched-cancel').addEventListener('click', () => {
+  document.getElementById('admin-pos-schedule-modal').classList.remove('open');
+});
+
+document.getElementById('btn-admin-pos-sched-confirm').addEventListener('click', () => {
+  adminCurrentDayPositions = readAdminDayPositionRows();
+  renderAdminPosSummary(adminCurrentDayPositions);
+  document.getElementById('admin-pos-schedule-modal').classList.remove('open');
+});
+
+// ─── Schedule mode toggle ─────────────────────────────────────────────────────
+function setAdminSchedMode(mode) {
+  const isTime = mode === 'time';
+  document.getElementById('m-sched-time-block').style.display = isTime ? '' : 'none';
+  document.getElementById('m-sched-pos-block').style.display  = isTime ? 'none' : '';
+  document.getElementById('m-sched-type-time').className = isTime ? 'btn btn-primary' : 'btn btn-ghost';
+  document.getElementById('m-sched-type-pos').className  = isTime ? 'btn btn-ghost'   : 'btn btn-primary';
+}
+
+document.getElementById('m-sched-type-time').addEventListener('click', () => setAdminSchedMode('time'));
+document.getElementById('m-sched-type-pos').addEventListener('click',  () => setAdminSchedMode('position'));
+
 // ─── Add driver modal (blank form) ────────────────────────────────────────────
 function openAddDriverModal() {
   document.getElementById('modal-title').textContent = 'Add Driver';
@@ -136,6 +236,9 @@ function openAddDriverModal() {
   });
   document.getElementById('m-time').value   = '05:00';
   document.getElementById('m-active').value = '1';
+  setAdminSchedMode('time');
+  adminCurrentDayPositions = '{}';
+  renderAdminPosSummary(adminCurrentDayPositions);
 
   // Default: all 7 days active at 05:00
   const defaultDs = {};
@@ -162,22 +265,37 @@ async function openEditModal(id) {
     document.getElementById('m-san-pass').value           = '';
     document.getElementById('m-app-pass').value           = '';
     document.getElementById('m-vehicle').value            = d.vehicle_number || '';
-    document.getElementById('m-time').value               = d.scheduled_time || '05:00';
     document.getElementById('m-active').value             = d.is_active ? '1' : '0';
     document.getElementById('m-notes').value              = d.notes         || '';
 
-    // Load day_schedules or convert from legacy scheduled_days + scheduled_time
-    if (d.day_schedules) {
-      adminCurrentDaySchedules = d.day_schedules;
-    } else {
-      const activeDays = (d.scheduled_days || '0,1,2,3,4,5,6').split(',').map(String);
-      const ds = {};
-      for (let day = 0; day < 7; day++) {
-        ds[String(day)] = activeDays.includes(String(day)) ? (d.scheduled_time || '05:00') : null;
+    if (d.day_positions || d.scheduled_position) {
+      setAdminSchedMode('position');
+      if (d.day_positions) {
+        adminCurrentDayPositions = d.day_positions;
+      } else {
+        // Migrate legacy single-position to per-day (all days same position)
+        const dp = {};
+        for (let day = 0; day < 7; day++) dp[String(day)] = d.scheduled_position;
+        adminCurrentDayPositions = JSON.stringify(dp);
       }
-      adminCurrentDaySchedules = JSON.stringify(ds);
+      renderAdminPosSummary(adminCurrentDayPositions);
+    } else {
+      setAdminSchedMode('time');
+      document.getElementById('m-time').value = d.scheduled_time || '05:00';
+      adminCurrentDayPositions = '{}';
+      // Load day_schedules or convert from legacy scheduled_days + scheduled_time
+      if (d.day_schedules) {
+        adminCurrentDaySchedules = d.day_schedules;
+      } else {
+        const activeDays = (d.scheduled_days || '0,1,2,3,4,5,6').split(',').map(String);
+        const ds = {};
+        for (let day = 0; day < 7; day++) {
+          ds[String(day)] = activeDays.includes(String(day)) ? (d.scheduled_time || '05:00') : null;
+        }
+        adminCurrentDaySchedules = JSON.stringify(ds);
+      }
+      renderAdminSchedSummary(adminCurrentDaySchedules);
     }
-    renderAdminSchedSummary(adminCurrentDaySchedules);
 
     document.getElementById('modal-error').textContent = '';
     document.getElementById('driver-modal').classList.add('open');
@@ -264,27 +382,39 @@ document.getElementById('btn-save-driver').addEventListener('click', async () =>
   const errEl  = document.getElementById('modal-error');
   errEl.textContent = '';
 
+  const posMode = document.getElementById('m-sched-type-pos').classList.contains('btn-primary');
+
   const body = {
     name:          document.getElementById('m-name').value.trim(),
     phone:         document.getElementById('m-phone').value.trim(),
     email:         document.getElementById('m-email').value.trim(),
     sanUsername:   document.getElementById('m-san-user').value.trim(),
     vehicleNumber: document.getElementById('m-vehicle').value.trim(),
-    scheduledTime: document.getElementById('m-time').value,
     isActive:      document.getElementById('m-active').value === '1',
     notes:         document.getElementById('m-notes').value.trim(),
-    daySchedules:  adminCurrentDaySchedules,
   };
 
-  // Also derive scheduledDays from daySchedules for legacy compatibility
-  if (adminCurrentDaySchedules) {
-    try {
-      const ds         = JSON.parse(adminCurrentDaySchedules);
-      const activeDays = Object.keys(ds).filter(k => ds[k] !== null);
-      const times      = activeDays.map(k => ds[k]).filter(Boolean);
-      body.scheduledTime = times[0] || body.scheduledTime || '05:00';
-      body.scheduledDays = activeDays.join(',') || '0,1,2,3,4,5,6';
-    } catch {}
+  if (posMode) {
+    const dp = JSON.parse(adminCurrentDayPositions || '{}');
+    const hasActive = Object.values(dp).some(v => v !== null);
+    if (!hasActive) {
+      errEl.textContent = 'Configure at least one active day in the position schedule';
+      return;
+    }
+    body.dayPositions = adminCurrentDayPositions;
+  } else {
+    body.scheduledTime = document.getElementById('m-time').value;
+    body.daySchedules  = adminCurrentDaySchedules;
+    // Derive scheduledDays for legacy compatibility
+    if (adminCurrentDaySchedules) {
+      try {
+        const ds         = JSON.parse(adminCurrentDaySchedules);
+        const activeDays = Object.keys(ds).filter(k => ds[k] !== null);
+        const times      = activeDays.map(k => ds[k]).filter(Boolean);
+        body.scheduledTime = times[0] || body.scheduledTime || '05:00';
+        body.scheduledDays = activeDays.join(',') || '0,1,2,3,4,5,6';
+      } catch {}
+    }
   }
 
   const sanPass = document.getElementById('m-san-pass').value;

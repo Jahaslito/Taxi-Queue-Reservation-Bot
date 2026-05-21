@@ -101,9 +101,9 @@ async function bootstrap() {
   const adminExists = await Admin.exists();
   if (!adminExists) {
     const hash = await bcrypt.hash(env.adminPassword, 10);
-    await Admin.create({ username: 'admin', password_hash: hash });
-    console.log(`[DB] Default admin created — username: admin`);
-    console.log('[DB] ⚠️  Set ADMIN_PASSWORD in your .env before going to production!');
+    await Admin.create({ username: env.adminUsername, password_hash: hash });
+    console.log(`[DB] Default admin created — username: ${env.adminUsername}`);
+    console.log('[DB] ⚠️  Set ADMIN_USERNAME and ADMIN_PASSWORD in your .env before going to production!');
   }
 
   global._httpServer = app.listen(env.port, () => {

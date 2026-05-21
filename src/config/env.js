@@ -22,6 +22,7 @@ module.exports = {
   encryptionKey:  process.env.ENCRYPTION_KEY,
   databaseUrl:    process.env.DATABASE_URL,
   adminPassword:  process.env.ADMIN_PASSWORD || 'admin123',
+  adminUsername:  process.env.ADMIN_USERNAME || 'admin',
   allowedOrigin:  process.env.ALLOWED_ORIGIN || '*',
   // Email (optional in dev — falls back to console logging)
   resendApiKey:   process.env.RESEND_API_KEY  || null,

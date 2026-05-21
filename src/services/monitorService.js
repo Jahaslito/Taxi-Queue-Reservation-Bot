@@ -59,7 +59,7 @@ const AUTO_REQUEUE_DELAY_MS = parseInt(process.env.MONITOR_REQUEUE_DELAY_MS ?? S
 // Auto-requeue fires between REQUEUE_START and REQUEUE_END (8 AM–11 PM PT).
 // Position schedule fires between POS_START and POS_END (4 AM–11 PM PT).
 // Manual runs via the Run button are never gated by either window.
-const OP_START_HOUR  = parseInt(process.env.MONITOR_START_HOUR     ?? '8',  10); //  8 AM PT
+const OP_START_HOUR  = parseInt(process.env.MONITOR_START_HOUR     ?? '5',  10); //  5 AM PT
 const OP_END_HOUR    = parseInt(process.env.MONITOR_END_HOUR       ?? '23', 10); // 11 PM PT
 const POS_START_HOUR   = parseInt(process.env.MONITOR_POS_START_HOUR   ?? '3',  10); //  3 AM PT
 const POS_END_HOUR     = parseInt(process.env.MONITOR_POS_END_HOUR     ?? '23', 10); // 11 PM PT

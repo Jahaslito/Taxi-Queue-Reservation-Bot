@@ -3,7 +3,12 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="theme-color" content="#07090F" />
   <title>SAN Queue — Admin</title>
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
   <style>
@@ -281,20 +286,111 @@
     }
     .day-sched-time:disabled { opacity: 0.35; }
 
-    @media (max-width: 1100px) {
-      .stats-grid { grid-template-columns: repeat(2,1fr); }
+    /* ── Mobile top bar ── */
+    .mobile-topbar {
+      display: none;
+      position: sticky; top: 0; z-index: 100;
+      background: var(--bg2); border-bottom: 1px solid var(--border);
+      padding: 14px 20px;
+      align-items: center; justify-content: space-between;
+      flex-shrink: 0;
     }
+    .mobile-title { font-family: 'Syne', sans-serif; font-size: 16px; font-weight: 800; }
+    .mobile-title span { color: var(--teal); }
+    .hamburger-btn {
+      background: none; border: none; color: var(--white);
+      font-size: 22px; cursor: pointer; padding: 6px 8px;
+      line-height: 1; border-radius: 8px;
+      transition: background 0.15s; min-width: 44px; min-height: 44px;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .hamburger-btn:hover { background: rgba(255,255,255,0.06); }
+
+    /* ── Sidebar overlay (mobile drawer backdrop) ── */
+    .sidebar-overlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.65); z-index: 150;
+      backdrop-filter: blur(2px);
+    }
+    .sidebar-overlay.open { display: block; }
+
+    /* ── 1100px — stats collapse ── */
+    @media (max-width: 1100px) {
+      .stats-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    /* ── 768px — icon-only sidebar ── */
     @media (max-width: 768px) {
-      .sidebar { width: 60px; }
+      .sidebar { width: 60px; transition: width 0.25s; }
       .sidebar .nav-link span:not(.icon) { display: none; }
       .sidebar-logo .title, .sidebar-logo .sub, .nav-group-label, .admin-info { display: none; }
       .page { padding: 20px 16px; }
       .stats-grid { grid-template-columns: 1fr 1fr; }
       .form-row { grid-template-columns: 1fr; }
+      /* Tables scroll horizontally rather than overflowing */
+      .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      table { min-width: 540px; }
+    }
+
+    /* ── 480px — mobile drawer + full-width layout ── */
+    @media (max-width: 480px) {
+      body { flex-direction: column; }
+
+      .mobile-topbar { display: flex; }
+
+      /* Sidebar becomes a fixed slide-out drawer */
+      .sidebar {
+        position: fixed;
+        top: 0; left: 0; bottom: 0;
+        width: 220px;
+        z-index: 200;
+        transform: translateX(-100%);
+        transition: transform 0.25s ease;
+      }
+      .sidebar.open { transform: translateX(0); }
+
+      /* Restore full sidebar text inside the drawer */
+      .sidebar .nav-link span:not(.icon) { display: inline; }
+      .sidebar-logo .title, .sidebar-logo .sub,
+      .nav-group-label, .admin-info { display: block; }
+
+      .main { width: 100%; overflow-x: hidden; }
+      .page { padding: 16px 14px; }
+
+      .page-header { margin-bottom: 18px; }
+      .page-header h1 { font-size: 20px; }
+
+      /* Stats: 2 cols on phone, each card slightly smaller */
+      .stats-grid { grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }
+      .stat-card { padding: 14px; }
+      .stat-card .stat-value { font-size: 24px; }
+
+      /* Filter bars wrap onto multiple lines */
+      .filter-bar { flex-wrap: wrap; }
+
+      /* Toast full-width at bottom */
+      .toast { right: 14px; bottom: 14px; left: 14px; }
+
+      /* Page headers that use inline flex — allow wrap */
+      .page-header[style] { flex-wrap: wrap !important; gap: 10px !important; }
+    }
+
+    /* ── 360px — single-column stats on very small phones ── */
+    @media (max-width: 360px) {
+      .stats-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
+
+<!-- ══════════════════════════ MOBILE TOP BAR ══════════════════════════ -->
+<div class="mobile-topbar" id="mobile-topbar">
+  <div class="mobile-title">SAN <span>Queue</span></div>
+  <button class="hamburger-btn" id="hamburger-btn" aria-label="Open menu">☰</button>
+</div>
+
+<!-- Sidebar backdrop (mobile only) -->
+<div class="sidebar-overlay" id="sidebar-overlay"></div>
 
 <!-- ══════════════════════════ SIDEBAR ══════════════════════════ -->
 <aside class="sidebar" id="sidebar" style="display:none;">
@@ -576,6 +672,7 @@
         <option value="all">All States</option>
         <option value="in_queue">In Queue</option>
         <option value="dispatched">Dispatched</option>
+        <option value="at_terminal">At Terminal</option>
         <option value="gone">Gone</option>
         <option value="requeuing">Re-queuing</option>
         <option value="watching">Not Yet Queued</option>
@@ -601,7 +698,7 @@
             <th>Last Dispatched</th>
             <th>Last Re-queued</th>
             <th style="text-align:center;">Today</th>
-            <th style="text-align:center;" title="Live position from last poll">Position</th>
+            <th style="text-align:center;" title="Queue position when in V Holding; terminal position when at T1/T2">Position</th>
             <th style="text-align:center;">Last Result</th>
             <th style="text-align:center;">Run</th>
           </tr>
@@ -891,6 +988,40 @@
 <!-- Toast -->
 <div class="toast" id="toast"></div>
 
+<script>
+  // ── Mobile hamburger drawer ──────────────────────────────────────────────────
+  (function () {
+    const hamburger = document.getElementById('hamburger-btn');
+    const overlay   = document.getElementById('sidebar-overlay');
+    const sidebar   = document.getElementById('sidebar');
+
+    function openDrawer() {
+      sidebar.classList.add('open');
+      overlay.classList.add('open');
+      document.body.style.overflow = 'hidden';
+    }
+    function closeDrawer() {
+      sidebar.classList.remove('open');
+      overlay.classList.remove('open');
+      document.body.style.overflow = '';
+    }
+
+    hamburger.addEventListener('click', openDrawer);
+    overlay.addEventListener('click', closeDrawer);
+
+    // Close drawer when a nav item is tapped on mobile
+    document.querySelectorAll('.nav-link').forEach(function (link) {
+      link.addEventListener('click', function () {
+        if (window.innerWidth <= 480) closeDrawer();
+      });
+    });
+
+    // Close drawer on resize to desktop
+    window.addEventListener('resize', function () {
+      if (window.innerWidth > 480) closeDrawer();
+    });
+  })();
+</script>
 <script src="/js/utils.js"></script>
 <script src="/js/admin/daySchedule.controller.js"></script>
 <script src="/js/admin/scheduledDrivers.controller.js"></script>
@@ -901,5 +1032,65 @@
 <script src="/js/admin/monitor.controller.js"></script>
 <script src="/js/admin/auth.controller.js"></script>
 <script src="/js/admin/app.js"></script>
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    });
+  }
+</script>
+<script>
+  (function () {
+    const isIOS        = /iPhone|iPad|iPod/.test(navigator.userAgent) && !window.MSStream;
+    const isStandalone = window.navigator.standalone === true;
+    const dismissed    = localStorage.getItem('ios-hint-dismissed');
+    if (!isIOS || isStandalone || dismissed) return;
+
+    const banner = document.createElement('div');
+    banner.id = 'ios-install-hint';
+    banner.innerHTML = `
+      <div style="display:flex;align-items:center;gap:12px;">
+        <div style="font-size:26px;line-height:1;">
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#00D1B2" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/>
+            <polyline points="16 6 12 2 8 6"/>
+            <line x1="12" y1="2" x2="12" y2="15"/>
+          </svg>
+        </div>
+        <div style="flex:1;min-width:0;">
+          <div style="font-weight:700;font-size:13px;color:#E8EDF8;">Install SAN Queue</div>
+          <div style="font-size:12px;color:#5A6585;margin-top:2px;">Tap <strong style="color:#E8EDF8;">Share</strong> then <strong style="color:#E8EDF8;">"Add to Home Screen"</strong></div>
+        </div>
+        <button id="ios-hint-close" aria-label="Dismiss" style="background:none;border:none;color:#5A6585;font-size:18px;cursor:pointer;padding:4px;line-height:1;flex-shrink:0;">✕</button>
+      </div>
+      <div style="position:absolute;bottom:-8px;left:50%;transform:translateX(-50%);width:0;height:0;border-left:8px solid transparent;border-right:8px solid transparent;border-top:8px solid rgba(255,255,255,0.07);"></div>
+    `;
+    Object.assign(banner.style, {
+      position:       'fixed',
+      bottom:         '80px',
+      left:           '16px',
+      right:          '16px',
+      background:     'rgba(14,18,32,0.97)',
+      border:         '1px solid rgba(255,255,255,0.07)',
+      borderRadius:   '16px',
+      padding:        '14px 16px',
+      zIndex:         '9999',
+      boxShadow:      '0 8px 32px rgba(0,0,0,0.5)',
+      backdropFilter: 'blur(12px)',
+      animation:      'slideUp 0.3s ease',
+    });
+
+    const style = document.createElement('style');
+    style.textContent = '@keyframes slideUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}';
+    document.head.appendChild(style);
+
+    document.body.appendChild(banner);
+
+    document.getElementById('ios-hint-close').addEventListener('click', function () {
+      banner.remove();
+      localStorage.setItem('ios-hint-dismissed', '1');
+    });
+  })();
+</script>
 </body>
 </html>

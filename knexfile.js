@@ -26,7 +26,11 @@ module.exports = {
     ...base,
     connection: {
       connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false }, // required by Neon / Supabase / Railway
+      // SSL is required for managed cloud databases (Neon, Supabase, Railway, DO Managed PG).
+      // Set DATABASE_SSL=false when running against a local/Docker Postgres on the same host.
+      ...(process.env.DATABASE_SSL !== 'false' && {
+        ssl: { rejectUnauthorized: false },
+      }),
     },
     pool: { min: 2, max: 20 },
   },

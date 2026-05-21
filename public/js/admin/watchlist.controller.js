@@ -44,6 +44,7 @@ function wlBadge(state) {
     watching:        ['var(--muted2)',  '👁',  'Watching'],
     in_queue:        ['var(--green)',   '✅', 'In Queue'],
     dispatched:      ['var(--amber)',   '🚖', 'Dispatched'],
+    at_terminal:     ['var(--purple)',  '✈',  'At Terminal'],
     gone:            ['var(--red)',     '🔴', 'Gone'],
     requeuing:       ['var(--blue)',    '⚡', 'Re-queuing'],
     not_authorized:  ['var(--red)',     '🚫', 'Not Authorized'],
@@ -84,9 +85,14 @@ function wlRenderRow(s) {
         : '<span style="color:var(--muted);">0</span>'}
     </td>
     <td style="text-align:center;font-family:'IBM Plex Mono',monospace;">
-      ${s.currentPosition
-        ? `<strong style="color:var(--teal);" title="Last re-queued at #${s.lastPosition || '?'}">#${s.currentPosition}</strong>`
-        : '<span style="color:var(--muted);">—</span>'}
+      ${s.state === 'at_terminal' && s.terminalPosition != null
+        ? `<div style="display:inline-flex;flex-direction:column;align-items:center;gap:1px;">
+             <strong style="color:var(--purple);" title="${s.terminalName || 'Terminal'} position #${s.terminalPosition}">#${s.terminalPosition}</strong>
+             <span style="font-size:10px;color:var(--purple);opacity:0.8;">${esc(s.terminalName || 'T?')}</span>
+           </div>`
+        : s.currentPosition
+          ? `<strong style="color:var(--teal);" title="Last re-queued at #${s.lastPosition || '?'}">#${s.currentPosition}</strong>`
+          : '<span style="color:var(--muted);">—</span>'}
     </td>
     <td style="text-align:center;">${wlResultBadge(s.lastResult)}</td>
     <td style="text-align:center;">
@@ -307,7 +313,14 @@ function wlConnectSSE() {
 
   wlSSE = new EventSource('/api/admin/watchlist/stream', { withCredentials: true });
 
-  wlSSE.onopen = () => setConnected(true);
+  wlSSE.onopen = () => {
+    setConnected(true);
+    // On reconnect (cache already populated from a previous load), refresh all
+    // driver states from REST so any changes that occurred while the SSE was
+    // disconnected (e.g. server restart) are reflected immediately rather than
+    // waiting for the next individual driver_state event.
+    if (wlCache.size > 0) wlLoadAll();
+  };
 
   wlSSE.onmessage = (e) => {
     let msg;

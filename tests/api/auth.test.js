@@ -164,66 +164,94 @@ describe('POST /api/auth/admin/login', () => {
   });
 });
 
-// ─── POST /api/auth/driver/reset-password ─────────────────────────────────
+// ─── POST /api/auth/driver/forgot-password + reset-password ──────────────────
+// The flow is two steps:
+//   1. POST /forgot-password {email}  → stores a token in DB, sends email (mocked)
+//   2. POST /reset-password {token, newPassword} → completes the reset
+// Tests fetch the token directly from the DB since email is not sent in the test env.
 
-describe('POST /api/auth/driver/reset-password', () => {
+describe('password reset flow', () => {
   let driver;
   beforeEach(async () => {
     driver = await createDriver({ email: 'reset@test.com', vehicle_number: 'RST001' });
   });
 
-  // 10 — Registered email: gets tempPassword, old password revoked
-  test('registered email returns 200 with tempPassword', async () => {
-    const res = await request(app)
-      .post('/api/auth/driver/reset-password')
-      .send({ email: driver.email });
+  // Helper: trigger forgot-password and return the token stored in the DB
+  async function requestResetToken(email) {
+    await request(app).post('/api/auth/driver/forgot-password').send({ email });
+    const row = await db('drivers').where({ email }).first();
+    return row?.password_reset_token ?? null;
+  }
 
+  test('forgot-password always returns 200 (prevents enumeration)', async () => {
+    const res = await request(app)
+      .post('/api/auth/driver/forgot-password')
+      .send({ email: driver.email });
     expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty('tempPassword');
-    expect(typeof res.body.tempPassword).toBe('string');
-    expect(res.body.tempPassword.length).toBeGreaterThan(0);
   });
 
-  test('tempPassword is not the vehicle number', async () => {
+  test('forgot-password for unknown email still returns 200', async () => {
+    const res = await request(app)
+      .post('/api/auth/driver/forgot-password')
+      .send({ email: 'nobody@example.com' });
+    expect(res.status).toBe(200);
+  });
+
+  test('forgot-password stores a reset token in the DB for known email', async () => {
+    const token = await requestResetToken(driver.email);
+    expect(typeof token).toBe('string');
+    expect(token.length).toBeGreaterThan(0);
+  });
+
+  test('valid token + new password returns 200', async () => {
+    const token = await requestResetToken(driver.email);
     const res = await request(app)
       .post('/api/auth/driver/reset-password')
-      .send({ email: driver.email });
-
-    expect(res.body.tempPassword).not.toBe(driver.vehicle_number);
+      .send({ token, newPassword: 'NewPass123!' });
+    expect(res.status).toBe(200);
   });
 
-  test('tempPassword authenticates the driver on next login', async () => {
-    const resetRes = await request(app)
+  test('new password authenticates the driver on next login', async () => {
+    const token = await requestResetToken(driver.email);
+    await request(app)
       .post('/api/auth/driver/reset-password')
-      .send({ email: driver.email });
+      .send({ token, newPassword: 'NewPass123!' });
 
     const loginRes = await request(app)
       .post('/api/auth/driver/login')
-      .send({ email: driver.email, appPassword: resetRes.body.tempPassword });
-
+      .send({ email: driver.email, appPassword: 'NewPass123!' });
     expect(loginRes.status).toBe(200);
   });
 
   test('old password is rejected after reset', async () => {
+    const token = await requestResetToken(driver.email);
     await request(app)
       .post('/api/auth/driver/reset-password')
-      .send({ email: driver.email });
+      .send({ token, newPassword: 'NewPass123!' });
 
     const loginRes = await request(app)
       .post('/api/auth/driver/login')
       .send({ email: driver.email, appPassword: driver.plainPassword });
-
     expect(loginRes.status).toBe(401);
   });
 
-  // 11 — Unknown email: same 200 but no tempPassword (prevents enumeration)
-  test('unknown email returns 200 without tempPassword', async () => {
+  test('invalid token returns 400', async () => {
     const res = await request(app)
       .post('/api/auth/driver/reset-password')
-      .send({ email: 'nobody@example.com' });
+      .send({ token: 'not-a-real-token', newPassword: 'NewPass123!' });
+    expect(res.status).toBe(400);
+  });
 
-    expect(res.status).toBe(200);
-    expect(res.body).not.toHaveProperty('tempPassword');
+  test('token cannot be reused after reset', async () => {
+    const token = await requestResetToken(driver.email);
+    await request(app)
+      .post('/api/auth/driver/reset-password')
+      .send({ token, newPassword: 'NewPass123!' });
+
+    const res = await request(app)
+      .post('/api/auth/driver/reset-password')
+      .send({ token, newPassword: 'AnotherPass456!' });
+    expect(res.status).toBe(400);
   });
 });
 

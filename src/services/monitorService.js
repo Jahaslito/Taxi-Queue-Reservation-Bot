@@ -1,5 +1,7 @@
 'use strict';
 
+const { fetch: ufetch, ProxyAgent } = require('undici');
+
 // ─── Queue Monitor Service ────────────────────────────────────────────────────
 //
 // Polls V Holding (10-17), T1 (10-8), and T2 (10-9) queue pages.
@@ -102,6 +104,35 @@ const MAX_TERMINAL_CHECKS = parseInt(process.env.MONITOR_MAX_TERMINAL_CHECKS ?? 
 
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) ' +
            'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+
+// ─── Proxy dispatcher for polling fetches ─────────────────────────────────────
+// Shares the same PROXY_SERVER / PROXY_USERNAME / PROXY_PASSWORD env vars as the
+// Playwright bot so all three SAN interactions go through the same proxy.
+// Uses a single sticky session for polling (we want a consistent IP, not rotation).
+// If PROXY_SERVER is not set, falls back to the server's own IP (no proxy).
+function buildPollDispatcher() {
+  const server = process.env.PROXY_SERVER;
+  if (!server) return undefined; // no proxy configured — use direct connection
+
+  const user = (process.env.PROXY_USERNAME || '').replace('{session}', 'monitor-poll');
+  const pass = process.env.PROXY_PASSWORD || '';
+
+  // Embed credentials into the proxy URL so undici ProxyAgent can authenticate.
+  // Format: http://user:pass@host:port  (works for HTTP CONNECT tunnelling)
+  let proxyUrl;
+  try {
+    const u = new URL(server);
+    if (user) { u.username = user; u.password = pass; }
+    proxyUrl = u.toString();
+  } catch {
+    proxyUrl = server; // already has creds embedded, or plain host
+  }
+
+  console.log('[Monitor] Proxy enabled for polling →', new URL(proxyUrl).host);
+  return new ProxyAgent(proxyUrl);
+}
+
+const pollDispatcher = buildPollDispatcher();
 
 // ─── Concurrency-limited job queue ───────────────────────────────────────────
 // Caps simultaneous Playwright bot sessions so a wave of departures (e.g.
@@ -426,9 +457,10 @@ async function fetchPage(url) {
   let lastErr;
   for (let attempt = 0; attempt < RETRY_COUNT; attempt++) {
     try {
-      const res = await fetch(url, {
-        headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml' },
-        signal:  AbortSignal.timeout(FETCH_TIMEOUT),
+      const res = await ufetch(url, {
+        headers:    { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml' },
+        signal:     AbortSignal.timeout(FETCH_TIMEOUT),
+        dispatcher: pollDispatcher, // undefined = direct (no proxy); ProxyAgent = routed
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       if (attempt > 0) console.log(`[Monitor] Fetch succeeded on attempt ${attempt + 1} (${url})`);

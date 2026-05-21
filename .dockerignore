@@ -1,16 +1,14 @@
 node_modules
-.env
-data/
 .git
-.DS_Store
-*.db
-*.db-shm
-*.db-wal
-# Test & dev artefacts — not needed in the production image
-tests/
-coverage/
+.gitignore
+*.md
+.env
+.env.*
+data
+flyers
+tests
 jest.config.js
-# Local tooling
-.claude/
-# Flyers & design assets
-flyers/
+deploy
+scripts
+*.log
+.DS_Store

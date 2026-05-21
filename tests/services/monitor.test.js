@@ -88,9 +88,10 @@ afterEach(() => {
 describe('isWithinOperatingHours()', () => {
   const CASES = [
     { h:  0, want: false, label: 'midnight PT' },
-    { h:  3, want: false, label: '3 AM PT' },
-    { h:  7, want: false, label: '7 AM PT — one hour before start' },
-    { h:  8, want: true,  label: '8 AM PT — exact start (inclusive)' },
+    { h:  3, want: false, label: '3 AM PT — two hours before start' },
+    { h:  4, want: false, label: '4 AM PT — one hour before start' },
+    { h:  5, want: true,  label: '5 AM PT — exact start (inclusive)' },
+    { h:  7, want: true,  label: '7 AM PT' },
     { h:  9, want: true,  label: '9 AM PT' },
     { h: 12, want: true,  label: 'noon PT' },
     { h: 17, want: true,  label: '5 PM PT' },
@@ -128,8 +129,8 @@ describe('auto-requeue gate (gone-handler logic)', () => {
     expect(gateDecision(_isWithinOperatingHours())).toBe('outside_hours');
   });
 
-  test('boundary 8 AM — exactly at start → fires', () => {
-    jest.useFakeTimers({ now: ptHour(8) });
+  test('boundary 5 AM — exactly at start → fires', () => {
+    jest.useFakeTimers({ now: ptHour(5) });
     expect(gateDecision(_isWithinOperatingHours())).toBe('requeue');
   });
 

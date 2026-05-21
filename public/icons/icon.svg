@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Background -->
+  <rect width="512" height="512" rx="96" fill="#07090F"/>
+
+  <!-- Teal glow circle -->
+  <circle cx="256" cy="220" r="130" fill="none" stroke="#00C2D4" stroke-width="2" opacity="0.15"/>
+
+  <!-- Taxi body -->
+  <rect x="136" y="248" width="240" height="108" rx="20" fill="#00C2D4"/>
+
+  <!-- Taxi roof / cabin -->
+  <path d="M180 248 L200 192 Q210 180 230 180 L282 180 Q302 180 312 192 L332 248 Z" fill="#00C2D4"/>
+
+  <!-- Taxi windows -->
+  <rect x="210" y="192" width="92" height="48" rx="8" fill="#07090F" opacity="0.6"/>
+
+  <!-- Wheels -->
+  <circle cx="182" cy="356" r="30" fill="#07090F"/>
+  <circle cx="182" cy="356" r="16" fill="#00C2D4" opacity="0.4"/>
+  <circle cx="330" cy="356" r="30" fill="#07090F"/>
+  <circle cx="330" cy="356" r="16" fill="#00C2D4" opacity="0.4"/>
+
+  <!-- Queue dots (bottom, representing queue position) -->
+  <circle cx="176" cy="420" r="8" fill="#00C2D4"/>
+  <circle cx="208" cy="420" r="8" fill="#00C2D4" opacity="0.6"/>
+  <circle cx="240" cy="420" r="8" fill="#00C2D4" opacity="0.4"/>
+  <circle cx="272" cy="420" r="8" fill="#00C2D4" opacity="0.25"/>
+  <circle cx="304" cy="420" r="8" fill="#00C2D4" opacity="0.15"/>
+  <circle cx="336" cy="420" r="8" fill="#00C2D4" opacity="0.08"/>
+</svg>

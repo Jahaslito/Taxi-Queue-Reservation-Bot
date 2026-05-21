@@ -254,13 +254,13 @@ describe('POST /api/driver/trigger', () => {
     expect(res.body).toHaveProperty('message');
   });
 
-  test('inactive driver returns 400', async () => {
+  test('inactive driver returns 401', async () => {
     await db('drivers').where({ id: driver.id }).update({ is_active: false });
 
     const res = await request(app)
       .post('/api/driver/trigger')
       .set('Cookie', dCookie);
 
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(401);
   });
 });

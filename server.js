@@ -14,10 +14,10 @@ const errorHandler = require('./src/middleware/errorHandler');
 
 const app = express();
 
-// ─── Trust Railway / reverse-proxy headers ────────────────────────────────────
-// Railway terminates TLS at the edge and forwards HTTP internally.
-// Without this, req.ip returns the proxy IP and rate limiting breaks.
-if (env.nodeEnv === 'production') app.set('trust proxy', 1);
+// ─── Trust reverse-proxy headers ─────────────────────────────────────────────
+// Needed in production (Railway) and when tunnelling locally (ngrok/localtunnel).
+// Without this, express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+app.set('trust proxy', 1);
 
 // ─── Security middleware ───────────────────────────────────────────────────────
 app.use(helmet({
@@ -106,7 +106,7 @@ async function bootstrap() {
     console.log('[DB] ⚠️  Set ADMIN_PASSWORD in your .env before going to production!');
   }
 
-  app.listen(env.port, () => {
+  global._httpServer = app.listen(env.port, () => {
     console.log(`\n🚕  SAN Queue Scheduler running on port ${env.port}`);
     console.log(`    Driver App : http://localhost:${env.port}`);
     console.log(`    Admin      : http://localhost:${env.port}/admin\n`);
@@ -122,6 +122,45 @@ async function bootstrap() {
 bootstrap().catch((err) => {
   console.error('[Fatal] Failed to start server:', err.message);
   process.exit(1);
+});
+
+// ─── Process-level crash guards ───────────────────────────────────────────────
+// Catch anything that slips past Express / async handlers.
+// Log the full stack, then exit so Railway/Docker restarts the container cleanly.
+// (Staying alive after an uncaughtException is unsafe — the process may be in a
+//  corrupt state. A clean restart is always the safer option.)
+
+process.on('uncaughtException', (err) => {
+  console.error('[Fatal] Uncaught exception — restarting:', err);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[Fatal] Unhandled promise rejection — restarting:', reason);
+  process.exit(1);
+});
+
+// ─── Graceful shutdown (SIGTERM from Railway / Docker stop) ───────────────────
+// Railway sends SIGTERM before force-killing. Give in-flight requests up to 10s
+// to finish before the process exits, so active SSE clients and bot jobs aren't
+// cut off mid-run.
+process.on('SIGTERM', () => {
+  console.log('[Shutdown] SIGTERM received — closing server gracefully…');
+  // server is module-scoped via app.listen return value; re-use the reference
+  // by attaching it at listen time.
+  if (global._httpServer) {
+    global._httpServer.close(() => {
+      console.log('[Shutdown] All connections closed — exiting.');
+      process.exit(0);
+    });
+    // Force-exit after 10s in case some connections are stuck
+    setTimeout(() => {
+      console.warn('[Shutdown] Timeout — force exiting.');
+      process.exit(0);
+    }, 10_000).unref();
+  } else {
+    process.exit(0);
+  }
 });
 
 module.exports = app;

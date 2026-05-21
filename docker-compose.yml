@@ -1,0 +1,106 @@
+# ─── SAN Queue — Docker Compose (DigitalOcean Droplet) ───────────────────────
+# Runs the full stack: app + postgres on a single droplet.
+# nginx + SSL run on the HOST (not in Docker) — see deploy/nginx.conf.
+#
+# Usage:
+#   docker compose up -d          # start
+#   docker compose logs -f app    # tail logs
+#   docker compose restart app    # hot-restart after code change
+#   docker compose down           # stop everything
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_DB:       san_queue
+      POSTGRES_USER:     san_queue
+      POSTGRES_PASSWORD: ${DB_PASSWORD}   # set in .env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    # Not exposed to the host — app talks to it on the internal network only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U san_queue -d san_queue"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── App (Node.js + Playwright) ───────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3000:3000"   # only accessible from localhost — nginx proxies in
+    environment:
+      NODE_ENV:     production
+      PORT:         3000
+
+      # Database — points at the internal 'db' service; SSL not needed on same host
+      DATABASE_URL: postgresql://san_queue:${DB_PASSWORD}@db:5432/san_queue
+      DATABASE_SSL: "false"
+
+      # Secrets — all sourced from .env on the droplet
+      JWT_SECRET:       ${JWT_SECRET}
+      ENCRYPTION_KEY:   ${ENCRYPTION_KEY}
+      ADMIN_PASSWORD:   ${ADMIN_PASSWORD}
+
+      # App URL (used in password-reset emails)
+      APP_URL:          ${APP_URL}
+      ALLOWED_ORIGIN:   ${APP_URL}
+
+      # Email (Resend)
+      RESEND_API_KEY:   ${RESEND_API_KEY:-}
+      EMAIL_FROM:       ${EMAIL_FROM:-SAN Queue <noreply@sanqueue.com>}
+
+      # Monitor tuning (optional — defaults apply if not set)
+      MONITOR_POLL_MS:              ${MONITOR_POLL_MS:-90000}
+      MONITOR_REFRESH_MS:           ${MONITOR_REFRESH_MS:-300000}
+      MONITOR_CONCURRENCY:          ${MONITOR_CONCURRENCY:-3}
+      MONITOR_START_HOUR:           ${MONITOR_START_HOUR:-5}
+      MONITOR_END_HOUR:             ${MONITOR_END_HOUR:-23}
+      MONITOR_POS_START_HOUR:       ${MONITOR_POS_START_HOUR:-3}
+      MONITOR_POS_END_HOUR:         ${MONITOR_POS_END_HOUR:-23}
+      MONITOR_MAX_TERMINAL_CHECKS:  ${MONITOR_MAX_TERMINAL_CHECKS:-5}
+      MONITOR_QUEUE_URL:            ${MONITOR_QUEUE_URL}
+      MONITOR_T1_URL:               ${MONITOR_T1_URL}
+      MONITOR_T2_URL:               ${MONITOR_T2_URL}
+
+      # Proxy — routes ALL SAN traffic (polling + bot) through the same IP
+      # Leave unset to use the droplet's own IP
+      PROXY_SERVER:   ${PROXY_SERVER:-}
+      PROXY_USERNAME: ${PROXY_USERNAME:-}
+      PROXY_PASSWORD: ${PROXY_PASSWORD:-}
+
+      # Playwright screenshot dir (debug)
+      BOT_DEBUG_DIR: /tmp/san-bot-debug
+
+    # Shared memory for Chromium (prevents crashes on small droplets)
+    shm_size: '256mb'
+
+    networks:
+      - internal
+
+    # Resource limits — adjust to your droplet size
+    # 2GB droplet: keep app under 1.5GB so the OS has headroom
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+volumes:
+  pgdata:         # postgres data persists across container restarts
+    driver: local
+
+networks:
+  internal:
+    driver: bridge

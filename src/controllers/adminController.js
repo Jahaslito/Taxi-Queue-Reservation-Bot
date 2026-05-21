@@ -279,9 +279,9 @@ async function triggerDriver(req, res, next) {
       throw err;
     }
 
-    // Respond immediately — the bot runs in the background
-    res.json({ message: `Bot triggered for ${driver.name} (${driver.vehicle_number}). Check logs for result.` });
-    runBotForDriver(driver, 'manual').catch(console.error);
+    // Run the bot and wait for the actual result (15–60 s)
+    const result = await runBotForDriver(driver, 'manual');
+    res.json({ result });
   } catch (err) {
     next(err);
   }

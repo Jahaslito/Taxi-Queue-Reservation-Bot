@@ -128,14 +128,39 @@ function showConfirm(message) {
 }
 
 // ─── Trigger bot for a specific driver ───────────────────────────────────────
-async function triggerDriver(id, name) {
+async function triggerDriver(id, name, btn) {
   if (!await showConfirm(`Run bot now for ${esc(name)}?`)) return;
+
+  // Lock the button while the bot runs (15–60 s)
+  const originalHTML = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+  btn.style.minWidth = btn.offsetWidth + 'px'; // prevent layout shift
+
   try {
-    await api(`/api/admin/drivers/${id}/trigger`, { method: 'POST' });
-    showToast(`Bot triggered for ${name} — check logs for result`, 'info');
-    setTimeout(loadLogs, 3000);
+    const data   = await api(`/api/admin/drivers/${id}/trigger`, { method: 'POST' });
+    const result = data?.result || {};
+
+    if (result.success) {
+      const pos = result.position ? `#${result.position}` : '?';
+      const loc = result.location ? ` · ${result.location}` : '';
+      const msg = result.alreadyQueued
+        ? `✅ Already in queue — Position ${pos}${loc}`
+        : `✅ Added to queue — Position ${pos}${loc}`;
+      showToast(msg, 'success', 6000);
+    } else if (result.dispatched) {
+      showToast(`🚖 ${esc(name)} is dispatched to a terminal`, 'info', 5000);
+    } else {
+      showToast(`❌ ${result.error || result.message || 'Bot run failed'}`, 'error', 6000);
+    }
+
+    loadDrivers(driversPage); // refresh last-run time
   } catch (err) {
-    showToast(err.message, 'error');
+    showToast(err.message || 'Failed to run bot', 'error');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalHTML;
+    btn.style.minWidth = '';
   }
 }
 
@@ -372,7 +397,7 @@ document.getElementById('drivers-table-body').addEventListener('click', e => {
   if (!btn) return;
   const id = Number(btn.dataset.id);
   if (btn.dataset.action === 'edit')    openEditModal(id);
-  if (btn.dataset.action === 'trigger') triggerDriver(id, btn.dataset.name);
+  if (btn.dataset.action === 'trigger') triggerDriver(id, btn.dataset.name, btn);
 });
 
 // Save driver (create or update)

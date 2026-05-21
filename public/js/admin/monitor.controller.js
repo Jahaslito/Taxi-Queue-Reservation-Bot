@@ -352,21 +352,62 @@ function disconnectSSE() {
 }
 
 // ─── Add watch flow ───────────────────────────────────────────────────────────
-async function startWatchPrompt() {
-  const raw = prompt('Enter vehicle number to watch (e.g. 4007):');
-  if (!raw || !raw.trim()) return;
-  const vehicleNumber = raw.trim();
+function openWatchModal() {
+  const modal = document.getElementById('watch-vehicle-modal');
+  const input = document.getElementById('watch-vehicle-input');
+  const errEl = document.getElementById('watch-vehicle-error');
+  input.value   = '';
+  errEl.textContent = '';
+  modal.classList.add('open');
+  setTimeout(() => input.focus(), 60);
+}
+
+function closeWatchModal() {
+  document.getElementById('watch-vehicle-modal').classList.remove('open');
+}
+
+async function submitWatchVehicle() {
+  const input   = document.getElementById('watch-vehicle-input');
+  const errEl   = document.getElementById('watch-vehicle-error');
+  const confirm = document.getElementById('btn-watch-confirm');
+  const vehicleNumber = input.value.trim();
+
+  if (!vehicleNumber) {
+    errEl.textContent = 'Please enter a vehicle number.';
+    input.focus();
+    return;
+  }
+
+  const originalHTML = confirm.innerHTML;
+  confirm.disabled = true;
+  confirm.innerHTML = '<span class="spinner"></span>';
 
   try {
-    const data = await api('/api/admin/monitor/watch', {
+    await api('/api/admin/monitor/watch', {
       method: 'POST',
       body: JSON.stringify({ vehicleNumber }),
     });
+    closeWatchModal();
     showToast(`👁 Now watching #${vehicleNumber}`, 'success');
   } catch (err) {
-    showToast(err.message, 'error');
+    errEl.textContent = err.message || 'Failed to add watch.';
+  } finally {
+    confirm.disabled = false;
+    confirm.innerHTML = originalHTML;
   }
 }
+
+// ─── Watch modal event listeners ─────────────────────────────────────────────
+document.getElementById('btn-watch-modal-close').addEventListener('click', closeWatchModal);
+document.getElementById('btn-watch-cancel').addEventListener('click', closeWatchModal);
+document.getElementById('btn-watch-confirm').addEventListener('click', submitWatchVehicle);
+document.getElementById('watch-vehicle-modal').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeWatchModal(); // click outside to dismiss
+});
+document.getElementById('watch-vehicle-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') submitWatchVehicle();
+  if (e.key === 'Escape') closeWatchModal();
+});
 
 async function stopWatching(driverId) {
   try {
@@ -390,4 +431,4 @@ function onMonitorPageHide() {
 }
 
 // ─── Event listeners ─────────────────────────────────────────────────────────
-document.getElementById('btn-add-watch').addEventListener('click', startWatchPrompt);
+document.getElementById('btn-add-watch').addEventListener('click', openWatchModal);

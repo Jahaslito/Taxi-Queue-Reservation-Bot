@@ -431,6 +431,8 @@ function wlDisconnectSSE() {
 // ─── Manual "Run" button handler ──────────────────────────────────────────────
 async function wlHandleRun(driverId, vehicleNumber) {
   if (wlRunning.has(driverId)) return;
+  if (!await showConfirm(`Run bot now for vehicle #${vehicleNumber}?`)) return;
+
   wlRunning.add(driverId);
   wlPatchRow(driverId); // immediately show ⏳
 

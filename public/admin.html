@@ -194,7 +194,9 @@
     /* ── Modal ── */
     .modal-overlay {
       display: none; position: fixed; inset: 0;
-      background: rgba(0,0,0,0.7); z-index: 900;
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+      z-index: 900; padding: 16px;
       align-items: center; justify-content: center;
     }
     .modal-overlay.open { display: flex; }
@@ -204,6 +206,33 @@
       max-height: 90vh; overflow-y: auto;
     }
     .modal h3 { font-family: 'Syne', sans-serif; font-size: 20px; font-weight: 700; margin-bottom: 20px; }
+    /* ── Themed modal variant (driver add/edit) ── */
+    .modal-themed {
+      padding: 0; overflow: hidden;
+      display: flex; flex-direction: column;
+      border-color: rgba(255,255,255,0.1);
+      box-shadow: 0 24px 64px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.04);
+    }
+    .modal-themed .modal-top-bar {
+      height: 3px; flex-shrink: 0;
+      background: linear-gradient(90deg, var(--teal), var(--blue), var(--purple));
+    }
+    .modal-themed .modal-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 20px 24px 16px; border-bottom: 1px solid var(--border); flex-shrink: 0;
+    }
+    .modal-themed .modal-header h3 {
+      font-family: 'Syne', sans-serif; font-size: 18px; font-weight: 800; margin: 0;
+    }
+    .modal-themed .modal-body { padding: 20px 24px 24px; overflow-y: auto; flex: 1; }
+    .btn-modal-close {
+      width: 28px; height: 28px; flex-shrink: 0;
+      background: rgba(255,255,255,0.05); border: 1px solid var(--border);
+      border-radius: 7px; color: var(--muted2); cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 13px; line-height: 1; transition: all 0.15s;
+    }
+    .btn-modal-close:hover { background: rgba(255,255,255,0.1); color: var(--white); }
     .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     .form-group { margin-bottom: 14px; }
     .form-group label { display: block; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 6px; }
@@ -791,100 +820,112 @@
 
 <!-- ══════════════════════════ ADD/EDIT DRIVER MODAL ══════════════════════════ -->
 <div class="modal-overlay" id="driver-modal">
-  <div class="modal">
-    <h3 id="modal-title">Add Driver</h3>
-    <input type="hidden" id="modal-driver-id" />
-
-    <div class="form-row">
-      <div class="form-group">
-        <label>Full Name *</label>
-        <input type="text" id="m-name" placeholder="John Doe" />
+  <div class="modal modal-themed">
+    <div class="modal-top-bar"></div>
+    <div class="modal-header">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <div style="width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,var(--teal),var(--blue));display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;">🚕</div>
+        <h3 id="modal-title">Add Driver</h3>
       </div>
-      <div class="form-group">
-        <label>Phone</label>
-        <input type="tel" id="m-phone" placeholder="+1 619 555 0123" />
-      </div>
+      <button class="btn-modal-close" onclick="document.getElementById('driver-modal').classList.remove('open')" aria-label="Close">✕</button>
     </div>
+    <div class="modal-body">
+      <input type="hidden" id="modal-driver-id" />
 
-    <div class="form-group">
-      <label>Email</label>
-      <input type="email" id="m-email" placeholder="driver@email.com" />
-    </div>
-
-    <div style="background:rgba(0,209,178,0.05);border:1px solid rgba(0,209,178,0.15);border-radius:12px;padding:14px;margin-bottom:14px;">
-      <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:var(--teal);margin-bottom:12px;">SAN eDispatch Credentials</div>
       <div class="form-row">
-        <div class="form-group" style="margin-bottom:0;">
-          <label>SAN Username *</label>
-          <input type="text" id="m-san-user" autocomplete="off" />
+        <div class="form-group">
+          <label>Full Name *</label>
+          <input type="text" id="m-name" placeholder="John Doe" />
         </div>
-        <div class="form-group" style="margin-bottom:0;">
-          <label>SAN Password *</label>
-          <input type="password" id="m-san-pass" autocomplete="new-password" />
+        <div class="form-group">
+          <label>Phone</label>
+          <input type="tel" id="m-phone" placeholder="+1 619 555 0123" />
         </div>
       </div>
-      <div class="form-group" style="margin-top:12px;margin-bottom:0;">
-        <label>Vehicle Dispatch Name *</label>
-        <input type="text" id="m-vehicle" placeholder="e.g. 4000" autocomplete="off" />
-      </div>
-    </div>
 
-    <div class="form-group">
-      <label>App Password <span style="color:var(--muted);font-weight:400;font-size:11px;">(leave blank to keep current)</span></label>
-      <input type="password" id="m-app-pass" autocomplete="new-password" placeholder="Reset driver app password" />
-    </div>
-
-    <div class="form-row">
       <div class="form-group">
-        <label>Active</label>
-        <select id="m-active">
-          <option value="1">Active</option>
-          <option value="0">Inactive</option>
-        </select>
+        <label>Email</label>
+        <input type="email" id="m-email" placeholder="driver@email.com" />
       </div>
-    </div>
 
-    <div class="form-group">
-      <label>Schedule Type</label>
-      <div style="display:flex;gap:8px;margin-top:4px;">
-        <button type="button" id="m-sched-type-time" class="btn btn-primary" style="flex:1;font-size:13px;">⏰ Time</button>
-        <button type="button" id="m-sched-type-pos"  class="btn btn-ghost"   style="flex:1;font-size:13px;">📍 Position</button>
+      <div style="background:rgba(0,209,178,0.05);border:1px solid rgba(0,209,178,0.2);border-radius:12px;padding:14px;margin-bottom:14px;">
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:var(--teal);margin-bottom:12px;display:flex;align-items:center;gap:6px;">
+          <span style="width:16px;height:16px;border-radius:4px;background:rgba(0,209,178,0.2);display:inline-flex;align-items:center;justify-content:center;font-size:10px;">🔑</span>
+          SAN eDispatch Credentials
+        </div>
+        <div class="form-row">
+          <div class="form-group" style="margin-bottom:0;">
+            <label>SAN Username *</label>
+            <input type="text" id="m-san-user" autocomplete="off" />
+          </div>
+          <div class="form-group" style="margin-bottom:0;">
+            <label>SAN Password *</label>
+            <input type="password" id="m-san-pass" autocomplete="new-password" />
+          </div>
+        </div>
+        <div class="form-group" style="margin-top:12px;margin-bottom:0;">
+          <label>Vehicle Dispatch Name *</label>
+          <input type="text" id="m-vehicle" placeholder="e.g. 4000" autocomplete="off" />
+        </div>
       </div>
-    </div>
 
-    <div id="m-sched-time-block">
       <div class="form-group">
-        <label>Queue Time (PT)</label>
-        <input type="time" id="m-time" value="05:00" />
+        <label>App Password <span style="color:var(--muted);font-weight:400;font-size:11px;">(leave blank to keep current)</span></label>
+        <input type="password" id="m-app-pass" autocomplete="new-password" placeholder="Reset driver app password" />
       </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label>Active</label>
+          <select id="m-active">
+            <option value="1">Active</option>
+            <option value="0">Inactive</option>
+          </select>
+        </div>
+      </div>
+
       <div class="form-group">
-        <label>Weekly Schedule</label>
-        <button type="button" class="btn btn-ghost" id="btn-open-admin-day-sched" style="width:100%;">
-          📅 Configure Weekly Schedule
-        </button>
-        <div id="admin-sched-summary" style="font-size:12px;color:var(--muted2);margin-top:6px;"></div>
+        <label>Schedule Type</label>
+        <div style="display:flex;gap:8px;margin-top:4px;">
+          <button type="button" id="m-sched-type-time" class="btn btn-primary" style="flex:1;font-size:13px;">⏰ Time</button>
+          <button type="button" id="m-sched-type-pos"  class="btn btn-ghost"   style="flex:1;font-size:13px;">📍 Position</button>
+        </div>
       </div>
-    </div>
 
-    <div id="m-sched-pos-block" style="display:none;">
+      <div id="m-sched-time-block">
+        <div class="form-group">
+          <label>Queue Time (PT)</label>
+          <input type="time" id="m-time" value="05:00" />
+        </div>
+        <div class="form-group">
+          <label>Weekly Schedule</label>
+          <button type="button" class="btn btn-ghost" id="btn-open-admin-day-sched" style="width:100%;">
+            📅 Configure Weekly Schedule
+          </button>
+          <div id="admin-sched-summary" style="font-size:12px;color:var(--muted2);margin-top:6px;"></div>
+        </div>
+      </div>
+
+      <div id="m-sched-pos-block" style="display:none;">
+        <div class="form-group">
+          <label>Per-Day Position Schedule</label>
+          <button type="button" class="btn btn-ghost" id="btn-open-admin-pos-sched" style="width:100%;">
+            📅 Configure Per-Day Positions
+          </button>
+          <div id="admin-pos-summary" style="font-size:12px;color:var(--muted2);margin-top:6px;"></div>
+        </div>
+      </div>
+
       <div class="form-group">
-        <label>Per-Day Position Schedule</label>
-        <button type="button" class="btn btn-ghost" id="btn-open-admin-pos-sched" style="width:100%;">
-          📅 Configure Per-Day Positions
-        </button>
-        <div id="admin-pos-summary" style="font-size:12px;color:var(--muted2);margin-top:6px;"></div>
+        <label>Notes</label>
+        <input type="text" id="m-notes" placeholder="Any special notes" />
       </div>
-    </div>
 
-    <div class="form-group">
-      <label>Notes</label>
-      <input type="text" id="m-notes" placeholder="Any special notes" />
-    </div>
-
-    <div class="error-msg" id="modal-error"></div>
-    <div class="modal-actions">
-      <button class="btn btn-ghost" id="btn-cancel-modal">Cancel</button>
-      <button class="btn btn-primary" id="btn-save-driver">Save Driver</button>
+      <div class="error-msg" id="modal-error"></div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="btn-cancel-modal">Cancel</button>
+        <button class="btn btn-primary" id="btn-save-driver" style="background:linear-gradient(135deg,var(--teal),var(--blue));color:#000;">Save Driver</button>
+      </div>
     </div>
   </div>
 </div>

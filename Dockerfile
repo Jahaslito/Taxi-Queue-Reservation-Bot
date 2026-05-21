@@ -35,7 +35,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # ── Install dependencies + Playwright's Chromium (cached layer) ───────────────
 COPY package*.json ./
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev && npx playwright install chromium
 
 # ── Copy application source (changes on every deploy) ────────────────────────
 COPY . .

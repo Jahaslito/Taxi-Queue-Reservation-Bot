@@ -352,13 +352,14 @@ describe('DELETE /api/admin/drivers/:id', () => {
 // ─── 22 — Trigger driver ─────────────────────────────────────────────────
 
 describe('POST /api/admin/drivers/:id/trigger', () => {
-  test('active driver returns 200 immediately with a message', async () => {
+  test('active driver returns 200 with bot result', async () => {
     const res = await request(app)
       .post(`/api/admin/drivers/${driver.id}/trigger`)
       .set('Cookie', aCookie);
 
     expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty('message');
+    expect(res.body).toHaveProperty('result');
+    expect(res.body.result).toHaveProperty('success');
   });
 
   test('inactive driver returns 400', async () => {

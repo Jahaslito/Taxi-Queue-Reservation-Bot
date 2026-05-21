@@ -541,6 +541,8 @@ async function poll() {
   prevWaitingCount = waitingCount;
 
   // One pass — O(n) with n = number of watches; each lookup is O(1) Map op
+  const returnedFromTerminal = []; // drivers SAN auto-returned to V Holding mid-terminal
+
   for (const [driverId, state] of watches) {
     state._lastQueueSize = waitingCount; // keep fresh for logging
 
@@ -569,6 +571,12 @@ async function poll() {
     } else if (inWaiting) {
       if (!state.hasBeenSeen) state.hasBeenSeen = true;
       state.lastSeenAt = new Date();
+      // If transitioning from at_terminal → in_queue, SAN auto-returned the driver
+      // to V Holding before the terminal poll could detect they'd left. Collect for
+      // requeue below (after the stateChanged broadcast fires) so we don't double-emit.
+      if (prev === 'at_terminal') {
+        returnedFromTerminal.push({ driverId, state });
+      }
       next = 'in_queue';
     } else if (state.hasBeenSeen) {
       // Driver was seen in V Holding but is no longer there — they've been
@@ -599,6 +607,26 @@ async function poll() {
       state._lastBroadcastPos = livePosition;
       broadcast('driver_state', { driverId, state: snap(state) });
       console.log(`[Monitor] #${state.vehicleNumber} pos → #${livePosition} (${state.state})`);
+    }
+  }
+
+  // ─── Requeue drivers SAN auto-returned to V Holding during terminal service ──
+  // When a driver finishes a terminal trip, SAN sometimes places them back in
+  // V Holding before our next poll detects their absence from T1/T2. The V Holding
+  // loop above flags them; we fire the bot here (after the stateChanged broadcast)
+  // so the event is logged and the UI shows the re-queue attempt.
+  for (const { driverId, state } of returnedFromTerminal) {
+    if (!isWithinOperatingHours()) {
+      console.log(
+        `[Monitor] #${state.vehicleNumber} returned from terminal — outside operating hours ` +
+        `(${OP_START_HOUR}:00–${OP_END_HOUR}:00 PT), requeue paused`,
+      );
+    } else {
+      console.log(
+        `[Monitor] #${state.vehicleNumber} at_terminal → in_queue (SAN auto-returned, ` +
+        `pos #${state.currentPosition}) — firing requeue`,
+      );
+      triggerRequeue(driverId, state).catch(console.error);
     }
   }
 

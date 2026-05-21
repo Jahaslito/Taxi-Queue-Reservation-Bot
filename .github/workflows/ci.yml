@@ -33,6 +33,7 @@ jobs:
 
     env:
       NODE_ENV: test
+      DATABASE_URL: postgresql://san_queue:testpassword@localhost:5432/san_queue_test
       TEST_DATABASE_URL: postgresql://san_queue:testpassword@localhost:5432/san_queue_test
       JWT_SECRET: ci-jwt-secret-not-used-in-production
       ENCRYPTION_KEY: ci-encryption-key-32-chars-ok!!

@@ -1,0 +1,86 @@
+name: Deploy → Staging
+
+# ─── Triggers ─────────────────────────────────────────────────────────────────
+# Every push to main: run tests → deploy to staging droplet automatically.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+
+  # ── 1. Tests must pass before any deploy ─────────────────────────────────────
+  test:
+    name: Test Suite
+    uses: ./.github/workflows/_test.yml
+
+  # ── 2. Deploy to staging ──────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to Staging
+    needs: test
+    runs-on: ubuntu-latest
+
+    # GitHub Environment — add protection rules in repo Settings → Environments
+    # (no approval required for staging — it deploys automatically)
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to staging droplet via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.STAGING_SSH_HOST }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key:      ${{ secrets.STAGING_SSH_KEY }}
+          port:     ${{ secrets.STAGING_SSH_PORT || 22 }}
+          script: |
+            set -euo pipefail
+            cd /opt/san-queue
+
+            echo "── Pulling latest code ──"
+            git fetch origin
+            git checkout main
+            git reset --hard origin/main
+
+            echo "── Running database migrations ──"
+            docker compose run --rm app node -e "
+              process.env.DATABASE_SSL = 'false';
+              const knex = require('knex')(require('./knexfile').production);
+              knex.migrate.latest()
+                .then(([batch, files]) => {
+                  if (files.length) console.log('Ran:', files.join(', '));
+                  else console.log('Already up to date.');
+                  process.exit(0);
+                })
+                .catch(e => { console.error(e.message); process.exit(1); });
+            "
+
+            echo "── Rebuilding and restarting app ──"
+            docker compose up -d --build --no-deps app
+
+            echo "── Health check ──"
+            for i in $(seq 1 12); do
+              STATUS=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:3000/api/health || echo "000")
+              if [ "$STATUS" = "200" ]; then
+                echo "✓ Staging healthy after ${i}x5s"
+                exit 0
+              fi
+              echo "  waiting… (${i}/12)"
+              sleep 5
+            done
+            echo "✗ Health check timed out"
+            docker compose logs --tail=40 app
+            exit 1
+
+      - name: Notify success
+        if: success()
+        run: echo "✅ Staging deploy complete — ${{ vars.STAGING_URL }}"
+
+      - name: Notify failure
+        if: failure()
+        run: echo "❌ Staging deploy FAILED — check SSH logs above"

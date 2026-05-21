@@ -1,0 +1,118 @@
+name: Deploy → Production
+
+# ─── Triggers ─────────────────────────────────────────────────────────────────
+# 1. Push a version tag:  git tag v1.2.0 && git push origin v1.2.0
+# 2. Manual trigger in GitHub Actions UI (workflow_dispatch)
+#
+# Both paths require a human approval in the GitHub "production" Environment
+# before the SSH deploy command actually runs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"   # e.g. v1.0.0, v2.3.1
+
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or tag to deploy (e.g. main, v1.2.0)"
+        required: true
+        default: main
+      reason:
+        description: "Reason for manual deploy"
+        required: false
+
+jobs:
+
+  # ── 1. Always run tests before touching production ────────────────────────────
+  test:
+    name: Test Suite
+    uses: ./.github/workflows/_test.yml
+
+  # ── 2. Deploy to production ───────────────────────────────────────────────────
+  deploy:
+    name: Deploy to Production
+    needs: test
+    runs-on: ubuntu-latest
+
+    # ⚠️  REQUIRES SETUP IN GITHUB:
+    # Repo → Settings → Environments → production → Required reviewers
+    # Add yourself (or your team) as a required reviewer.
+    # The workflow pauses here until someone clicks "Approve" in the UI.
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Resolve deploy ref
+        id: ref
+        run: |
+          REF="${{ github.event.inputs.ref || github.ref_name }}"
+          echo "Deploying ref: $REF"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to production droplet via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.PROD_SSH_HOST }}
+          username: ${{ secrets.PROD_SSH_USER }}
+          key:      ${{ secrets.PROD_SSH_KEY }}
+          port:     ${{ secrets.PROD_SSH_PORT || 22 }}
+          script: |
+            set -euo pipefail
+            cd /opt/san-queue
+
+            echo "── Pulling ref: ${{ steps.ref.outputs.ref }} ──"
+            git fetch --tags origin
+            git checkout ${{ steps.ref.outputs.ref }}
+            git reset --hard ${{ steps.ref.outputs.ref }}
+
+            echo "── Running database migrations ──"
+            docker compose run --rm app node -e "
+              process.env.DATABASE_SSL = 'false';
+              const knex = require('knex')(require('./knexfile').production);
+              knex.migrate.latest()
+                .then(([batch, files]) => {
+                  if (files.length) console.log('Ran:', files.join(', '));
+                  else console.log('Already up to date.');
+                  process.exit(0);
+                })
+                .catch(e => { console.error(e.message); process.exit(1); });
+            "
+
+            echo "── Rebuilding and restarting app ──"
+            docker compose up -d --build --no-deps app
+
+            echo "── Health check ──"
+            for i in $(seq 1 18); do
+              STATUS=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:3000/api/health || echo "000")
+              if [ "$STATUS" = "200" ]; then
+                echo "✓ Production healthy after ${i}x5s"
+                exit 0
+              fi
+              echo "  waiting… (${i}/18)"
+              sleep 5
+            done
+            echo "✗ Health check timed out — rolling back"
+            git stash
+            docker compose up -d --build --no-deps app
+            exit 1
+
+      - name: Notify success
+        if: success()
+        run: |
+          echo "✅ Production deploy complete"
+          echo "   Ref: ${{ steps.ref.outputs.ref }}"
+          echo "   URL: ${{ vars.PRODUCTION_URL }}"
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          echo "❌ Production deploy FAILED"
+          echo "   Ref: ${{ steps.ref.outputs.ref }}"

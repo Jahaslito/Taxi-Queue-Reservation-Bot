@@ -1,0 +1,66 @@
+name: CI — Test Suite
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]   # tag pushes are handled by deploy-production.yml
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    name: Run Tests (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [20.x, 22.x]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: san_queue
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: san_queue_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      NODE_ENV: test
+      TEST_DATABASE_URL: postgresql://san_queue:testpassword@localhost:5432/san_queue_test
+      JWT_SECRET: ci-jwt-secret-not-used-in-production
+      ENCRYPTION_KEY: ci-encryption-key-32-chars-ok!!
+      ADMIN_PASSWORD: ciAdminPass123
+      RETRY_BASE_MS: 0
+      RETRY_JITTER_MS: 0
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Upload coverage report
+        if: matrix.node-version == '20.x'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+        continue-on-error: true

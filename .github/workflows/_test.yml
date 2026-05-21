@@ -1,0 +1,54 @@
+name: _test (reusable)
+
+# ─── Reusable test job ────────────────────────────────────────────────────────
+# Called by deploy-staging.yml and deploy-production.yml so tests always
+# run before any deploy, using identical DB/env setup as ci.yml.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_call:
+    outputs:
+      result:
+        description: "test result"
+        value: ${{ jobs.test.result }}
+
+jobs:
+  test:
+    name: Run Tests (Node 22.x)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: san_queue
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: san_queue_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      NODE_ENV: test
+      TEST_DATABASE_URL: postgresql://san_queue:testpassword@localhost:5432/san_queue_test
+      JWT_SECRET: ci-jwt-secret-not-used-in-production
+      ENCRYPTION_KEY: ci-encryption-key-32-chars-ok!!
+      ADMIN_PASSWORD: ciAdminPass123
+      RETRY_BASE_MS: 0
+      RETRY_JITTER_MS: 0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm test

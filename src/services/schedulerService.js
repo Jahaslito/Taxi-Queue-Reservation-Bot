@@ -2,7 +2,7 @@ const cron    = require('node-cron');
 const Driver  = require('../models/Driver');
 const Log     = require('../models/Log');
 const { decrypt }    = require('./cryptoService');
-const { addToQueue } = require('./botService');
+const { addToQueue, sanitizeError } = require('./botService');
 
 // In-memory set prevents the same driver from running twice simultaneously
 const runningJobs = new Set();
@@ -117,9 +117,10 @@ async function runBotForDriver(driver, triggerType = 'scheduled') {
 
     return result;
   } catch (err) {
-    await Log.update(logId, { status: 'failed', error_message: err.message });
+    const friendly = sanitizeError(err.message);
+    await Log.update(logId, { status: 'failed', error_message: friendly });
     console.error(`[Scheduler] ✗ ${driver.name} → Unexpected error: ${err.message}`);
-    return { success: false, error: err.message };
+    return { success: false, error: friendly };
   } finally {
     runningJobs.delete(jobKey);
   }

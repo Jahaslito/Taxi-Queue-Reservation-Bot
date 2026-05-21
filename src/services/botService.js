@@ -3,6 +3,25 @@ const crypto       = require('crypto');
 const fs           = require('fs');
 const path         = require('path');
 
+// ─── Friendly error messages ──────────────────────────────────────────────────
+// Converts raw technical errors into driver-readable messages.
+function sanitizeError(msg = '') {
+  const m = msg.toLowerCase();
+  if (m.includes('executable') || m.includes('chromium') || m.includes('browser') || m.includes('playwright'))
+    return 'Bot temporarily unavailable — please try again shortly';
+  if (m.includes('timeout') || m.includes('timed out'))
+    return 'The SAN website took too long to respond — please try again';
+  if (m.includes('net::err') || m.includes('name not resolved') || m.includes('connection refused') || m.includes('econnrefused'))
+    return 'Could not reach the SAN website — please try again';
+  if (m.includes('invalid') || m.includes('incorrect') || m.includes('wrong') || m.includes('credentials'))
+    return 'Invalid SAN username or password — check your credentials';
+  if (m.includes('not found'))
+    return 'Vehicle number not found in SAN eDispatch';
+  if (m.includes('navigation') || m.includes('page crashed'))
+    return 'The SAN website is currently unavailable — please try again later';
+  return 'Something went wrong — please try again or contact support';
+}
+
 // ─── Proxy rotation ───────────────────────────────────────────────────────────
 // Returns a Playwright-compatible proxy config with a fresh session ID, or null
 // if PROXY_SERVER is not set (proxy disabled — all traffic goes via server IP).
@@ -239,11 +258,13 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
     console.error(`[Bot] ${vehicleNumber} → ERROR: ${err.message}`);
     // Capture page state at the moment of failure so we can see what the bot was looking at
     if (page) await debugCapture(page, vehicleNumber, 'error');
+    const friendly = sanitizeError(err.message);
     return {
       success: false,
       durationMs: Date.now() - startTime,
-      error: err.message,
-      message: `Automation failed: ${err.message}`
+      error: friendly,
+      message: friendly,
+      rawError: err.message,   // kept for server logs only, never shown to drivers
     };
   } finally {
     if (browser) await browser.close();
@@ -280,4 +301,4 @@ async function extractQueueInfo(page) {
   }
 }
 
-module.exports = { addToQueue };
+module.exports = { addToQueue, sanitizeError };

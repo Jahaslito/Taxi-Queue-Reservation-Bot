@@ -35,7 +35,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # ── Install dependencies + Playwright's Chromium (cached layer) ───────────────
 COPY package*.json ./
-RUN npm ci --omit=dev && npx playwright install chromium
+RUN npm ci --omit=dev && npx playwright install chromium && npm install -g pm2
 
 # ── Copy application source (changes on every deploy) ────────────────────────
 COPY . .
@@ -47,4 +47,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
   CMD node -e "require('http').get('http://localhost:3000/api/health', \
     r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
 
-CMD ["node", "--no-warnings", "server.js"]
+CMD ["pm2-runtime", "start", "ecosystem.config.js"]

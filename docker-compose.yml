@@ -62,8 +62,13 @@ services:
       RESEND_API_KEY:   ${RESEND_API_KEY:-}
       EMAIL_FROM:       ${EMAIL_FROM:-SAN Queue <noreply@sanqueue.com>}
 
+      # Stripe billing
+      STRIPE_SECRET_KEY:      ${STRIPE_SECRET_KEY:-}
+      STRIPE_PRICE_ID:        ${STRIPE_PRICE_ID:-}
+      STRIPE_WEBHOOK_SECRET:  ${STRIPE_WEBHOOK_SECRET:-}
+
       # Monitor tuning (optional — defaults apply if not set)
-      MONITOR_POLL_MS:              ${MONITOR_POLL_MS:-90000}
+      MONITOR_POLL_MS:              ${MONITOR_POLL_MS:-30000}
       MONITOR_REFRESH_MS:           ${MONITOR_REFRESH_MS:-300000}
       MONITOR_CONCURRENCY:          ${MONITOR_CONCURRENCY:-3}
       MONITOR_START_HOUR:           ${MONITOR_START_HOUR:-5}

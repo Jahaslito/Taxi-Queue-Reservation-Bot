@@ -13,6 +13,40 @@ const MAX_RETRIES    = 3;
 const BASE_RETRY_MS  = parseInt(process.env.RETRY_BASE_MS  ?? '5000', 10); // 5s → 10s → 20s
 const MAX_JITTER_MS  = parseInt(process.env.RETRY_JITTER_MS ?? '2000', 10); // up to 2s jitter
 
+// ─── Global bot semaphore ─────────────────────────────────────────────────────
+// Caps concurrent Chromium instances across ALL cron ticks.
+// Without this, overlapping ticks (e.g. 5:00 batch still running when 5:01
+// fires) would each enforce their own local cap, silently doubling total
+// concurrency and potentially OOM-ing the server.
+class BotSemaphore {
+  constructor(max) {
+    this._max     = max;
+    this._running = 0;
+    this._waiting = []; // pending resolve callbacks
+  }
+
+  acquire() {
+    if (this._running < this._max) {
+      this._running++;
+      return Promise.resolve();
+    }
+    return new Promise(resolve => this._waiting.push(resolve));
+  }
+
+  release() {
+    if (this._waiting.length > 0) {
+      // Hand the slot directly to the next waiter — _running stays the same
+      this._waiting.shift()();
+    } else {
+      this._running = Math.max(0, this._running - 1);
+    }
+  }
+
+  get active() { return this._running; }
+}
+
+const botSemaphore = new BotSemaphore(MAX_CONCURRENT);
+
 /**
  * Returns false for permanent failures that are not worth retrying
  * (wrong credentials, vehicle not found). Everything else is transient.
@@ -26,31 +60,23 @@ function isTransientError(result) {
 }
 
 /**
- * Runs an array of drivers through the bot with a hard concurrency ceiling.
- * At most MAX_CONCURRENT Chromium instances run simultaneously.
+ * Runs an array of drivers through the bot respecting the global semaphore.
+ * All callers (every cron tick) share the same BotSemaphore, so the cap of
+ * MAX_CONCURRENT browsers is enforced globally — not just within one batch.
  */
 async function runWithConcurrencyLimit(drivers, triggerType) {
-  const queue    = [...drivers];
-  const inFlight = new Set();
-
-  function next() {
-    while (inFlight.size < MAX_CONCURRENT && queue.length > 0) {
-      const driver  = queue.shift();
-      const promise = runBotForDriver(driver, triggerType)
-        .catch(console.error)
-        .finally(() => {
-          inFlight.delete(promise);
-          next();
-        });
-      inFlight.add(promise);
-    }
-  }
-
-  next();
-
-  while (inFlight.size > 0) {
-    await Promise.race(inFlight);
-  }
+  await Promise.all(
+    drivers.map(async (driver) => {
+      await botSemaphore.acquire();
+      try {
+        await runBotForDriver(driver, triggerType);
+      } catch (err) {
+        console.error('[Scheduler] Unexpected error in bot run:', err.message);
+      } finally {
+        botSemaphore.release();
+      }
+    }),
+  );
 }
 
 /**
@@ -176,10 +202,13 @@ function startScheduler() {
 
       console.log(`[Scheduler] ${currentTime} PT — Found ${drivers.length} driver(s) to process`);
 
+      // One query for all drivers — replaces N sequential round-trips
+      const driverIds    = drivers.map(d => d.id);
+      const alreadyDoneIds = await Log.findSuccessTodayBatch(driverIds, today);
+
       const driversToRun = [];
       for (const driver of drivers) {
-        const alreadyDone = await Log.findSuccessToday(driver.id, today);
-        if (alreadyDone) {
+        if (alreadyDoneIds.has(driver.id)) {
           console.log(`[Scheduler] Skipping ${driver.name} — already queued today`);
         } else {
           driversToRun.push(driver);

@@ -49,6 +49,21 @@ class Log {
   }
 
   /**
+   * Batch version of findSuccessToday — one query for any number of drivers.
+   * Returns a Set of driverIds that have already been successfully queued today.
+   * Replaces N sequential queries in the cron tick with a single WHERE IN.
+   */
+  static async findSuccessTodayBatch(driverIds, today) {
+    if (!driverIds.length) return new Set();
+    const rows = await db(TABLE)
+      .whereIn('driver_id', driverIds)
+      .whereRaw("DATE(triggered_at AT TIME ZONE 'America/Los_Angeles') = ?", [today])
+      .whereIn('status', ['success', 'already_queued'])
+      .select('driver_id');
+    return new Set(rows.map(r => r.driver_id));
+  }
+
+  /**
    * Admin logs list with driver name and vehicle joined.
    * Supports filtering by driverId, status, date, and free-text search.
    */

@@ -67,16 +67,50 @@ const APP_HOST    = 'san.gtcvms.com/gsidispatch.edispatch';
 const TIMEOUT     = 60000;   // 60s — OIDC handshake + SPA hydration can be slow
 const NAV_TIMEOUT = 60000;   // Extra time for full page-navigation round-trips
 
+// ─── Session store ────────────────────────────────────────────────────────────
+// In-memory cache of Playwright storage states (cookies + localStorage) keyed by
+// SAN username. Lets subsequent runs skip the full OIDC login (~15 s saved).
+//
+// Lifecycle:
+//   • Populated on every successful login — overwritten on every successful run.
+//   • Evicted automatically after SESSION_TTL_MS (proactive expiry).
+//   • Cleared immediately if SAN rejects the restored session (reactive expiry).
+//   • Lost on server restart — first run re-authenticates and repopulates.
+//
+// IdentityServer (the OIDC provider used by SAN) does not bind sessions to IP,
+// so sessions remain valid across rotating residential proxy IPs.
+const SESSION_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
+const sessionStore   = new Map();            // sanUsername → { storageState, savedAt }
+
+function getStoredSession(username) {
+  const entry = sessionStore.get(username);
+  if (!entry) return undefined;
+  if (Date.now() - entry.savedAt > SESSION_TTL_MS) {
+    sessionStore.delete(username);
+    console.log(`[Bot:session] Evicted stale session for ${username}`);
+    return undefined;
+  }
+  return entry.storageState;
+}
+
+function saveSession(username, storageState) {
+  sessionStore.set(username, { storageState, savedAt: Date.now() });
+}
+
 /**
  * Automates the full SAN eDispatch queue process for one driver.
  *
- * Flow:
+ * Flow (first run / session expired):
  *  1. Navigate to eDispatch → OIDC redirects to identity server login page
- *  2. Fill username + password, click Log In
- *  3. OIDC callback redirects back to eDispatch app
- *  4. Fill vehicle NUMBER in search field, click Search
- *  5. Click "Add To Queue" on the vehicle result page
- *  6. Read Position / Location / Time from the WAIT confirmation screen
+ *  2. Fill username + password, click Log In → OIDC callback → back on app
+ *  3. Save storage state (cookies) for future runs
+ *  4–9. Search, add to queue, read position
+ *
+ * Flow (session cached, < 4 hours old):
+ *  1. Navigate to eDispatch with restored cookies → lands on app directly
+ *  2. (login skipped — ~15 s saved)
+ *  3. Refresh storage state
+ *  4–9. Search, add to queue, read position
  */
 async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
   const startTime = Date.now();
@@ -95,57 +129,81 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
       ]
     });
 
-    const proxyConfig = getProxyConfig();
+    const proxyConfig  = getProxyConfig();
+    const savedSession = getStoredSession(sanUsername);
+
     if (proxyConfig) {
       console.log(`[Bot] ${vehicleNumber} → Using proxy session ${proxyConfig.username.split('-session-')[1] ?? '?'}`);
+    }
+    if (savedSession) {
+      console.log(`[Bot] ${vehicleNumber} → Restoring saved session for ${sanUsername}`);
     }
 
     const context = await browser.newContext({
       // Mobile UA matches what the site expects (optimised for mobile)
-      userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
-      viewport:  { width: 390, height: 844 },
+      userAgent:    'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+      viewport:     { width: 390, height: 844 },
       permissions:     [],
       acceptDownloads: false,
+      storageState:    savedSession,   // undefined = fresh context; object = restored session
       ...(proxyConfig ? { proxy: proxyConfig } : {}),
     });
 
     page = await context.newPage();
 
     // ─── STEP 1: Navigate ─────────────────────────────────────────────────────
-    // Navigating to the app URL triggers an OIDC redirect to:
-    //   https://san.gtcvms.com/GsiIdentityServer/Account/Login?ReturnUrl=...
-    // Playwright follows all redirects automatically; we wait for the login
-    // form to appear on the identity-server page.
-    console.log(`[Bot] ${vehicleNumber} → Navigating to SAN eDispatch (OIDC flow)…`);
+    // With a valid saved session the app loads directly (no OIDC redirect).
+    // Without one (first run or expired) SAN redirects to the identity server.
+    // We wait for whichever destination appears first.
+    console.log(`[Bot] ${vehicleNumber} → Navigating to SAN eDispatch…`);
     await page.goto(SAN_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
 
-    // Confirm we landed on the OIDC login page
-    await page.waitForURL(`**/${OIDC_HOST}/**`, { timeout: TIMEOUT });
-    console.log(`[Bot] ${vehicleNumber} → Redirected to OIDC login: ${page.url()}`);
+    await page.waitForURL(
+      url => url.href.includes(OIDC_HOST) || url.href.includes(APP_HOST),
+      { timeout: TIMEOUT },
+    );
 
-    // ─── STEP 2: Fill login form ──────────────────────────────────────────────
-    await page.waitForSelector('input[placeholder="Enter Username"]', { timeout: TIMEOUT });
-    console.log(`[Bot] ${vehicleNumber} → Filling credentials for ${sanUsername}…`);
+    // ─── STEP 2: Login only when OIDC redirected us ───────────────────────────
+    if (page.url().includes(OIDC_HOST)) {
+      if (savedSession) {
+        // SAN rejected the restored cookies — clear the bad entry so the next
+        // run doesn't waste time trying the same stale session again.
+        sessionStore.delete(sanUsername);
+        console.log(`[Bot] ${vehicleNumber} → Saved session rejected by SAN — falling back to full login`);
+      } else {
+        console.log(`[Bot] ${vehicleNumber} → Redirected to OIDC login: ${page.url()}`);
+      }
 
-    await page.fill('input[placeholder="Enter Username"]', sanUsername);
-    await page.fill('input[placeholder="Enter Password"]', sanPassword);
+      await page.waitForSelector('input[placeholder="Enter Username"]', { timeout: TIMEOUT });
+      console.log(`[Bot] ${vehicleNumber} → Filling credentials for ${sanUsername}…`);
+      await page.fill('input[placeholder="Enter Username"]', sanUsername);
+      await page.fill('input[placeholder="Enter Password"]', sanPassword);
 
-    // Click Log In — wait for the OIDC callback to redirect us back to the app
-    await Promise.all([
-      page.waitForURL(`**/${APP_HOST}/**`, { timeout: NAV_TIMEOUT }),
-      page.click('button:has-text("Log In")')
-    ]);
+      // Click Log In — wait for OIDC callback to redirect back to the app
+      await Promise.all([
+        page.waitForURL(`**/${APP_HOST}/**`, { timeout: NAV_TIMEOUT }),
+        page.click('button:has-text("Log In")'),
+      ]);
 
-    console.log(`[Bot] ${vehicleNumber} → OIDC callback complete — back on eDispatch.`);
+      console.log(`[Bot] ${vehicleNumber} → OIDC callback complete — back on eDispatch.`);
+    } else {
+      console.log(`[Bot] ${vehicleNumber} → Session valid — skipped OIDC login.`);
+    }
+
+    // ─── STEP 3: Persist / refresh the session ───────────────────────────────
+    // Always snapshot current cookies after reaching the app so the next run
+    // can reuse them. Overwrites any previous entry for this username.
+    const storageState = await context.storageState();
+    saveSession(sanUsername, storageState);
 
     // Let the SPA fully hydrate before querying the DOM
     await page.waitForLoadState('networkidle', { timeout: TIMEOUT }).catch(() => {});
 
-    // Debug: capture what the page looks like right after login, before any waitForFunction
+    // Debug: capture what the page looks like right after auth
     await debugCapture(page, vehicleNumber, 'after_login');
 
-    // ─── STEP 3: Check for wrong-credentials error ────────────────────────────
-    // If the URL is still on the identity server, login failed
+    // ─── STEP 4: Check for wrong-credentials error ────────────────────────────
+    // If we're still on the identity server after the login attempt, auth failed.
     if (page.url().includes(OIDC_HOST)) {
       const errorText = await page.textContent('body').catch(() => '');
       const hint = errorText.includes('Invalid') || errorText.includes('incorrect')
@@ -154,7 +212,7 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
       return { success: false, durationMs: Date.now() - startTime, error: hint, message: hint };
     }
 
-    // ─── STEP 4: Wait for either the search page OR the WAIT screen ─────────────
+    // ─── STEP 5: Wait for either the search page OR the WAIT screen ─────────────
     // When already queued, SAN skips the search page and shows the WAIT screen directly.
     // When dispatched to a terminal, SAN shows a /status page — detect and bail early.
     await page.waitForFunction(
@@ -196,7 +254,7 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
 
     console.log(`[Bot] ${vehicleNumber} → On vehicle search page.`);
 
-    // ─── STEP 5: Search by vehicle number ────────────────────────────────────
+    // ─── STEP 6: Search by vehicle number ────────────────────────────────────
     // The field placeholder says "Vehicle Dispatch Name" but the actual value
     // entered is the numeric vehicle number (e.g. "4000")
     console.log(`[Bot] ${vehicleNumber} → Searching for vehicle ${vehicleNumber}…`);
@@ -214,14 +272,14 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
       { timeout: TIMEOUT }
     );
 
-    // ─── STEP 6: Already queued after search? ────────────────────────────────
+    // ─── STEP 7: Already queued after search? ────────────────────────────────
     if (await isWaitScreen(page)) {
       const info = await extractQueueInfo(page);
       return { success: true, alreadyQueued: true, ...info, durationMs: Date.now() - startTime,
                message: `Vehicle already in queue at position ${info.position}` };
     }
 
-    // ─── STEP 7: Confirm vehicle was found ───────────────────────────────────
+    // ─── STEP 8: Confirm vehicle was found ───────────────────────────────────
     const addToQueueVisible = await page.isVisible('button:has-text("Add To Queue")').catch(() => false);
     if (!addToQueueVisible) {
       return {
@@ -232,7 +290,7 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
       };
     }
 
-    // ─── STEP 8: Click Add To Queue ───────────────────────────────────────────
+    // ─── STEP 9: Click Add To Queue ───────────────────────────────────────────
     console.log(`[Bot] ${vehicleNumber} → Clicking Add To Queue…`);
     await page.click('button:has-text("Add To Queue")');
 
@@ -244,7 +302,7 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
     );
     console.log(`[Bot] ${vehicleNumber} → ✓ Successfully added to queue!`);
 
-    // ─── STEP 9: Extract queue details ───────────────────────────────────────
+    // ─── STEP 10: Extract queue details ──────────────────────────────────────
     const info = await extractQueueInfo(page);
     return {
       success: true,

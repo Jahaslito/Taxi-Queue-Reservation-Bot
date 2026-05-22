@@ -718,17 +718,20 @@ async function poll() {
   // positionFiredToday also survives queue resets: once fired it stays true for
   // the rest of the day regardless of what happens to the queue.
   //
-  // Dynamic lead: estimatedDrift = effectiveGrowthRate × (bot_exec_time / poll_interval)
-  // This projects how many positions will be added while the bot is running.
-  // POS_LEAD_BUFFER acts as a minimum floor so the bot still fires early on calm days.
-  // Both values are computed once per tick (above) and shared across all drivers — O(n).
+  // Dynamic lead: estimatedDrift = effectiveGrowthRate × (poll_staleness + bot_exec_time) / poll_interval
+  // The +1 term accounts for poll staleness: the snapshot we're reading may already be up to
+  // one full poll interval (90 s) old before the bot even starts. Adding 1.0 to the fraction
+  // means we project drift across both the staleness window AND the bot execution window.
+  //   botTimeFraction = (45 000 / 90 000) + 1.0 = 1.5  →  1.5 poll-intervals of growth covered
+  // The hard floor of 20 ensures the bot fires early enough on calm days even when growth ≈ 0,
+  // preventing systematic undershoots like 115→187 seen on surge mornings.
   if (isWithinPositionHours()) {
   const todayDayStr = new Date().toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/Los_Angeles' });
   const DAY_KEY_MAP = { Sun: '0', Mon: '1', Tue: '2', Wed: '3', Thu: '4', Fri: '5', Sat: '6' };
   const todayDayKey = DAY_KEY_MAP[todayDayStr];
 
-  const botTimeFraction  = POS_BOT_EXEC_MS / POLL_INTERVAL_MS;
-  const estimatedDrift   = Math.max(POS_LEAD_BUFFER, Math.ceil(effectiveGrowthRate * botTimeFraction));
+  const botTimeFraction  = (POS_BOT_EXEC_MS / POLL_INTERVAL_MS) + 1; // +1 covers poll-staleness window
+  const estimatedDrift   = Math.max(20, Math.ceil(effectiveGrowthRate * botTimeFraction));
 
   for (const [driverId, state] of watches) {
     // Resolve today's effective position — skips drivers with no target today

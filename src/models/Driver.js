@@ -8,6 +8,8 @@ const PUBLIC_FIELDS = [
   'vehicle_number', 'scheduled_time', 'scheduled_days', 'day_schedules',
   'scheduled_position', 'day_positions',
   'is_active', 'monitor_enabled', 'notes', 'created_at', 'email_verified_at',
+  // Subscription
+  'stripe_customer_id', 'stripe_subscription_id', 'subscription_status', 'trial_ends_at',
 ];
 
 class Driver {
@@ -126,6 +128,11 @@ class Driver {
       })
       .count('* as count')
       .first();
+  }
+
+  /** Find a driver by their Stripe customer ID */
+  static findByStripeCustomerId(stripeCustomerId) {
+    return db(TABLE).select(PUBLIC_FIELDS).where({ stripe_customer_id: stripeCustomerId }).first();
   }
 
   /** Find a driver by their email verification token (includes token columns) */

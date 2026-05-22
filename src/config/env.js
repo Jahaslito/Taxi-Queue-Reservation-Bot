@@ -15,6 +15,13 @@ if (process.env.NODE_ENV === 'production' && !process.env.RESEND_API_KEY) {
   console.warn('[env] WARNING: RESEND_API_KEY is not set — emails will not be sent in production');
 }
 
+// Warn when Stripe vars are absent in production
+if (process.env.NODE_ENV === 'production') {
+  if (!process.env.STRIPE_SECRET_KEY)    console.warn('[env] WARNING: STRIPE_SECRET_KEY is not set — billing will not work');
+  if (!process.env.STRIPE_WEBHOOK_SECRET) console.warn('[env] WARNING: STRIPE_WEBHOOK_SECRET is not set — webhooks will be rejected');
+  if (!process.env.STRIPE_PRICE_ID)      console.warn('[env] WARNING: STRIPE_PRICE_ID is not set — checkout will fail');
+}
+
 module.exports = {
   port:           parseInt(process.env.PORT, 10) || 3000,
   nodeEnv:        process.env.NODE_ENV || 'development',
@@ -28,4 +35,8 @@ module.exports = {
   resendApiKey:   process.env.RESEND_API_KEY  || null,
   emailFrom:      process.env.EMAIL_FROM       || 'SAN Queue <noreply@sanqueue.com>',
   appUrl:         process.env.APP_URL          || 'http://localhost:3000',
+  // Stripe (required in production)
+  stripeSecretKey:     process.env.STRIPE_SECRET_KEY     || null,
+  stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || null,
+  stripePriceId:       process.env.STRIPE_PRICE_ID       || null,
 };

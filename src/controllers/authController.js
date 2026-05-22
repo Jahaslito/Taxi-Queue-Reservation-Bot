@@ -4,8 +4,9 @@ const Driver            = require('../models/Driver');
 const Admin             = require('../models/Admin');
 const { encrypt }       = require('../services/cryptoService');
 const { generateToken } = require('../middleware/auth');
-const { nodeEnv }       = require('../config/env');
+const { nodeEnv, appUrl: APP_URL_ENV } = require('../config/env');
 const { sendVerificationEmail, sendPasswordResetEmail, APP_URL } = require('../services/emailService');
+const stripeService     = require('../services/stripeService');
 
 // ─── Token helpers ────────────────────────────────────────────────────────────
 function makeToken()  { return crypto.randomBytes(32).toString('hex'); }
@@ -200,7 +201,7 @@ async function verifyEmail(req, res) {
 // ─── Resend verification email (requires driver to be logged in) ──────────────
 async function resendVerification(req, res, next) {
   try {
-    const driver = await Driver.findById(req.user.id);
+    const driver = await Driver.findById(req.driverId);
 
     if (!driver.email) {
       const err = new Error('No email address on your account.');
@@ -226,6 +227,63 @@ async function resendVerification(req, res, next) {
   }
 }
 
+// ─── Create Stripe Checkout Session ──────────────────────────────────────────
+// Returns { url } — the frontend redirects the driver to Stripe's hosted page.
+async function createCheckoutSession(req, res, next) {
+  try {
+    const driver = await Driver.findByIdWithCredentials(req.driverId);
+    if (!driver) {
+      const err = new Error('Driver not found');
+      err.statusCode = 404;
+      throw err;
+    }
+    if (!driver.email_verified_at) {
+      const err = new Error('Please verify your email address before setting up billing.');
+      err.statusCode = 403;
+      throw err;
+    }
+
+    // Reuse existing Stripe customer or create a new one
+    let customerId = driver.stripe_customer_id;
+    if (!customerId) {
+      const customer = await stripeService.createCustomer(driver);
+      customerId = customer.id;
+      await Driver.update(driver.id, { stripe_customer_id: customerId });
+    }
+
+    const session = await stripeService.createCheckoutSession({
+      customerId,
+      driverId: driver.id,
+    });
+
+    res.json({ url: session.url });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ─── Open Stripe Billing Portal ───────────────────────────────────────────────
+// Returns { url } — the frontend redirects to Stripe's hosted portal.
+async function billingPortal(req, res, next) {
+  try {
+    const driver = await Driver.findById(req.driverId);
+    if (!driver?.stripe_customer_id) {
+      const err = new Error('No billing account found. Please start a subscription first.');
+      err.statusCode = 400;
+      throw err;
+    }
+
+    const session = await stripeService.createPortalSession(
+      driver.stripe_customer_id,
+      `${APP_URL_ENV}/`,
+    );
+
+    res.json({ url: session.url });
+  } catch (err) {
+    next(err);
+  }
+}
+
 function logout(req, res) {
   res.clearCookie('token', { httpOnly: true, sameSite: 'strict', secure: nodeEnv === 'production' });
   res.json({ ok: true });
@@ -240,4 +298,6 @@ module.exports = {
   resetDriverPassword,
   verifyEmail,
   resendVerification,
+  createCheckoutSession,
+  billingPortal,
 };

@@ -51,19 +51,23 @@ async function createDriver(overrides = {}) {
   const email         = overrides.email          || `driver_${uid()}@test.com`;
 
   const defaults = {
-    name:           'Test Driver',
+    name:                'Test Driver',
     email,
-    app_password:   await bcrypt.hash(plainPassword, 10),
-    san_username:   'test_san_user',
-    san_password:   encrypt('test_san_password'),
-    vehicle_number: vehicleNumber,
-    scheduled_time: '05:00',
-    scheduled_days: '0,1,2,3,4,5,6',
-    day_schedules:  JSON.stringify({
+    app_password:        await bcrypt.hash(plainPassword, 10),
+    san_username:        'test_san_user',
+    san_password:        encrypt('test_san_password'),
+    vehicle_number:      vehicleNumber,
+    scheduled_time:      '05:00',
+    scheduled_days:      '0,1,2,3,4,5,6',
+    day_schedules:       JSON.stringify({
       '0': '05:00', '1': '05:00', '2': '05:00',
       '3': '05:00', '4': '05:00', '5': '05:00', '6': '05:00',
     }),
-    is_active:      true,
+    is_active:           true,
+    // Mark test drivers as grandfathered so requireSubscription middleware
+    // doesn't block them — mirrors what the migration does for real drivers
+    email_verified_at:   new Date(),
+    subscription_status: 'active',
   };
 
   // Strip helper keys that are not real columns before inserting

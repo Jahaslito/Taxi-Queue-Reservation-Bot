@@ -13,6 +13,8 @@ const {
   resetDriverPassword,
   verifyEmail,
   resendVerification,
+  createCheckoutSession,
+  billingPortal,
 } = require('../controllers/authController');
 
 const router = Router();
@@ -32,7 +34,8 @@ router.post(
       .optional({ checkFalsy: true })
       .matches(/^[0-6](,[0-6]){0,6}$/)
       .withMessage('scheduledDays must be comma-separated day numbers 0–6'),
-    body('email').optional({ checkFalsy: true }).isEmail().withMessage('Invalid email format'),
+    // Email is required for billing — Stripe needs a valid address
+    body('email').isEmail().withMessage('A valid email address is required'),
   ],
   validate,
   registerDriver,
@@ -90,6 +93,13 @@ router.post(
   validate,
   resetDriverPassword,
 );
+
+// ─── Stripe Billing ───────────────────────────────────────────────────────────
+// Create a Checkout Session → returns { url } for the frontend to redirect to
+router.post('/driver/create-checkout', authenticateDriver, createCheckoutSession);
+
+// Open the Stripe Customer Portal → returns { url } for managing billing
+router.post('/driver/billing-portal', authenticateDriver, billingPortal);
 
 // ─── Logout ───────────────────────────────────────────────────────────────────
 router.post('/logout', logout);

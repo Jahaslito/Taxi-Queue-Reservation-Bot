@@ -1,0 +1,156 @@
+// ─── Billing Controller ────────────────────────────────────────────────────────
+// Handles the Stripe billing setup / management flows:
+//   • view-billing  — shown when subscription is not active
+//   • view-verify-email — shown when email is not verified
+//   • Account → Subscription card
+//
+// Depends on: utils.js (api, showToast), app.js (showView, doLogout, driverProfile)
+
+// ─── Status helpers ───────────────────────────────────────────────────────────
+const STATUS_LABELS = {
+  trialing:   { label: 'Free Trial',      bg: 'rgba(0,194,212,0.15)',  color: '#00c2d4' },
+  active:     { label: 'Active',          bg: 'rgba(39,192,131,0.15)', color: '#27c083' },
+  past_due:   { label: 'Payment Due',     bg: 'rgba(240,90,91,0.15)',  color: '#f05a5b' },
+  canceled:   { label: 'Canceled',        bg: 'rgba(122,138,181,0.2)', color: '#7a8ab5' },
+  unpaid:     { label: 'Unpaid',          bg: 'rgba(240,90,91,0.15)',  color: '#f05a5b' },
+  incomplete: { label: 'Incomplete',      bg: 'rgba(245,166,35,0.15)', color: '#f5a623' },
+};
+
+function renderSubscriptionBadge(status) {
+  const badge = document.getElementById('acct-sub-status-badge');
+  if (!badge) return;
+  const cfg = STATUS_LABELS[status] || { label: status || 'Unknown', bg: 'rgba(122,138,181,0.2)', color: '#7a8ab5' };
+  badge.textContent = cfg.label;
+  badge.style.background = cfg.bg;
+  badge.style.color       = cfg.color;
+}
+
+function renderTrialInfo(profile) {
+  const el = document.getElementById('acct-sub-trial-info');
+  if (!el) return;
+  if (profile.subscription_status === 'trialing' && profile.trial_ends_at) {
+    const end  = new Date(profile.trial_ends_at);
+    const days = Math.max(0, Math.ceil((end - Date.now()) / 86400000));
+    el.textContent = `Trial ends in ${days} day${days !== 1 ? 's' : ''} (${end.toLocaleDateString()})`;
+    el.style.display = 'block';
+  } else {
+    el.style.display = 'none';
+  }
+}
+
+// ─── Billing button in Account tab ───────────────────────────────────────────
+document.getElementById('btn-acct-billing').addEventListener('click', async function () {
+  this.disabled = true;
+  this.textContent = '…';
+  try {
+    const data = await api('/api/auth/driver/billing-portal', { method: 'POST' });
+    window.location.href = data.url;
+  } catch (err) {
+    showToast(err.message || 'Could not open billing portal', 'error');
+    this.disabled  = false;
+    this.textContent = 'Manage Billing';
+  }
+});
+
+// Called from app.js when driverProfile loads
+window.renderAccountSubscription = function (profile) {
+  if (!profile) return;
+  renderSubscriptionBadge(profile.subscription_status);
+  renderTrialInfo(profile);
+};
+
+// ─── view-billing helpers ─────────────────────────────────────────────────────
+
+/**
+ * Configure the billing view for the current driver's subscription_status.
+ * Must be called just before showView('view-billing').
+ */
+window.prepareBillingView = function (profile) {
+  const title    = document.getElementById('billing-view-title');
+  const subtitle = document.getElementById('billing-view-subtitle');
+  const btnStart = document.getElementById('btn-start-billing');
+  const btnP     = document.getElementById('billing-view-subtitle').parentElement;
+  const manageSection = document.getElementById('billing-manage-section');
+
+  const errEl = document.getElementById('billing-error');
+  errEl.style.display = 'none';
+  errEl.textContent   = '';
+
+  const status = profile?.subscription_status;
+
+  if (status === 'past_due') {
+    title.textContent    = 'Payment Required';
+    subtitle.textContent = 'Your last payment failed. Update your card to restore access.';
+    btnStart.style.display   = 'none';
+    manageSection.style.display = 'block';
+    document.querySelector('#billing-view-subtitle + p')?.style && (document.querySelector('#billing-view-subtitle + p').style.display = 'none');
+  } else if (status === 'canceled' || status === 'unpaid') {
+    title.textContent    = 'Subscription Ended';
+    subtitle.textContent = 'Your subscription has ended. Resubscribe to continue using SAN Queue.';
+    btnStart.textContent = 'Resubscribe →';
+    btnStart.style.display   = '';
+    manageSection.style.display = 'none';
+  } else {
+    title.textContent    = 'Start Your Free Trial';
+    subtitle.textContent = '14 days free — then just $16 / month';
+    btnStart.textContent = 'Start Free Trial →';
+    btnStart.style.display   = '';
+    manageSection.style.display = 'none';
+  }
+};
+
+// ─── Start billing / checkout ─────────────────────────────────────────────────
+document.getElementById('btn-start-billing').addEventListener('click', async function () {
+  const errEl = document.getElementById('billing-error');
+  errEl.style.display = 'none';
+  this.disabled = true;
+  this.innerHTML = '<span class="spinner"></span> Connecting to Stripe…';
+
+  try {
+    const data = await api('/api/auth/driver/create-checkout', { method: 'POST' });
+    window.location.href = data.url;
+  } catch (err) {
+    errEl.textContent   = err.message || 'Could not start checkout. Please try again.';
+    errEl.style.display = 'block';
+    this.disabled       = false;
+    this.textContent    = 'Start Free Trial →';
+  }
+});
+
+// ─── Manage billing (past_due) ────────────────────────────────────────────────
+document.getElementById('btn-manage-billing').addEventListener('click', async function () {
+  this.disabled = true;
+  this.innerHTML = '<span class="spinner"></span> Opening portal…';
+  try {
+    const data = await api('/api/auth/driver/billing-portal', { method: 'POST' });
+    window.location.href = data.url;
+  } catch (err) {
+    showToast(err.message || 'Could not open billing portal', 'error');
+    this.disabled  = false;
+    this.textContent = 'Update Payment Method';
+  }
+});
+
+// ─── view-verify-email helpers ────────────────────────────────────────────────
+window.prepareVerifyEmailView = function (profile) {
+  const addrEl = document.getElementById('verify-email-addr');
+  if (addrEl) addrEl.textContent = profile?.email || 'your email address';
+};
+
+document.getElementById('btn-resend-verify-email').addEventListener('click', async function () {
+  this.disabled    = true;
+  this.textContent = 'Sending…';
+  try {
+    await api('/api/auth/driver/resend-verification', { method: 'POST' });
+    showToast('Verification email sent — check your inbox!', 'success');
+    this.textContent = '✓ Sent';
+    setTimeout(() => {
+      this.disabled    = false;
+      this.textContent = 'Resend verification email';
+    }, 5000);
+  } catch (err) {
+    showToast(err.message, 'error');
+    this.disabled    = false;
+    this.textContent = 'Resend verification email';
+  }
+});

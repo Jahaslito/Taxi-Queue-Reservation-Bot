@@ -6,6 +6,7 @@ const Log                     = require('../models/Log');
 const PositionClaim           = require('../models/PositionClaim');
 const { encrypt }             = require('../services/cryptoService');
 const { runBotForDriver }     = require('../services/schedulerService');
+const { sendVerificationEmail } = require('../services/emailService');
 
 async function getStats(req, res, next) {
   try {
@@ -171,6 +172,19 @@ async function addDriver(req, res, next) {
       day_schedules:  daySchedulesJson,
       notes:          notes  || null,
     });
+
+    // Send verification email if driver has an email address
+    if (email) {
+      const verificationToken   = crypto.randomBytes(32).toString('hex');
+      const verificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      await Driver.update(driver.id, {
+        email_verification_token:      verificationToken,
+        email_verification_expires_at: verificationExpires,
+      });
+      sendVerificationEmail({ ...driver, email }, verificationToken).catch((err) =>
+        console.error('[Email] Failed to send admin-created driver verification email:', err.message),
+      );
+    }
 
     // Return tempPassword once so the admin can hand it to the driver — never stored in plain text
     res.status(201).json({ ...driver, tempPassword });

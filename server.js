@@ -40,6 +40,12 @@ app.use(cors({
   credentials: true,
 }));
 
+// ─── Stripe webhook — MUST be before express.json() ──────────────────────────
+// Stripe signature verification requires the raw request body. express.json()
+// replaces req.body with a parsed object, so the webhook route must be mounted
+// first with its own express.raw() parser.
+app.use('/api/webhook/stripe', require('./src/routes/webhook'));
+
 // ─── Body parsing + static files ──────────────────────────────────────────────
 app.use(express.json());
 app.use(cookieParser());

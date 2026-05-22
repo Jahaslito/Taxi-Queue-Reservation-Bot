@@ -1,9 +1,10 @@
 const { Router } = require('express');
 const { body }   = require('express-validator');
 
-const { authenticateDriver }                            = require('../middleware/auth');
-const { apiLimiter }                                    = require('../middleware/rateLimiter');
-const validate                                          = require('../middleware/validate');
+const { authenticateDriver }    = require('../middleware/auth');
+const { apiLimiter }            = require('../middleware/rateLimiter');
+const requireSubscription       = require('../middleware/requireSubscription');
+const validate                  = require('../middleware/validate');
 const { getProfile, updateProfile, getLogs, getTodayStatus, triggerSelf } = require('../controllers/driverController');
 
 const router = Router();
@@ -11,7 +12,12 @@ const router = Router();
 router.use(apiLimiter);
 router.use(authenticateDriver);
 
+// Profile is intentionally NOT behind requireSubscription — the frontend needs
+// it on boot to determine which state screen to show (verify email / billing).
 router.get('/profile', getProfile);
+
+// All other driver endpoints require a verified email + active subscription.
+router.use(requireSubscription);
 
 router.put(
   '/profile',

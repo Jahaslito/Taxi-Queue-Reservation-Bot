@@ -470,8 +470,8 @@
       <input type="tel" id="reg-phone" placeholder="+1 619 555 0123" />
     </div>
     <div class="form-group">
-      <label>Email (optional)</label>
-      <input type="email" id="reg-email" placeholder="john@example.com" />
+      <label>Email <span style="color:var(--red);font-size:11px;">Required for billing</span></label>
+      <input type="email" id="reg-email" placeholder="john@example.com" required />
     </div>
     <div class="form-group">
       <label>App Password</label>
@@ -531,6 +531,115 @@
     <div class="error-msg" id="reg-error"></div>
     <button class="btn btn-primary" id="btn-register">Create Account</button>
     <button class="btn btn-ghost mt-4" id="btn-back-login">← Back to Login</button>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════ VERIFY EMAIL VIEW ════ -->
+<div class="view" id="view-verify-email">
+  <header class="app-header">
+    <div class="logo">
+      <div class="logo-dot"></div>
+      <div class="logo-text">SAN <span>Queue</span></div>
+    </div>
+  </header>
+
+  <div style="padding:60px 0 32px;text-align:center;">
+    <div style="font-size:56px;margin-bottom:20px;">📧</div>
+    <h2 style="font-family:'Syne',sans-serif;font-size:24px;font-weight:800;margin-bottom:12px;">Check your inbox</h2>
+    <p style="color:var(--muted);font-size:15px;line-height:1.6;max-width:300px;margin:0 auto;">
+      We sent a verification link to<br />
+      <strong id="verify-email-addr" style="color:var(--white);">your email</strong>
+    </p>
+  </div>
+
+  <div style="background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:16px;padding:20px;margin-bottom:20px;">
+    <div style="font-size:13px;color:var(--muted);line-height:1.7;">
+      ✅ Click the link in the email to verify your address<br />
+      💳 After verifying, you'll set up your billing<br />
+      🚀 Then you're all set — the bot will run on schedule
+    </div>
+  </div>
+
+  <button class="btn btn-ghost" id="btn-resend-verify-email" style="margin-bottom:12px;">Resend verification email</button>
+  <button class="btn btn-ghost" onclick="doLogout()" style="opacity:0.6;">Log out</button>
+</div>
+
+<!-- ══════════════════════════════════════════════ BILLING VIEW ════ -->
+<div class="view" id="view-billing">
+  <header class="app-header">
+    <div class="logo">
+      <div class="logo-dot"></div>
+      <div class="logo-text">SAN <span>Queue</span></div>
+    </div>
+  </header>
+
+  <!-- Hero -->
+  <div style="padding:36px 0 28px;text-align:center;">
+    <img src="/icons/logo.png" alt="SAN Queue" style="width:88px;height:88px;border-radius:22px;object-fit:contain;box-shadow:0 16px 40px rgba(0,194,212,0.25);margin-bottom:24px;display:block;margin-left:auto;margin-right:auto;" />
+    <h1 id="billing-view-title" style="font-family:'Syne',sans-serif;font-size:30px;font-weight:800;line-height:1.2;margin-bottom:12px;letter-spacing:-0.02em;">Start Your Free Trial</h1>
+    <p id="billing-view-subtitle" style="font-size:17px;color:var(--muted);line-height:1.6;">14 days free — then just <strong style="color:var(--white);">$16 / month</strong></p>
+  </div>
+
+  <!-- Pricing pill -->
+  <div style="text-align:center;margin-bottom:28px;">
+    <div style="display:inline-flex;align-items:baseline;gap:4px;background:rgba(0,194,212,0.1);border:1px solid rgba(0,194,212,0.25);border-radius:40px;padding:10px 24px;">
+      <span style="font-family:'Syne',sans-serif;font-size:32px;font-weight:800;color:var(--white);">$16</span>
+      <span style="font-size:15px;color:var(--muted);">/ month after trial</span>
+    </div>
+  </div>
+
+  <!-- Feature list -->
+  <div style="background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:18px;padding:22px 20px;margin-bottom:24px;">
+    <div style="display:flex;flex-direction:column;gap:14px;">
+      <div style="display:flex;align-items:center;gap:14px;">
+        <div style="width:36px;height:36px;border-radius:10px;background:rgba(0,194,212,0.15);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:17px;">⚡</div>
+        <div>
+          <div style="font-size:15px;font-weight:600;color:var(--white);">Automated daily check-in</div>
+          <div style="font-size:13px;color:var(--muted);margin-top:2px;">The bot adds you to the SAN queue at your scheduled time</div>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:14px;">
+        <div style="width:36px;height:36px;border-radius:10px;background:rgba(0,194,212,0.15);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:17px;">📍</div>
+        <div>
+          <div style="font-size:15px;font-weight:600;color:var(--white);">Position claiming</div>
+          <div style="font-size:13px;color:var(--muted);margin-top:2px;">Lock your target queue position — no one else can take it</div>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:14px;">
+        <div style="width:36px;height:36px;border-radius:10px;background:rgba(0,194,212,0.15);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:17px;">📋</div>
+        <div>
+          <div style="font-size:15px;font-weight:600;color:var(--white);">Full run history</div>
+          <div style="font-size:13px;color:var(--muted);margin-top:2px;">Track every queue entry with status and position logs</div>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:14px;">
+        <div style="width:36px;height:36px;border-radius:10px;background:rgba(0,194,212,0.15);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:17px;">🔐</div>
+        <div>
+          <div style="font-size:15px;font-weight:600;color:var(--white);">Secure credential storage</div>
+          <div style="font-size:13px;color:var(--muted);margin-top:2px;">Your SAN login is encrypted and never exposed</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="billing-error" style="display:none;margin-bottom:16px;padding:12px 16px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.4);border-radius:10px;color:#f87171;font-size:14px;font-weight:600;"></div>
+
+  <!-- CTA -->
+  <button class="btn btn-primary" id="btn-start-billing" style="margin-bottom:10px;background:linear-gradient(135deg,#00b4ff,#7c6dff);border:none;font-size:17px;font-weight:700;padding:18px;border-radius:16px;">
+    Start Free Trial →
+  </button>
+  <p style="text-align:center;font-size:13px;color:var(--muted);margin-bottom:24px;">
+    Card required — you won't be charged until day 15. Cancel any time.
+  </p>
+  <button class="btn btn-ghost" onclick="doLogout()" style="opacity:0.5;font-size:14px;">Log out</button>
+
+  <!-- Shown for past_due / canceled drivers instead of the trial button -->
+  <div id="billing-manage-section" style="display:none;">
+    <button class="btn btn-primary" id="btn-manage-billing" style="margin-bottom:10px;background:linear-gradient(135deg,#f5a623,#e08a00);border:none;font-size:17px;font-weight:700;padding:18px;border-radius:16px;">
+      Update Payment Method
+    </button>
+    <p style="text-align:center;font-size:13px;color:var(--muted);margin-bottom:24px;">Update your card to restore full access.</p>
+    <button class="btn btn-ghost" onclick="doLogout()" style="opacity:0.5;font-size:14px;">Log out</button>
   </div>
 </div>
 
@@ -704,7 +813,20 @@
 
   <div style="padding:28px 0 20px;">
     <h2 style="font-family:'Syne',sans-serif;font-size:24px;font-weight:800;">Account</h2>
-    <p style="color:var(--muted);font-size:14px;margin-top:6px;">Manage your login password</p>
+    <p style="color:var(--muted);font-size:14px;margin-top:6px;">Manage your subscription &amp; password</p>
+  </div>
+
+  <!-- Subscription card -->
+  <div class="status-card" style="margin-bottom:16px;">
+    <div class="card-label">Subscription</div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;flex-wrap:wrap;gap:10px;">
+      <div>
+        <div id="acct-sub-status-badge" style="display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;">—</div>
+        <div id="acct-sub-trial-info" style="display:none;font-size:12px;color:var(--muted);margin-top:6px;"></div>
+        <div style="font-size:13px;color:var(--muted);margin-top:6px;">$16 / month · 14-day free trial for new accounts</div>
+      </div>
+      <button class="btn btn-ghost" id="btn-acct-billing" style="font-size:13px;padding:8px 16px;">Manage Billing</button>
+    </div>
   </div>
 
   <div class="status-card">
@@ -782,6 +904,7 @@
 <script src="/js/driver/dashboard.controller.js"></script>
 <script src="/js/driver/schedule.controller.js"></script>
 <script src="/js/driver/history.controller.js"></script>
+<script src="/js/driver/billing.controller.js"></script>
 <script src="/js/driver/app.js"></script>
 <script>
   if ('serviceWorker' in navigator) {

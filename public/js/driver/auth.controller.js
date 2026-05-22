@@ -92,8 +92,7 @@ document.getElementById('btn-login').addEventListener('click', async () => {
   try {
     const body = { email: identifier, appPassword: password };
     const data = await api('/api/auth/driver/login', { method: 'POST', body: JSON.stringify(body) });
-    driverProfile = data.driver;
-    showView('view-dashboard');
+    routeDriver(data.driver);
   } catch (err) {
     errEl.textContent = err.message;
   } finally {
@@ -120,6 +119,9 @@ document.getElementById('btn-register').addEventListener('click', async () => {
   if (!name || !appPassword || !sanUsername || !sanPassword || !vehicleNumber || !scheduledTime) {
     errEl.textContent = 'Please fill in all required fields'; return;
   }
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    errEl.textContent = 'A valid email address is required'; return;
+  }
 
   const btn = document.getElementById('btn-register');
   btn.innerHTML = '<span class="spinner"></span> Creating account…'; btn.disabled = true;
@@ -129,9 +131,8 @@ document.getElementById('btn-register').addEventListener('click', async () => {
       method: 'POST',
       body: JSON.stringify({ name, phone, email, appPassword, sanUsername, sanPassword, vehicleNumber, scheduledTime, scheduledDays }),
     });
-    driverProfile = data.driver;
     showToast('Account created! Welcome 🎉');
-    showView('view-dashboard');
+    routeDriver(data.driver);
   } catch (err) {
     errEl.textContent = err.message;
   } finally {

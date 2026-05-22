@@ -234,10 +234,42 @@ document.getElementById('btn-admin-pos-sched-cancel').addEventListener('click', 
   document.getElementById('admin-pos-schedule-modal').classList.remove('open');
 });
 
-document.getElementById('btn-admin-pos-sched-confirm').addEventListener('click', () => {
-  adminCurrentDayPositions = readAdminDayPositionRows();
-  renderAdminPosSummary(adminCurrentDayPositions);
-  document.getElementById('admin-pos-schedule-modal').classList.remove('open');
+document.getElementById('btn-admin-pos-sched-confirm').addEventListener('click', async () => {
+  const errEl = document.getElementById('admin-pos-sched-error');
+  errEl.style.display = 'none';
+  errEl.textContent   = '';
+
+  const dayPositions = readAdminDayPositionRows();
+  const dp           = JSON.parse(dayPositions);
+  const hasActive    = Object.values(dp).some(v => v !== null);
+
+  if (!hasActive) {
+    errEl.textContent   = 'Enable at least one day before applying.';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  const btn = document.getElementById('btn-admin-pos-sched-confirm');
+  btn.disabled  = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+
+  try {
+    const driverId = Number(document.getElementById('modal-driver-id').value) || 0;
+    await api('/api/admin/positions/check', {
+      method: 'POST',
+      body:   JSON.stringify({ dayPositions, driverId }),
+    });
+    // No conflict — store and close
+    adminCurrentDayPositions = dayPositions;
+    renderAdminPosSummary(adminCurrentDayPositions);
+    document.getElementById('admin-pos-schedule-modal').classList.remove('open');
+  } catch (err) {
+    errEl.textContent   = err.message;
+    errEl.style.display = 'block';
+  } finally {
+    btn.disabled  = false;
+    btn.innerHTML = 'Apply';
+  }
 });
 
 // ─── Schedule mode toggle ─────────────────────────────────────────────────────

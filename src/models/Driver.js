@@ -51,10 +51,10 @@ class Driver {
     return driver;
   }
 
-  static async update(id, data) {
-    const [driver] = await db(TABLE)
+  static async update(id, data, trx = db) {
+    const [driver] = await trx(TABLE)
       .where({ id })
-      .update({ ...data, updated_at: db.fn.now() })
+      .update({ ...data, updated_at: trx.fn.now() })
       .returning(PUBLIC_FIELDS);
     return driver;
   }

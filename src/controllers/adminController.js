@@ -1,7 +1,9 @@
 const bcrypt                  = require('bcryptjs');
 const crypto                  = require('crypto');
+const db                      = require('../config/database');
 const Driver                  = require('../models/Driver');
 const Log                     = require('../models/Log');
+const PositionClaim           = require('../models/PositionClaim');
 const { encrypt }             = require('../services/cryptoService');
 const { runBotForDriver }     = require('../services/schedulerService');
 
@@ -41,16 +43,12 @@ async function getStats(req, res, next) {
 
     for (const driver of allActiveDrivers) {
       // Position-scheduled — collect separately, never appear in time breakdown
-      if (driver.scheduled_position || driver.day_positions) {
+      if (driver.day_positions) {
         let targetPosition = null;
-        if (driver.day_positions) {
-          try {
-            const dp = JSON.parse(driver.day_positions);
-            targetPosition = dp[todayDay] ?? null;
-          } catch {}
-        } else {
-          targetPosition = driver.scheduled_position;
-        }
+        try {
+          const dp = JSON.parse(driver.day_positions);
+          targetPosition = dp[todayDay] ?? null;
+        } catch {}
         if (targetPosition !== null) {
           positionDrivers.push({
             name:            driver.name,
@@ -226,7 +224,7 @@ async function updateDriver(req, res, next) {
       }
     }
 
-    const updated = await Driver.update(req.params.id, {
+    const updateData = {
       name:               name           ?? driver.name,
       phone:              phone          ?? driver.phone,
       email:              email          ?? driver.email,
@@ -237,11 +235,43 @@ async function updateDriver(req, res, next) {
       scheduled_time:     derivedScheduledTime,
       scheduled_days:     derivedScheduledDays,
       day_schedules:      derivedDaySchedules,
-      scheduled_position: derivedScheduledPosition,
+      scheduled_position: null,           // retired — all positions live in day_positions
       day_positions:      derivedDayPositions,
       is_active:          isActive       !== undefined ? isActive : driver.is_active,
       notes:              notes          ?? driver.notes,
-    });
+    };
+
+    const isScheduleUpdate = dayPositions  !== undefined || scheduledPosition !== undefined
+                          || daySchedules  !== undefined || scheduledTime     !== undefined
+                          || scheduledDays !== undefined;
+
+    // When deactivating, release the driver's position claims so those slots
+    // become available to other drivers immediately.
+    const isDeactivating = isActive === false && driver.is_active === true;
+
+    let updated;
+    try {
+      updated = await db.transaction(async (trx) => {
+        const result = await Driver.update(req.params.id, updateData, trx);
+
+        if (isDeactivating) {
+          await PositionClaim.clearForDriver(req.params.id, trx);
+        } else if (isScheduleUpdate) {
+          const parsedDp = derivedDayPositions
+            ? JSON.parse(derivedDayPositions)
+            : {};
+          await PositionClaim.setForDriver(req.params.id, parsedDp, trx);
+        }
+
+        return result;
+      });
+    } catch (err) {
+      if (err.code === '23505') {
+        err.statusCode = 409;
+        throw err;
+      }
+      throw err;
+    }
 
     res.json(updated);
   } catch (err) {
@@ -259,6 +289,8 @@ async function deactivateDriver(req, res, next) {
     }
 
     await Driver.deactivate(req.params.id);
+    // Release position slots so other drivers can claim them immediately
+    await PositionClaim.clearForDriver(req.params.id);
     res.json({ message: 'Driver deactivated' });
   } catch (err) {
     next(err);
@@ -282,6 +314,31 @@ async function triggerDriver(req, res, next) {
     // Run the bot and wait for the actual result (15–60 s)
     const result = await runBotForDriver(driver, 'manual');
     res.json({ result });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /api/admin/positions/check
+ * Checks whether a set of (day, position) slots conflict with any other driver.
+ * Used by the admin position modal Apply button for immediate inline feedback.
+ * Body: { dayPositions: '{"2":10,"3":200}', driverId: 3 }
+ */
+async function checkPositions(req, res, next) {
+  try {
+    const { dayPositions, driverId } = req.body;
+    let dp;
+    try { dp = JSON.parse(dayPositions); } catch {
+      const err = new Error('Invalid dayPositions JSON');
+      err.statusCode = 400;
+      throw err;
+    }
+    const conflict = await PositionClaim.checkConflicts(Number(driverId) || 0, dp);
+    if (conflict) {
+      return res.status(409).json({ error: conflict });
+    }
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }
@@ -318,5 +375,6 @@ module.exports = {
   updateDriver,
   deactivateDriver,
   triggerDriver,
+  checkPositions,
   getLogs,
 };

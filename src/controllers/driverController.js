@@ -1,7 +1,9 @@
-const bcrypt        = require('bcryptjs');
-const Driver        = require('../models/Driver');
-const Log           = require('../models/Log');
-const { encrypt }   = require('../services/cryptoService');
+const bcrypt            = require('bcryptjs');
+const db                = require('../config/database');
+const Driver            = require('../models/Driver');
+const Log               = require('../models/Log');
+const PositionClaim     = require('../models/PositionClaim');
+const { encrypt }       = require('../services/cryptoService');
 const { runBotForDriver } = require('../services/schedulerService');
 
 async function getProfile(req, res, next) {
@@ -77,19 +79,49 @@ async function updateProfile(req, res, next) {
       }
     }
 
-    const updated = await Driver.update(req.driverId, {
+    const updateData = {
       name:               name           || driver.name,
       phone:              phone          !== undefined ? phone : driver.phone,
       scheduled_time:     derivedScheduledTime,
       scheduled_days:     derivedScheduledDays,
       day_schedules:      derivedDaySchedules,
-      scheduled_position: derivedScheduledPosition,
+      scheduled_position: null,           // retired — all positions live in day_positions
       day_positions:      derivedDayPositions,
       san_username:       sanUsername    || driver.san_username,
       san_password:       sanPassword    ? encrypt(sanPassword)                  : driver.san_password,
       vehicle_number:     vehicleNumber  || driver.vehicle_number,
       app_password:       newAppPassword ? await bcrypt.hash(newAppPassword, 10) : driver.app_password,
-    });
+    };
+
+    // Sync position_claims whenever any schedule field is explicitly in the request.
+    // This covers: saving positions, switching to time-based (clears claims), and
+    // updating days/times (no-op for claims but keeps the guard simple).
+    const isScheduleUpdate = dayPositions  !== undefined || scheduledPosition !== undefined
+                          || daySchedules  !== undefined || scheduledTime     !== undefined
+                          || scheduledDays !== undefined;
+
+    let updated;
+    try {
+      updated = await db.transaction(async (trx) => {
+        const result = await Driver.update(req.driverId, updateData, trx);
+
+        if (isScheduleUpdate) {
+          const parsedDp = derivedDayPositions
+            ? JSON.parse(derivedDayPositions)
+            : {};
+          await PositionClaim.setForDriver(req.driverId, parsedDp, trx);
+        }
+
+        return result;
+      });
+    } catch (err) {
+      if (err.code === '23505') {
+        // setForDriver always formats 23505 messages before throwing — just tag status
+        err.statusCode = 409;
+        throw err;
+      }
+      throw err;
+    }
 
     res.json(updated);
   } catch (err) {

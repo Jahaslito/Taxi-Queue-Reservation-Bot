@@ -15,6 +15,16 @@ const idParam = param('id').isInt({ min: 1 }).withMessage('Driver ID must be a p
 
 router.get('/stats', adminController.getStats);
 
+router.post(
+  '/positions/check',
+  [
+    body('dayPositions').isString().notEmpty().withMessage('dayPositions is required'),
+    body('driverId').optional().isInt({ min: 0 }),
+  ],
+  validate,
+  adminController.checkPositions,
+);
+
 router.get(
   '/drivers',
   [query('search').optional().trim().isLength({ max: 100 })],

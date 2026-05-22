@@ -242,6 +242,98 @@ describe('GET /api/driver/status/today', () => {
   });
 });
 
+// ─── 32 — Position claim exclusivity ─────────────────────────────────────────
+
+describe('PUT /api/driver/profile — position claim exclusivity', () => {
+  test('driver can save a day_positions schedule when the slot is free', async () => {
+    const res = await request(app)
+      .put('/api/driver/profile')
+      .set('Cookie', dCookie)
+      .send({ dayPositions: JSON.stringify({ '5': 200 }) });
+
+    expect(res.status).toBe(200);
+    expect(res.body.day_positions).toBeTruthy();
+  });
+
+  test('second driver claiming the same (day, position) gets 409', async () => {
+    // Driver A claims Friday position 300
+    await request(app)
+      .put('/api/driver/profile')
+      .set('Cookie', dCookie)
+      .send({ dayPositions: JSON.stringify({ '5': 300 }) });
+
+    // Driver B tries to claim the same slot
+    const driverB = await createDriver();
+    const cookieB = driverCookie(driverB.id);
+    const res = await request(app)
+      .put('/api/driver/profile')
+      .set('Cookie', cookieB)
+      .send({ dayPositions: JSON.stringify({ '5': 300 }) });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/300/);
+    expect(res.body.error).toMatch(/Friday/i);
+  });
+
+  test('driver can re-save their own existing position without conflict', async () => {
+    // Save Friday 200
+    await request(app)
+      .put('/api/driver/profile')
+      .set('Cookie', dCookie)
+      .send({ dayPositions: JSON.stringify({ '5': 200 }) });
+
+    // Save Friday 200 again (same slot, same driver) — should succeed
+    const res = await request(app)
+      .put('/api/driver/profile')
+      .set('Cookie', dCookie)
+      .send({ dayPositions: JSON.stringify({ '5': 200 }) });
+
+    expect(res.status).toBe(200);
+  });
+
+  test('same position number on a different day does not conflict', async () => {
+    // Driver A: Friday 200
+    await request(app)
+      .put('/api/driver/profile')
+      .set('Cookie', dCookie)
+      .send({ dayPositions: JSON.stringify({ '5': 200 }) });
+
+    // Driver B: Saturday 200 — different day, should succeed
+    const driverB = await createDriver();
+    const cookieB = driverCookie(driverB.id);
+    const res = await request(app)
+      .put('/api/driver/profile')
+      .set('Cookie', cookieB)
+      .send({ dayPositions: JSON.stringify({ '6': 200 }) });
+
+    expect(res.status).toBe(200);
+  });
+
+  test('switching to time-based schedule releases position claims', async () => {
+    // Driver A claims Friday 400
+    await request(app)
+      .put('/api/driver/profile')
+      .set('Cookie', dCookie)
+      .send({ dayPositions: JSON.stringify({ '5': 400 }) });
+
+    // Driver A switches to time-based — releases the claim
+    await request(app)
+      .put('/api/driver/profile')
+      .set('Cookie', dCookie)
+      .send({ daySchedules: JSON.stringify({ '5': '06:00' }) });
+
+    // Driver B can now claim Friday 400
+    const driverB = await createDriver();
+    const cookieB = driverCookie(driverB.id);
+    const res = await request(app)
+      .put('/api/driver/profile')
+      .set('Cookie', cookieB)
+      .send({ dayPositions: JSON.stringify({ '5': 400 }) });
+
+    expect(res.status).toBe(200);
+  });
+});
+
 // ─── 31 — Trigger self ───────────────────────────────────────────────────
 
 describe('POST /api/driver/trigger', () => {

@@ -52,7 +52,7 @@ async function loadDrivers(page) {
     if (!data) return; // 401 already handled by api()
 
     if (!data.drivers.length) {
-      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted2);padding:32px;">No drivers found</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted2);padding:32px;">No drivers found</td></tr>';
       setDriversPagination(0);
       return;
     }
@@ -85,6 +85,7 @@ async function loadDrivers(page) {
             <div style="font-weight:600;">${esc(d.name)}</div>
             <div style="font-size:12px;color:var(--muted2);">${esc(d.san_username)}</div>
           </td>
+          <td style="font-size:13px;color:var(--muted2);">${d.email ? esc(d.email) : '—'}</td>
           <td><span class="mono">${esc(d.vehicle_number)}</span></td>
           <td>${schedCell}</td>
           <td><span style="font-size:12px;color:var(--muted2);">${esc(activeDaysLabel)}</span></td>
@@ -104,7 +105,7 @@ async function loadDrivers(page) {
 
     setDriversPagination(data.total);
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="7" style="color:var(--red);text-align:center;padding:24px;">${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" style="color:var(--red);text-align:center;padding:24px;">${err.message}</td></tr>`;
   }
 }
 

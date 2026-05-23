@@ -238,10 +238,13 @@ async function updateDriver(req, res, next) {
       }
     }
 
+    // Normalise email: treat empty string the same as "not provided"
+    const normalisedEmail = (email !== undefined) ? (email.trim() || null) : driver.email;
+
     const updateData = {
       name:               name           ?? driver.name,
       phone:              phone          ?? driver.phone,
-      email:              email          ?? driver.email,
+      email:              normalisedEmail,
       app_password:       appPassword    ? await bcrypt.hash(appPassword, 10) : driver.app_password,
       san_username:       sanUsername    ?? driver.san_username,
       san_password:       sanPassword    ? encrypt(sanPassword) : driver.san_password,
@@ -285,6 +288,22 @@ async function updateDriver(req, res, next) {
         throw err;
       }
       throw err;
+    }
+
+    // If the admin added or changed the driver's email, send a fresh verification
+    // email and clear the verified timestamp so the new address gets confirmed.
+    const emailChanged = normalisedEmail && normalisedEmail !== driver.email;
+    if (emailChanged) {
+      const verificationToken   = crypto.randomBytes(32).toString('hex');
+      const verificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      await db('drivers').where({ id: req.params.id }).update({
+        email_verification_token:      verificationToken,
+        email_verification_expires_at: verificationExpires,
+        email_verified_at:             null,
+      });
+      sendVerificationEmail({ ...updated, email: normalisedEmail }, verificationToken).catch((err) =>
+        console.error('[Email] Failed to send updated-email verification:', err.message),
+      );
     }
 
     res.json(updated);

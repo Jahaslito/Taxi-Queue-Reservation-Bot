@@ -100,6 +100,7 @@ class Driver {
           q.where((builder) => {
             builder
               .whereILike('d.name',           `%${search}%`)
+              .orWhereILike('d.email',          `%${search}%`)
               .orWhereILike('d.vehicle_number', `%${search}%`)
               .orWhereILike('d.san_username',   `%${search}%`);
           });
@@ -120,6 +121,7 @@ class Driver {
           q.where((builder) => {
             builder
               .whereILike('d.name',           `%${search}%`)
+              .orWhereILike('d.email',          `%${search}%`)
               .orWhereILike('d.vehicle_number', `%${search}%`)
               .orWhereILike('d.san_username',   `%${search}%`);
           });

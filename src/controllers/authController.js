@@ -31,6 +31,13 @@ async function registerDriver(req, res, next) {
       }
     }
 
+    const existingVehicle = await Driver.findByVehicleNumber(vehicleNumber);
+    if (existingVehicle) {
+      const err = new Error('Vehicle number already registered');
+      err.statusCode = 409;
+      throw err;
+    }
+
     // Build day_schedules JSON
     let daySchedulesJson;
     if (daySchedules) {

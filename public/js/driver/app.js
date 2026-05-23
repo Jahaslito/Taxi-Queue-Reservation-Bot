@@ -41,6 +41,13 @@ function showView(viewId) {
 function routeDriver(profile) {
   driverProfile = profile;
 
+  // When billing is disabled (BILLING_ENABLED=false on the server), skip all
+  // email-verification and subscription gates and go straight to the dashboard.
+  if (!window.__APP_CONFIG__.billingEnabled) {
+    showView('view-dashboard');
+    return;
+  }
+
   // 1. Email not verified → show verification screen
   if (!profile.email_verified_at) {
     if (window.prepareVerifyEmailView) window.prepareVerifyEmailView(profile);
@@ -84,7 +91,12 @@ document.getElementById('btn-resend-verification').addEventListener('click', asy
 // Try to load the profile using the existing session cookie.
 // Success → routeDriver() picks the right screen based on account state.
 // Failure (401 / network error) → show the login screen.
+window.__APP_CONFIG__ = { billingEnabled: true }; // safe default until fetched
 (async () => {
+  // Load server-side feature flags first so routeDriver() has them available
+  try {
+    window.__APP_CONFIG__ = await api('/api/config');
+  } catch { /* keep default */ }
   const params   = new URLSearchParams(window.location.search);
   const resetTok = params.get('reset');
   const verified = params.get('verified');

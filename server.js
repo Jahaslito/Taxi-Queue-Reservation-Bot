@@ -82,6 +82,13 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString(), version: '1.0.0' });
 });
 
+// ─── Public app config (safe to expose) ──────────────────────────────────────
+app.get('/api/config', (req, res) => {
+  res.json({
+    billingEnabled: process.env.BILLING_ENABLED !== 'false',
+  });
+});
+
 // ─── SPA fallbacks ────────────────────────────────────────────────────────────
 app.get('/admin*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'admin.html'));

@@ -84,6 +84,13 @@ router.post(
   adminController.triggerDriver,
 );
 
+router.post(
+  '/drivers/:id/send-reset',
+  [idParam],
+  validate,
+  adminController.sendDriverPasswordReset,
+);
+
 router.get(
   '/position-tracking',
   [

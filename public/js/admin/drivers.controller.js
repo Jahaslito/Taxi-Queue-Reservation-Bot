@@ -96,8 +96,9 @@ async function loadDrivers(page) {
           <td>${activeBadge}</td>
           <td>
             <div style="display:flex;gap:6px;">
-              <button class="btn btn-trigger btn-sm" data-action="trigger" data-id="${Number(d.id)}" data-name="${esc(d.name)}">▶ Run</button>
-              <button class="btn btn-ghost btn-sm"   data-action="edit"    data-id="${Number(d.id)}">Edit</button>
+              <button class="btn btn-trigger btn-sm" data-action="trigger"    data-id="${Number(d.id)}" data-name="${esc(d.name)}">▶ Run</button>
+              <button class="btn btn-ghost btn-sm"   data-action="edit"       data-id="${Number(d.id)}">Edit</button>
+              <button class="btn btn-ghost btn-sm"   data-action="send-reset" data-id="${Number(d.id)}" data-name="${esc(d.name)}" data-email="${esc(d.email || '')}" title="Send password reset email">🔑</button>
             </div>
           </td>
         </tr>`;
@@ -162,6 +163,29 @@ async function triggerDriver(id, name, btn) {
     btn.disabled = false;
     btn.innerHTML = originalHTML;
     btn.style.minWidth = '';
+  }
+}
+
+// ─── Send password reset link ─────────────────────────────────────────────────
+async function sendPasswordReset(id, name, email, btn) {
+  if (!email) {
+    showToast(`${esc(name)} has no email address — add one via Edit first.`, 'error', 5000);
+    return;
+  }
+  if (!await showConfirm(`Send a password reset link to ${esc(name)} (${esc(email)})?`)) return;
+
+  const originalHTML = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+
+  try {
+    const data = await api(`/api/admin/drivers/${id}/send-reset`, { method: 'POST' });
+    showToast(`✅ ${data.message}`, 'success', 5000);
+  } catch (err) {
+    showToast(err.message || 'Failed to send reset link', 'error');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalHTML;
   }
 }
 
@@ -429,8 +453,9 @@ document.getElementById('drivers-table-body').addEventListener('click', e => {
   const btn = e.target.closest('[data-action]');
   if (!btn) return;
   const id = Number(btn.dataset.id);
-  if (btn.dataset.action === 'edit')    openEditModal(id);
-  if (btn.dataset.action === 'trigger') triggerDriver(id, btn.dataset.name, btn);
+  if (btn.dataset.action === 'edit')       openEditModal(id);
+  if (btn.dataset.action === 'trigger')    triggerDriver(id, btn.dataset.name, btn);
+  if (btn.dataset.action === 'send-reset') sendPasswordReset(id, btn.dataset.name, btn.dataset.email, btn);
 });
 
 // Save driver (create or update)

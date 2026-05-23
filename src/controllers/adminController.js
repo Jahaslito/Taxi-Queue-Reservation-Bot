@@ -7,7 +7,7 @@ const PositionClaim           = require('../models/PositionClaim');
 const PositionTracking        = require('../models/PositionTracking');
 const { encrypt }             = require('../services/cryptoService');
 const { runBotForDriver }     = require('../services/schedulerService');
-const { sendVerificationEmail } = require('../services/emailService');
+const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/emailService');
 
 async function getStats(req, res, next) {
   try {
@@ -415,6 +415,31 @@ async function getPositionTracking(req, res, next) {
   }
 }
 
+// ─── Send password reset link to a driver ────────────────────────────────────
+async function sendDriverPasswordReset(req, res, next) {
+  try {
+    const driver = await Driver.findById(req.params.id);
+    if (!driver) return res.status(404).json({ error: 'Driver not found' });
+    if (!driver.email) {
+      return res.status(400).json({ error: 'Driver has no email address — add one via Edit first.' });
+    }
+
+    const resetToken   = crypto.randomBytes(32).toString('hex');
+    const resetExpires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    await db('drivers').where({ id: driver.id }).update({
+      password_reset_token:      resetToken,
+      password_reset_expires_at: resetExpires,
+    });
+
+    await sendPasswordResetEmail(driver, resetToken);
+
+    res.json({ message: `Reset link sent to ${driver.email}` });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   getStats,
   listDrivers,
@@ -426,4 +451,5 @@ module.exports = {
   checkPositions,
   getLogs,
   getPositionTracking,
+  sendDriverPasswordReset,
 };

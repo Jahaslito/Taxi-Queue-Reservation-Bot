@@ -6,7 +6,7 @@ const TABLE = 'drivers';
 const PUBLIC_FIELDS = [
   'id', 'name', 'phone', 'email', 'san_username',
   'vehicle_number', 'scheduled_time', 'scheduled_days', 'day_schedules',
-  'scheduled_position', 'day_positions',
+  'scheduled_position', 'day_positions', 'max_acceptable_position',
   'is_active', 'monitor_enabled', 'notes', 'created_at', 'email_verified_at',
   // Subscription
   'stripe_customer_id', 'stripe_subscription_id', 'subscription_status', 'trial_ends_at',

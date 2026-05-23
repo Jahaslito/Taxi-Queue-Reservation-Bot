@@ -1,5 +1,8 @@
 require('dotenv').config();
 
+// ─── Daily log file rotation — must be initialised before anything else logs ──
+require('./src/utils/logger');
+
 // Validates all required env vars before anything else loads.
 // Server exits immediately with a clear message if any are missing.
 const env = require('./src/config/env');

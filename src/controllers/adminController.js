@@ -142,7 +142,7 @@ async function getDriver(req, res, next) {
 
 async function addDriver(req, res, next) {
   try {
-    const { name, phone, email, sanUsername, sanPassword, vehicleNumber, scheduledTime, scheduledDays, daySchedules, notes } = req.body;
+    const { name, phone, email, sanUsername, sanPassword, vehicleNumber, scheduledTime, scheduledDays, daySchedules, maxAcceptablePosition, notes } = req.body;
 
     // Build day_schedules JSON
     let daySchedulesJson;
@@ -171,6 +171,7 @@ async function addDriver(req, res, next) {
       scheduled_time: scheduledTime,
       scheduled_days: scheduledDays || '0,1,2,3,4,5,6',
       day_schedules:  daySchedulesJson,
+      max_acceptable_position: Number.isInteger(maxAcceptablePosition) ? maxAcceptablePosition : null,
       notes:          notes  || null,
     });
 
@@ -203,7 +204,7 @@ async function updateDriver(req, res, next) {
       throw err;
     }
 
-    const { name, phone, email, sanUsername, sanPassword, appPassword, vehicleNumber, scheduledTime, scheduledDays, daySchedules, scheduledPosition, dayPositions, isActive, notes } = req.body;
+    const { name, phone, email, sanUsername, sanPassword, appPassword, vehicleNumber, scheduledTime, scheduledDays, daySchedules, scheduledPosition, dayPositions, maxAcceptablePosition, isActive, notes } = req.body;
 
     // One-at-a-time: position-based and time-based scheduling are mutually exclusive.
     let derivedScheduledTime     = scheduledTime ?? driver.scheduled_time;
@@ -255,6 +256,10 @@ async function updateDriver(req, res, next) {
       day_schedules:      derivedDaySchedules,
       scheduled_position: null,           // retired — all positions live in day_positions
       day_positions:      derivedDayPositions,
+      // null = use default (target + 20); explicit integer = driver's preferred ceiling
+      max_acceptable_position: maxAcceptablePosition !== undefined
+        ? (Number.isInteger(maxAcceptablePosition) ? maxAcceptablePosition : null)
+        : driver.max_acceptable_position,
       is_active:          isActive       !== undefined ? isActive : driver.is_active,
       notes:              notes          ?? driver.notes,
     };
@@ -415,6 +420,47 @@ async function getPositionTracking(req, res, next) {
   }
 }
 
+/**
+ * GET /api/admin/reports/positions/:date?
+ *
+ * Returns the day's position-scheduler activity: one row per driver covering
+ * the full lifecycle (waiting / fired / completed / missed_impossible / etc.)
+ * plus aggregate stats — median error, counts by decision.
+ *
+ * :date defaults to today in Pacific Time (YYYY-MM-DD). Use 'yesterday' as a
+ * shortcut for the previous PT day.
+ */
+async function getDailyReport(req, res, next) {
+  try {
+    const todayPT = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+    let date = req.params.date || 'today';
+
+    if (date === 'today') {
+      date = todayPT;
+    } else if (date === 'yesterday') {
+      const y = new Date();
+      y.setDate(y.getDate() - 1);
+      date = y.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+    }
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      const err = new Error('Date must be YYYY-MM-DD, "today", or "yesterday"');
+      err.statusCode = 400;
+      throw err;
+    }
+
+    // Run both queries in parallel — independent
+    const [records, summary] = await Promise.all([
+      PositionTracking.byDate(date),
+      PositionTracking.dailySummary(date),
+    ]);
+
+    res.json({ date, summary, records });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // ─── Send password reset link to a driver ────────────────────────────────────
 async function sendDriverPasswordReset(req, res, next) {
   try {
@@ -451,5 +497,6 @@ module.exports = {
   checkPositions,
   getLogs,
   getPositionTracking,
+  getDailyReport,
   sendDriverPasswordReset,
 };

@@ -1,0 +1,29 @@
+=== Log file created 2026-05-23 08:57:36 PT ===
+[2026-05-23 08:57:36 PT] [INFO] [Monitor] Proxy enabled for polling → gate.decodo.com:7000
+[2026-05-23 08:57:36 PT] [INFO] [DB] Migrations up to date
+[2026-05-23 08:57:36 PT] [ERROR] [Fatal] Uncaught exception — restarting: listen EADDRINUSE: address already in use :::3000
+Error: listen EADDRINUSE: address already in use :::3000
+    at Server.setupListenHandle [as _listen2] (node:net:1940:16)
+    at listenInCluster (node:net:1997:12)
+    at Server.listen (node:net:2102:7)
+    at app.listen (/Users/jaffer/Desktop/Gigs/san-queue/node_modules/express/lib/application.js:635:24)
+    at bootstrap (/Users/jaffer/Desktop/Gigs/san-queue/server.js:125:28)
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+
+=== Session resumed 2026-05-23 08:57:54 PT (server restart) ===
+[2026-05-23 08:57:54 PT] [INFO] [Monitor] Proxy enabled for polling → gate.decodo.com:7000
+[2026-05-23 08:57:54 PT] [INFO] [Monitor] Watching #200 (id=10, auto=true, hasBeenSeen=false)
+[2026-05-23 08:57:54 PT] [INFO] [Monitor] Watching #4007 (id=8, auto=true, hasBeenSeen=true)
+[2026-05-23 08:57:54 PT] [INFO] [Monitor] Restored manual pin for #4007
+[2026-05-23 08:57:54 PT] [INFO] [Monitor] Auto-watched 2 active driver(s)
+[2026-05-23 08:57:54 PT] [INFO] [Monitor] Started — poll cadence 5s idle / 10s near fire / 5s at fire, auto-refresh every 300s, bot concurrency: 3, watching 2 driver(s)
+[2026-05-23 08:57:57 PT] [INFO] [Monitor] #4007 pos → #263 (in_queue)
+[2026-05-23 08:58:06 PT] [INFO] 
+--- State snapshot ---
+
+=== Session resumed 2026-05-23 12:52:49 PT (server restart) ===
+[2026-05-23 12:52:49 PT] [INFO] GET /_test/report → 200 | date=2026-05-23 records=0 total=0
+[2026-05-23 12:52:49 PT] [INFO] GET /_test/report/today → 200 | date=2026-05-23 records=0 total=0
+[2026-05-23 12:52:49 PT] [INFO] GET /_test/report/yesterday → 200 | date=2026-05-22 records=0 total=0
+[2026-05-23 12:52:49 PT] [INFO] GET /_test/report/2099-01-15 → 200 | date=2099-01-15 records=0 total=0
+=== Process exiting 2026-05-23 12:52:49 PT ===

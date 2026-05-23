@@ -44,7 +44,12 @@ const Log                 = require('../models/Log');
 const PositionTracking    = require('../models/PositionTracking');
 
 // ─── Constants (overridable via env for testing / tuning) ────────────────────
+// POLL_INTERVAL_MS is the maximum (idle) cadence. Adaptive polling tightens to
+// 10 s or 5 s when any position-scheduled driver is close to firing — see
+// computeNextPollMs() below. Trade-off: bandwidth vs miss-rate near surge.
 const POLL_INTERVAL_MS  = parseInt(process.env.MONITOR_POLL_MS     ?? String(90_000), 10);
+const POLL_NEAR_FIRE_MS = parseInt(process.env.MONITOR_POLL_NEAR_FIRE_MS ?? '10000', 10); // <60s away
+const POLL_AT_FIRE_MS   = parseInt(process.env.MONITOR_POLL_AT_FIRE_MS   ??  '5000', 10); // <20s away
 const FETCH_TIMEOUT     = parseInt(process.env.MONITOR_TIMEOUT     ?? String(15_000), 10);
 const BOT_CONCURRENCY   = parseInt(process.env.MONITOR_CONCURRENCY ?? '3',                10);
 const AUTO_REFRESH_MS   = parseInt(process.env.MONITOR_REFRESH_MS  ?? String(5 * 60_000), 10);
@@ -67,9 +72,12 @@ const POS_END_HOUR     = parseInt(process.env.MONITOR_POS_END_HOUR     ?? '23', 
 // Minimum lead buffer (positions). Small safety cushion for near-zero growth days.
 // The dynamic drift calculation takes over whenever growth exceeds ~10 drivers/tick.
 const POS_LEAD_BUFFER  = parseInt(process.env.MONITOR_POS_LEAD_BUFFER  ?? '5', 10);
-// Estimated Playwright bot execution time (ms). Used to project how many positions
-// will be added between the fire decision and when SAN assigns the queue slot.
-const POS_BOT_EXEC_MS  = parseInt(process.env.MONITOR_POS_BOT_EXEC_MS  ?? '45000', 10);
+// Fallback estimate for Playwright bot execution time (ms) before we have real
+// data. Used to project how many positions will be added between the fire decision
+// and when SAN assigns the queue slot. The actual estimate is the rolling P95 of
+// the last MAX_LATENCY_SAMPLES bot runs (see botExecutionEstimateMs below) — this
+// constant is only the cold-start default until we collect enough samples.
+const POS_BOT_EXEC_MS  = parseInt(process.env.MONITOR_POS_BOT_EXEC_MS  ?? '15000', 10);
 // Minimum assumed queue growth rate (drivers/second) used as a floor before historical
 // data exists and during calm periods. Protects against cold-start on a busy morning.
 // Tune down if drivers land too early; tune up if they still land too late.
@@ -258,6 +266,53 @@ const BIAS_REFRESH_EVERY = 20;    // recalculate bias every N poll ticks
 // Oldest entry first; capped at SHORT_WINDOW_POLLS + 1 entries.
 const recentObservations = [];
 
+// ─── Adaptive polling (poll faster as drivers approach their fire window) ────
+// Current effective interval (ms). Recalculated at the end of every poll based
+// on the smallest secondsUntilFire across all armed position-scheduled drivers.
+// Lives at module scope so getState() / nextPollIn() can report it.
+let currentPollDelayMs = POLL_INTERVAL_MS;
+
+/**
+ * Pure function: returns the poll interval (ms) appropriate for a given
+ * "seconds until next driver needs to fire". Tighter cadence near the fire
+ * window, idle cadence otherwise. Also used by the fire-before-next-poll guard
+ * so both decisions stay consistent.
+ */
+function expectedNextPollMs(secondsUntilFire) {
+  if (!Number.isFinite(secondsUntilFire) || secondsUntilFire > 60) return POLL_INTERVAL_MS;
+  if (secondsUntilFire > 20) return POLL_NEAR_FIRE_MS;
+  return POLL_AT_FIRE_MS;
+}
+
+// ─── Bot latency tracking (P95) ──────────────────────────────────────────────
+// Ring buffer of recent bot execution times in milliseconds. Used to compute the
+// dynamic horizon for drift prediction — replaces the stale 45 s constant from
+// before the proxy/session-cache speedups. Lost on restart but converges within
+// the first 5+ bot runs of the morning. In-memory only — zero DB cost.
+//
+// Push is O(1); P95 is O(n log n) for n=30 (~0.01 ms — negligible vs. a 30 s poll).
+const MAX_LATENCY_SAMPLES  = 30;
+const MIN_SAMPLES_FOR_P95  = 5;
+const botLatencySamples    = []; // ms; newest pushed to end, oldest shifted off
+
+function recordBotLatency(durationMs) {
+  if (!Number.isFinite(durationMs) || durationMs <= 0) return;
+  botLatencySamples.push(durationMs);
+  if (botLatencySamples.length > MAX_LATENCY_SAMPLES) botLatencySamples.shift();
+}
+
+/**
+ * Returns the bot execution estimate (ms) used by the drift forecast.
+ *   • Fewer than MIN_SAMPLES_FOR_P95 samples → POS_BOT_EXEC_MS env fallback
+ *   • Otherwise → P95 of the rolling window (resilient to outliers)
+ */
+function botExecutionEstimateMs() {
+  if (botLatencySamples.length < MIN_SAMPLES_FOR_P95) return POS_BOT_EXEC_MS;
+  const sorted = [...botLatencySamples].sort((a, b) => a - b);
+  const idx    = Math.max(0, Math.ceil(0.95 * sorted.length) - 1);
+  return sorted[Math.min(sorted.length - 1, idx)];
+}
+
 // EventEmitter — decouples SSE clients from service logic
 const emitter = new EventEmitter();
 emitter.setMaxListeners(500); // support many concurrent admin browser tabs
@@ -338,6 +393,36 @@ function parseTerminalPage(html) {
 const MAX_RECENT_EVENTS = 50;
 const recentRequeuEvents = [];   // newest first
 
+// ─── Position decision recording ─────────────────────────────────────────────
+// Writes one row per driver per day to position_tracking, upserted on every
+// decision-state CHANGE (not every poll). For ~10 drivers this is ≤30 writes/day
+// total — negligible DB load. The in-memory state.lastPosDecision is the de-dupe
+// gate so we don't write the same 'waiting' row 120 times an hour.
+//
+// Fire-state metrics are passed when transitioning to 'fired' (inside
+// triggerPositionSchedule), so a single row captures the lifecycle:
+//   waiting → fired → completed (or missed/failed).
+function recordPositionDecision(state, decision, reason, metrics = {}) {
+  if (state.lastPosDecision === decision) return; // no state change → no write
+  state.lastPosDecision = decision;
+
+  PositionTracking.upsertDecision({
+    driverId:              state.driverId,
+    vehicleNumber:         state.vehicleNumber,
+    targetPosition:        metrics.targetPosition,
+    maxAcceptablePosition: metrics.maxAcceptablePosition,
+    decision,
+    decisionReason:        reason,
+    queueSizeAtFire:       metrics.queueSize,
+    growthRate:            metrics.growthRate,
+    estimatedDrift:        metrics.estimatedDrift,
+    predictedLanding:      metrics.predictedLanding,
+    firedAt:               metrics.firedAt,
+  }).catch((err) => console.error(
+    `[PosTracking] upsert failed for #${state.vehicleNumber}: ${err.message}`,
+  ));
+}
+
 // ─── SSE broadcast ───────────────────────────────────────────────────────────
 function broadcast(type, payload) {
   const ts = Date.now();
@@ -389,9 +474,25 @@ async function _runBot(driverId, state, triggerType = 'monitor_requeue') {
 
   const result = await runBotForDriver(driver, triggerType);
 
+  // Record execution time for the rolling P95 used by drift prediction.
+  // Replaces the stale POS_BOT_EXEC_MS constant — see botExecutionEstimateMs().
+  if (Number.isFinite(result?.durationMs)) {
+    recordBotLatency(result.durationMs);
+    // If this was a position-schedule fire, persist the duration onto the
+    // same row that already has the 'fired' decision.
+    if (state.pendingTrackingId) {
+      PositionTracking.recordBotDuration(state.pendingTrackingId, result.durationMs)
+        .catch((err) => console.error('[PosTracking] recordBotDuration error:', err.message));
+    }
+  }
+
   state.lastResult  = result;
   state.state       = 'watching';
-  state.hasBeenSeen = false; // next poll re-confirms in_queue
+  // Keep hasBeenSeen=true when the bot succeeded (added or found already in queue).
+  // This prevents the position scheduler from firing in the gap between bot
+  // completion and the next queue-page fetch — the next poll will confirm in_queue.
+  // Only reset to false if the bot actually failed (driver is definitely not in queue).
+  state.hasBeenSeen = !!(result?.success);
   if (result?.success && !result?.alreadyQueued) {
     state.requeueCount++;
     state.requeueCountToday++;
@@ -456,7 +557,12 @@ async function triggerRequeue(driverId, state, { delayMs = 0 } = {}) {
 // re-add after dispatch, so the SAN server is always ready to accept it.
 // positionFiredToday is set BEFORE enqueuing so concurrent polls cannot
 // double-trigger the same driver.
-async function triggerPositionSchedule(driverId, state, effectivePosition, { growthRate = 0, estimatedDrift = 0 } = {}) {
+async function triggerPositionSchedule(driverId, state, effectivePosition, {
+  growthRate           = 0,
+  estimatedDrift       = 0,
+  predictedLanding     = null,
+  maxAcceptablePosition = null,
+} = {}) {
   state.state          = 'requeuing';
   state.lastRequeuedAt = new Date();
   broadcast('driver_state',      { driverId, state: snap(state) });
@@ -465,23 +571,38 @@ async function triggerPositionSchedule(driverId, state, effectivePosition, { gro
   const queueSizeAtFire = state._lastQueueSize ?? 0;
   console.log(`[Pos] 📍 Bot queued for #${state.vehicleNumber} — target: ${effectivePosition}, queue now: ${queueSizeAtFire}`);
 
-  // Record the fire event for accuracy tracking — non-blocking
-  PositionTracking.create({
+  // Upsert the 'fired' decision — replaces any prior 'waiting' record for today.
+  // Non-blocking; we capture pendingTrackingId so the bot result / actual landing
+  // can be filled in on the same row later.
+  PositionTracking.upsertDecision({
     driverId,
-    vehicleNumber:    state.vehicleNumber,
-    targetPosition:   effectivePosition,
+    vehicleNumber:         state.vehicleNumber,
+    targetPosition:        effectivePosition,
+    maxAcceptablePosition,
+    decision:              'fired',
+    decisionReason:        'inside_fire_window',
     queueSizeAtFire,
     growthRate,
     estimatedDrift,
+    predictedLanding,
+    firedAt:               new Date(),
   }).then((trackingId) => {
-    state.pendingTrackingId = trackingId; // filled in when driver appears in queue
-  }).catch((err) => console.error('[PosTracking] Failed to insert record:', err.message));
+    state.pendingTrackingId = trackingId;
+    state.lastPosDecision   = 'fired';
+  }).catch((err) => console.error('[PosTracking] Failed to upsert fired row:', err.message));
 
   jobQueue.enqueue(() =>
     _runBot(driverId, state, 'position_schedule').catch((err) => {
       state.state      = 'watching';
       state.hasBeenSeen = false;
       state.lastResult  = { success: false, error: err.message };
+
+      // Persist the failure so the report shows it.
+      if (state.pendingTrackingId) {
+        PositionTracking.markFailed(state.pendingTrackingId, err.message)
+          .catch((e) => console.error('[PosTracking] markFailed error:', e.message));
+        state.lastPosDecision = 'failed';
+      }
 
       broadcast('requeue_result', {
         driverId,
@@ -523,6 +644,128 @@ async function fetchPage(url) {
   throw lastErr;
 }
 
+// ─── Position-scheduler decision function ───────────────────────────────────
+// Pure function — no side effects, no I/O. Returns a decision object the caller
+// applies. Centralising the logic here makes it easy to unit-test and ensures
+// the log line, DB write, and bot fire all see the same metrics.
+//
+// Decision shape:
+//   { action: 'skip_no_target'      }                                  // no DB write
+//   { action: 'skip_already_fired'  , logLine }                        // no DB write
+//   { action: 'skip_bot_inflight'   , reason, logLine, metrics }
+//   { action: 'skip_already_seen'   , reason, logLine, metrics }
+//   { action: 'fire'                , reason, logLine, fireOpts, ... } // sets positionFiredToday
+//   { action: 'wait'                , reason, logLine, metrics, secondsUntilFire }
+function evaluatePositionScheduler(state, ctx) {
+  const {
+    waitingCount,
+    effectiveGrowthRate,
+    estimatedDrift,
+    biasCorrection,
+    horizonSeconds,
+    botExecMs,
+    todayDayKey,
+    botSamplesCount,
+  } = ctx;
+
+  // Resolve today's effective position — skip drivers with no target today
+  let effectivePosition = state.scheduledPosition;
+  if (state.dayPositions) {
+    try {
+      const dp = JSON.parse(state.dayPositions);
+      effectivePosition = dp[todayDayKey] ?? null;
+    } catch { effectivePosition = null; }
+  }
+  if (!effectivePosition) return { action: 'skip_no_target' };
+
+  // Tolerance ceiling — driver-configured or default (target + 20)
+  const maxAcceptable = Number.isInteger(state.maxAcceptablePosition)
+    ? state.maxAcceptablePosition
+    : effectivePosition + 20;
+
+  const baseMetrics = { targetPosition: effectivePosition, maxAcceptablePosition: maxAcceptable };
+  const veh         = `#${state.vehicleNumber}`;
+
+  // ─── Early skip checks ────────────────────────────────────────────────────
+  if (state.positionFiredToday) {
+    return {
+      action:  'skip_already_fired',
+      logLine: `[Pos] ${veh} — already fired today (target: ${effectivePosition}), skipping`,
+    };
+  }
+  if (state.state === 'requeuing') {
+    return {
+      action:  'skip_bot_inflight',
+      reason:  'bot_currently_running',
+      logLine: `[Pos] ${veh} — bot in-flight, skipping`,
+      metrics: baseMetrics,
+    };
+  }
+  if (state.hasBeenSeen) {
+    return {
+      action:  'skip_already_seen',
+      reason:  'driver_already_in_queue_today',
+      logLine: `[Pos] ${veh} — already in queue today, skipping`,
+      metrics: baseMetrics,
+    };
+  }
+
+  // ─── Projection and fire decision ─────────────────────────────────────────
+  // Simple rule: fire as soon as projection reaches target. We do NOT cap on
+  // maxAcceptable — the user wants every driver queued so we can record actual
+  // landing positions and learn from the data. maxAcceptable is still recorded
+  // in the tracking row for later analysis.
+  const projectedLanding = waitingCount + estimatedDrift + biasCorrection;
+  const shouldFire       = projectedLanding >= effectivePosition;
+
+  // secondsUntilFire drives adaptive polling — how soon do we expect to fire?
+  // Negative projection (already past target) → 0; no growth → Infinity.
+  const positionsUntilFire = effectivePosition - projectedLanding;
+  const secondsUntilFire   = effectiveGrowthRate > 0 && positionsUntilFire > 0
+    ? positionsUntilFire / effectiveGrowthRate
+    : (positionsUntilFire <= 0 ? 0 : Infinity);
+
+  if (shouldFire) {
+    return {
+      action:  'fire',
+      reason:  'projection_reached_target',
+      effectivePosition,
+      maxAcceptable,
+      secondsUntilFire,
+      logLine: `[Pos] ${veh} — ✓ queue ${waitingCount} + drift ${estimatedDrift}` +
+               `${biasCorrection !== 0 ? ` + bias ${biasCorrection.toFixed(1)}` : ''} ` +
+               `= ${projectedLanding.toFixed(1)} ≥ target ${effectivePosition} ` +
+               `(max ${maxAcceptable}, rate ${effectiveGrowthRate.toFixed(2)}/s, ` +
+               `horizon ${horizonSeconds.toFixed(0)}s, botP95 ${(botExecMs/1000).toFixed(1)}s, ` +
+               `samples ${botSamplesCount}) — firing bot`,
+      fireOpts: {
+        growthRate:            effectiveGrowthRate,
+        estimatedDrift,
+        predictedLanding:      Math.round(projectedLanding),
+        maxAcceptablePosition: maxAcceptable,
+      },
+    };
+  }
+
+  // ─── Wait ─────────────────────────────────────────────────────────────────
+  return {
+    action:  'wait',
+    reason:  'projected_below_target',
+    secondsUntilFire,
+    logLine: `[Pos] ${veh} — waiting (queue: ${waitingCount}, drift: ${estimatedDrift}, ` +
+             `bias: ${biasCorrection.toFixed(1)}, projected: ${projectedLanding.toFixed(1)}, ` +
+             `target: ${effectivePosition}, max: ${maxAcceptable}, ` +
+             `secsToFire: ${Number.isFinite(secondsUntilFire) ? secondsUntilFire.toFixed(0) : '∞'})`,
+    metrics: {
+      ...baseMetrics,
+      queueSize:        waitingCount,
+      growthRate:       effectiveGrowthRate,
+      estimatedDrift,
+      predictedLanding: Math.round(projectedLanding),
+    },
+  };
+}
+
 // ─── Core poll tick ──────────────────────────────────────────────────────────
 async function poll() {
   if (watches.size === 0) return; // nothing to watch — skip fetch (cost = 0)
@@ -534,8 +777,29 @@ async function poll() {
     for (const s of watches.values()) {
       s.requeueCountToday  = 0;
       s.positionFiredToday = false;
+      s.lastPosDecision    = null; // new day → next decision will write a fresh row
+      s.pendingTrackingId  = null;
+
+      // Reset visibility/terminal state so drivers carried over from yesterday's
+      // at_terminal limbo don't block the position scheduler with stale
+      // hasBeenSeen=true. The state machine in the next poll re-derives state
+      // from current queue presence: drivers actually in V Holding get
+      // hasBeenSeen=true again before the position scheduler evaluates them.
+      //
+      // Without this, drivers who were dispatched late yesterday and cleared
+      // the terminal overnight get requeued by the monitor the instant
+      // operating hours open at 5 AM — landing at whatever low position
+      // exists then, robbing the position scheduler of the morning to hit
+      // their actual target.
+      s.hasBeenSeen        = false;
+      s.state              = 'watching';
+      s.terminalSeen       = false;
+      s.terminalCheckCount = 0;
+      s.terminalName       = null;
+      s.terminalPosition   = null;
+      s.atTerminalSince    = null;
     }
-    console.log('[Monitor] Daily counters reset for new day');
+    console.log('[Monitor] Daily reset — counters and visibility state cleared');
     broadcast('daily_reset', { date: currentDayPT });
   }
 
@@ -722,6 +986,16 @@ async function poll() {
         `[Monitor] #${state.vehicleNumber} returned from terminal — outside operating hours ` +
         `(${OP_START_HOUR}:00–${OP_END_HOUR}:00 PT), requeue paused`,
       );
+    } else if (
+      // Same defer-to-position-scheduler logic as the cleared-terminal block.
+      (state.scheduledPosition || state.dayPositions)
+      && !state.positionFiredToday
+      && isWithinPositionHours()
+    ) {
+      console.log(
+        `[Monitor] #${state.vehicleNumber} returned from terminal — deferring requeue ` +
+        `(position scheduler hasn't decided yet today)`,
+      );
     } else {
       console.log(
         `[Monitor] #${state.vehicleNumber} at_terminal → in_queue (SAN auto-returned, ` +
@@ -794,6 +1068,25 @@ async function poll() {
               `[Monitor] #${state.vehicleNumber} cleared terminal — outside operating hours ` +
               `(${OP_START_HOUR}:00–${OP_END_HOUR}:00 PT), requeue paused`,
             );
+          } else if (
+            // Defer to position scheduler: if this driver has a position target
+            // and the scheduler hasn't reached a decision yet today, let it
+            // decide first. Otherwise the monitor would land them at whatever
+            // low position exists at 5 AM, robbing the scheduler of the chance
+            // to fire at the actual target window later in the morning.
+            //
+            // The scheduler always marks positionFiredToday=true on 'fire', so
+            // this defer ALWAYS releases — either when the scheduler fires for
+            // this driver, or naturally when position hours end
+            // (isWithinPositionHours becomes false).
+            (state.scheduledPosition || state.dayPositions)
+            && !state.positionFiredToday
+            && isWithinPositionHours()
+          ) {
+            console.log(
+              `[Monitor] #${state.vehicleNumber} cleared terminal — deferring requeue ` +
+              `(position scheduler hasn't decided yet today)`,
+            );
           } else {
             const reason = clearedAfterSeen
               ? 'left terminal list'
@@ -821,8 +1114,9 @@ async function poll() {
   //
   // Dynamic lead using real poll age + bot execution time (both in seconds).
   // horizonSeconds = how far into the future we need to predict queue size:
-  //   pollAgeSeconds  — data already stale by this many seconds when we read it
-  //   POS_BOT_EXEC_MS — bot takes this long to execute and claim the slot
+  //   pollAgeSeconds   — data already stale by this many seconds when we read it
+  //   botExecutionEstimateMs() — rolling P95 of recent bot runs (cold-start: POS_BOT_EXEC_MS)
+  //   SAFETY_BUFFER_SECS — extra cushion against under-prediction
   // estimatedDrift = rate(drivers/sec) × horizonSeconds → positions added during that window.
   // biasCorrection  — median of recent (actual - target) landing errors from position_tracking.
   //   If positive (we keep landing too far back), the prediction is bumped up so the bot fires earlier.
@@ -832,54 +1126,76 @@ async function poll() {
   const DAY_KEY_MAP = { Sun: '0', Mon: '1', Tue: '2', Wed: '3', Thu: '4', Fri: '5', Sat: '6' };
   const todayDayKey = DAY_KEY_MAP[todayDayStr];
 
-  const pollAgeSeconds   = lastObservationAt ? (Date.now() - lastObservationAt) / 1000 : POLL_INTERVAL_MS / 1000;
-  const horizonSeconds   = pollAgeSeconds + (POS_BOT_EXEC_MS / 1000) + SAFETY_BUFFER_SECS;
-  const estimatedDrift   = Math.max(20, Math.ceil(effectiveGrowthRate * horizonSeconds));
+  const pollAgeSeconds = lastObservationAt ? (Date.now() - lastObservationAt) / 1000 : POLL_INTERVAL_MS / 1000;
+  const botExecMs      = botExecutionEstimateMs();
+  const horizonSeconds = pollAgeSeconds + (botExecMs / 1000) + SAFETY_BUFFER_SECS;
+  const estimatedDrift = Math.max(20, Math.ceil(effectiveGrowthRate * horizonSeconds));
+
+  // Context shared by every per-driver decision. Pure data — no module state.
+  const decisionCtx = {
+    waitingCount,
+    effectiveGrowthRate,
+    estimatedDrift,
+    biasCorrection,
+    horizonSeconds,
+    botExecMs,
+    todayDayKey,
+    botSamplesCount: botLatencySamples.length,
+  };
+
+  // Track the soonest fire across all armed drivers — drives adaptive polling.
+  let minSecondsUntilFire = Infinity;
 
   for (const [driverId, state] of watches) {
-    // Resolve today's effective position — skips drivers with no target today
-    let effectivePosition = state.scheduledPosition;
-    if (state.dayPositions) {
-      try {
-        const dp = JSON.parse(state.dayPositions);
-        effectivePosition = dp[todayDayKey] ?? null;
-      } catch { effectivePosition = null; }
-    }
-    if (!effectivePosition) continue; // no position target today
+    const decision = evaluatePositionScheduler(state, decisionCtx);
 
-    if (state.positionFiredToday) {
-      console.log(`[Pos] #${state.vehicleNumber} — already fired today (target: ${effectivePosition}), skipping`);
-      continue;
-    }
-    if (state.state === 'requeuing') {
-      console.log(`[Pos] #${state.vehicleNumber} — bot in-flight, skipping`);
-      continue;
-    }
-    if (state.hasBeenSeen) {
-      console.log(`[Pos] #${state.vehicleNumber} — already in queue today, skipping`);
-      continue;
+    if (Number.isFinite(decision.secondsUntilFire) && decision.secondsUntilFire < minSecondsUntilFire) {
+      minSecondsUntilFire = decision.secondsUntilFire;
     }
 
-    // Fire when (projected landing + bias correction) reaches the target.
-    // biasCorrection > 0 means we've been landing too far back historically —
-    // adding it to the projection makes the bot fire earlier to compensate.
-    const projectedLanding = waitingCount + estimatedDrift + biasCorrection;
-    if (projectedLanding >= effectivePosition) {
-      console.log(
-        `[Pos] #${state.vehicleNumber} — ✓ queue ${waitingCount} + drift ${estimatedDrift}` +
-        `${biasCorrection !== 0 ? ` + bias ${biasCorrection.toFixed(1)}` : ''} ` +
-        `= ${projectedLanding.toFixed(1)} ≥ ${effectivePosition} ` +
-        `(rate: ${effectiveGrowthRate.toFixed(2)}/s, horizon: ${(pollAgeSeconds + POS_BOT_EXEC_MS/1000).toFixed(0)}s) — firing bot`,
-      );
-      state.positionFiredToday = true; // mark before enqueuing — prevents double-trigger
-      triggerPositionSchedule(driverId, state, effectivePosition, { growthRate: effectiveGrowthRate, estimatedDrift }).catch(console.error);
-    } else {
-      console.log(
-        `[Pos] #${state.vehicleNumber} — waiting ` +
-        `(queue: ${waitingCount}, drift: ${estimatedDrift}, bias: ${biasCorrection.toFixed(1)}, projected: ${projectedLanding.toFixed(1)}, target: ${effectivePosition})`,
-      );
+    // Apply side effects per decision action
+    switch (decision.action) {
+      case 'skip_no_target':
+        // silent — driver has no position target today
+        break;
+
+      case 'skip_already_fired':
+        console.log(decision.logLine);
+        break;
+
+      case 'skip_bot_inflight':
+      case 'skip_already_seen':
+      case 'wait':
+        console.log(decision.logLine);
+        recordPositionDecision(state, decision.action, decision.reason, decision.metrics);
+        break;
+
+      case 'fire':
+        console.log(decision.logLine);
+        state.positionFiredToday = true; // mark before enqueuing — prevents double-trigger
+        triggerPositionSchedule(driverId, state, decision.effectivePosition, decision.fireOpts)
+          .catch(console.error);
+        break;
+
+      default:
+        console.warn(`[Pos] Unknown decision action: ${decision.action}`);
     }
   }
+
+  // Set the adaptive interval for the next scheduled poll. When no drivers are
+  // armed (minSecondsUntilFire stays Infinity) this returns POLL_INTERVAL_MS.
+  const newDelayMs = expectedNextPollMs(minSecondsUntilFire);
+  if (newDelayMs !== currentPollDelayMs) {
+    console.log(
+      `[Monitor] Poll cadence ${currentPollDelayMs/1000}s → ${newDelayMs/1000}s ` +
+      `(nearest fire in ${Number.isFinite(minSecondsUntilFire) ? minSecondsUntilFire.toFixed(0) + 's' : '∞'})`,
+    );
+    currentPollDelayMs = newDelayMs;
+  }
+  } else if (currentPollDelayMs !== POLL_INTERVAL_MS) {
+    // Outside position hours (e.g. midnight–2 AM PT) → relax cadence.
+    console.log(`[Monitor] Poll cadence ${currentPollDelayMs/1000}s → ${POLL_INTERVAL_MS/1000}s (outside position hours)`);
+    currentPollDelayMs = POLL_INTERVAL_MS;
   } // end isWithinPositionHours
 }
 
@@ -949,8 +1265,9 @@ async function addWatch(driverId, { isAuto = false, _ctx = null } = {}) {
     lastResult:        null,
     requeueCount:       0,
     requeueCountToday,
-    scheduledPosition:  driver.scheduled_position ?? null,
-    dayPositions:       driver.day_positions ?? null,
+    scheduledPosition:       driver.scheduled_position ?? null,
+    dayPositions:            driver.day_positions ?? null,
+    maxAcceptablePosition:   driver.max_acceptable_position ?? null, // null → default to target + 20
     positionFiredToday,
     currentPosition:    null,  // live position updated every poll tick
     lastPosition:       null,  // position bot placed them at (from bot result)
@@ -1052,8 +1369,9 @@ async function refreshAutoWatches() {
       } else {
         // Sync position schedule fields so driver profile changes take effect within 5 min
         const existing = watches.get(d.id);
-        existing.scheduledPosition = d.scheduled_position ?? null;
-        existing.dayPositions      = d.day_positions ?? null;
+        existing.scheduledPosition     = d.scheduled_position ?? null;
+        existing.dayPositions          = d.day_positions ?? null;
+        existing.maxAcceptablePosition = d.max_acceptable_position ?? null;
       }
     }
 
@@ -1101,7 +1419,8 @@ async function manualRun(driverId) {
 function getState() {
   return {
     pollStats:        lastPollStats,
-    pollIntervalMs:   POLL_INTERVAL_MS,
+    pollIntervalMs:   currentPollDelayMs, // live adaptive interval (idle ≤ this ≤ near-fire)
+    pollIntervalIdleMs: POLL_INTERVAL_MS, // configured idle ceiling, for UI display
     queueUrl:         QUEUE_URL,
     watches:          [...watches.values()].map(snap),
     recentEvents:     recentRequeuEvents.slice(),
@@ -1164,16 +1483,28 @@ async function startMonitor() {
     console.warn('[Monitor] Initial auto-watch failed:', e.message);
   }
 
-  if (pollTimer)    clearInterval(pollTimer);
-  if (refreshTimer) clearInterval(refreshTimer);
+  if (pollTimer)    { clearTimeout(pollTimer);    pollTimer    = null; }
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
 
-  pollTimer    = setInterval(() => poll().catch(console.error),                POLL_INTERVAL_MS);
-  refreshTimer = setInterval(() => refreshAutoWatches().catch(console.error),  AUTO_REFRESH_MS);
+  // Self-rescheduling chain so the adaptive interval (currentPollDelayMs) can
+  // change between ticks. .finally() guarantees we wait for the in-flight poll
+  // to finish before scheduling the next one — no overlap, no piling up.
+  const schedule = () => {
+    pollTimer = setTimeout(() => {
+      poll()
+        .catch(console.error)
+        .finally(() => { if (pollTimer !== null) schedule(); });
+    }, currentPollDelayMs);
+  };
+  schedule();
 
-  poll().catch(console.error); // immediate first tick
+  refreshTimer = setInterval(() => refreshAutoWatches().catch(console.error), AUTO_REFRESH_MS);
+
+  poll().catch(console.error); // immediate first tick — doesn't block the chain
 
   console.log(
-    `[Monitor] Started — poll every ${POLL_INTERVAL_MS / 1000}s, ` +
+    `[Monitor] Started — poll cadence ${POLL_INTERVAL_MS / 1000}s idle / ` +
+    `${POLL_NEAR_FIRE_MS / 1000}s near fire / ${POLL_AT_FIRE_MS / 1000}s at fire, ` +
     `auto-refresh every ${AUTO_REFRESH_MS / 1000}s, ` +
     `bot concurrency: ${BOT_CONCURRENCY}, ` +
     `watching ${watches.size} driver(s)`,
@@ -1181,7 +1512,7 @@ async function startMonitor() {
 }
 
 function stopMonitor() {
-  if (pollTimer)    { clearInterval(pollTimer);    pollTimer    = null; }
+  if (pollTimer)    { clearTimeout(pollTimer);     pollTimer    = null; }
   if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
   watches.clear();
   autoDriverIds.clear();
@@ -1193,10 +1524,11 @@ function stopMonitor() {
   biasCorrection     = 0;
   biasPollCount      = 0;
   recentObservations.length = 0;
+  currentPollDelayMs = POLL_INTERVAL_MS;
 }
 
-/** Seconds until next scheduled poll. */
-function nextPollIn() { return Math.round(POLL_INTERVAL_MS / 1000); }
+/** Seconds until next scheduled poll (uses the current adaptive interval). */
+function nextPollIn() { return Math.round(currentPollDelayMs / 1000); }
 
 module.exports = {
   startMonitor,
@@ -1211,8 +1543,12 @@ module.exports = {
   subscribe,
   nextPollIn,
   // Exposed for unit tests
-  _parseQueue:              parseQueue,
-  _parseTerminalPage:       parseTerminalPage,
-  _norm:                    norm,
-  _isWithinOperatingHours:  isWithinOperatingHours,
+  _parseQueue:                parseQueue,
+  _parseTerminalPage:         parseTerminalPage,
+  _norm:                      norm,
+  _isWithinOperatingHours:    isWithinOperatingHours,
+  _evaluatePositionScheduler: evaluatePositionScheduler,
+  _expectedNextPollMs:        expectedNextPollMs,
+  _botExecutionEstimateMs:    botExecutionEstimateMs,
+  _recordBotLatency:          recordBotLatency,
 };

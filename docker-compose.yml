@@ -92,6 +92,9 @@ services:
       # Playwright screenshot dir (debug)
       BOT_DEBUG_DIR: /tmp/san-bot-debug
 
+    volumes:
+      - ./logs:/app/logs   # daily log files persist across container restarts
+
     # Shared memory for Chromium (prevents crashes on small droplets)
     shm_size: '256mb'
 

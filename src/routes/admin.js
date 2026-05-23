@@ -51,6 +51,10 @@ router.post(
       .optional({ checkFalsy: true })
       .matches(/^[0-6](,[0-6]){0,6}$/)
       .withMessage('scheduledDays must be comma-separated day numbers 0–6'),
+    body('maxAcceptablePosition')
+      .optional({ nullable: true })
+      .isInt({ min: 1, max: 1000 })
+      .withMessage('maxAcceptablePosition must be an integer between 1 and 1000'),
   ],
   validate,
   adminController.addDriver,
@@ -64,6 +68,10 @@ router.put(
       .optional({ checkFalsy: true })
       .matches(/^[0-6](,[0-6]){0,6}$/)
       .withMessage('scheduledDays must be comma-separated day numbers 0–6'),
+    body('maxAcceptablePosition')
+      .optional({ nullable: true })
+      .isInt({ min: 1, max: 1000 })
+      .withMessage('maxAcceptablePosition must be an integer between 1 and 1000'),
   ],
   validate,
   adminController.updateDriver,
@@ -99,6 +107,20 @@ router.get(
   ],
   validate,
   adminController.getPositionTracking,
+);
+
+// Daily position-scheduler report — defaults to today PT, accepts 'today',
+// 'yesterday', or any YYYY-MM-DD. Returns rows + summary in one response.
+router.get(
+  '/reports/positions/:date?',
+  [
+    param('date')
+      .optional()
+      .matches(/^(today|yesterday|\d{4}-\d{2}-\d{2})$/)
+      .withMessage('date must be YYYY-MM-DD, "today", or "yesterday"'),
+  ],
+  validate,
+  adminController.getDailyReport,
 );
 
 router.get(

@@ -20,7 +20,8 @@ const COOKIE_OPTS = {
 
 async function registerDriver(req, res, next) {
   try {
-    const { name, phone, email, appPassword, sanUsername, sanPassword, vehicleNumber, scheduledTime, scheduledDays, daySchedules } = req.body;
+    const { name, phone, appPassword, sanUsername, sanPassword, vehicleNumber, scheduledTime, scheduledDays, daySchedules } = req.body;
+    const email = req.body.email ? req.body.email.toLowerCase().trim() : null;
 
     if (email) {
       const existing = await Driver.findByEmail(email);
@@ -87,7 +88,8 @@ async function registerDriver(req, res, next) {
 
 async function loginDriver(req, res, next) {
   try {
-    const { email, vehicleNumber, appPassword } = req.body;
+    const { vehicleNumber, appPassword } = req.body;
+    const email = req.body.email ? req.body.email.toLowerCase().trim() : null;
 
     const record = email
       ? await Driver.findByEmail(email)
@@ -136,7 +138,7 @@ async function loginAdmin(req, res, next) {
 // ─── Forgot password — send reset link via email ──────────────────────────────
 async function forgotPassword(req, res, next) {
   try {
-    const { email } = req.body;
+    const email = req.body.email ? req.body.email.toLowerCase().trim() : '';
     const driver = await Driver.findByEmail(email);
 
     // Always return the same response to prevent email enumeration

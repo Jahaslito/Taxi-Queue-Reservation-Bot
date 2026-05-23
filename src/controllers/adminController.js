@@ -240,7 +240,7 @@ async function updateDriver(req, res, next) {
     }
 
     // Normalise email: treat empty string the same as "not provided"
-    const normalisedEmail = (email !== undefined) ? (email.trim() || null) : driver.email;
+    const normalisedEmail = (email !== undefined) ? (email.toLowerCase().trim() || null) : driver.email;
 
     const updateData = {
       name:               name           ?? driver.name,

@@ -24,7 +24,7 @@ class Driver {
   }
 
   static findByEmail(email) {
-    return db(TABLE).where({ email }).first();
+    return db(TABLE).whereRaw('LOWER(email) = ?', [email.toLowerCase().trim()]).first();
   }
 
   static findByVehicleNumber(vehicleNumber) {

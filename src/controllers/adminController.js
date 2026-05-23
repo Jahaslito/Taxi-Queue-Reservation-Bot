@@ -4,6 +4,7 @@ const db                      = require('../config/database');
 const Driver                  = require('../models/Driver');
 const Log                     = require('../models/Log');
 const PositionClaim           = require('../models/PositionClaim');
+const PositionTracking        = require('../models/PositionTracking');
 const { encrypt }             = require('../services/cryptoService');
 const { runBotForDriver }     = require('../services/schedulerService');
 const { sendVerificationEmail } = require('../services/emailService');
@@ -400,6 +401,20 @@ async function getLogs(req, res, next) {
   }
 }
 
+async function getPositionTracking(req, res, next) {
+  try {
+    const limit  = req.query.limit  ?? 50;
+    const offset = req.query.offset ?? 0;
+    const [rows, countRow] = await Promise.all([
+      PositionTracking.recent({ limit, offset }),
+      PositionTracking.recentCount(),
+    ]);
+    res.json({ records: rows, total: Number(countRow.count) });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   getStats,
   listDrivers,
@@ -410,4 +425,5 @@ module.exports = {
   triggerDriver,
   checkPositions,
   getLogs,
+  getPositionTracking,
 };

@@ -85,6 +85,16 @@ router.post(
 );
 
 router.get(
+  '/position-tracking',
+  [
+    query('limit').optional().isInt({ min: 1, max: 200 }).toInt(),
+    query('offset').optional().isInt({ min: 0 }).toInt(),
+  ],
+  validate,
+  adminController.getPositionTracking,
+);
+
+router.get(
   '/logs',
   [
     query('limit').optional().isInt({ min: 1, max: 200 }).toInt(),

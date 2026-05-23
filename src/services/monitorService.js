@@ -38,9 +38,10 @@ const { fetch: ufetch, ProxyAgent } = require('undici');
 //   • Bot jobs are concurrency-capped (MONITOR_CONCURRENCY, default 3).
 //   • EventEmitter supports up to 500 SSE clients.
 
-const { EventEmitter } = require('events');
-const Driver           = require('../models/Driver');
-const Log              = require('../models/Log');
+const { EventEmitter }    = require('events');
+const Driver              = require('../models/Driver');
+const Log                 = require('../models/Log');
+const PositionTracking    = require('../models/PositionTracking');
 
 // ─── Constants (overridable via env for testing / tuning) ────────────────────
 const POLL_INTERVAL_MS  = parseInt(process.env.MONITOR_POLL_MS     ?? String(90_000), 10);
@@ -69,6 +70,14 @@ const POS_LEAD_BUFFER  = parseInt(process.env.MONITOR_POS_LEAD_BUFFER  ?? '5', 1
 // Estimated Playwright bot execution time (ms). Used to project how many positions
 // will be added between the fire decision and when SAN assigns the queue slot.
 const POS_BOT_EXEC_MS  = parseInt(process.env.MONITOR_POS_BOT_EXEC_MS  ?? '45000', 10);
+// Minimum assumed queue growth rate (drivers/second) used as a floor before historical
+// data exists and during calm periods. Protects against cold-start on a busy morning.
+// Tune down if drivers land too early; tune up if they still land too late.
+const EMERGENCY_SURGE_RATE = parseFloat(process.env.MONITOR_EMERGENCY_SURGE_RATE ?? '0.5');
+// Extra seconds added to the forecast horizon as a safety cushion.
+const SAFETY_BUFFER_SECS   = parseInt(process.env.MONITOR_SAFETY_BUFFER_MS ?? '10000', 10) / 1000;
+// How many recent queue observations to keep for the short-window rate calculation.
+const SHORT_WINDOW_POLLS   = 3;
 
 function currentHourPT() {
   return parseInt(
@@ -228,11 +237,24 @@ let pollTimer    = null;
 let refreshTimer = null;
 
 // ─── Queue growth-rate tracking (for dynamic position-schedule lead) ──────────
+// All rates are in drivers/second so they stay accurate even if poll intervals drift.
 // prevWaitingCount: null on startup so the first tick doesn't produce a false surge.
-// smoothedGrowthRate: exponential moving average (alpha=0.5) of per-tick deltas.
-// Both are global to the queue — one computation per poll tick, shared by all drivers.
-let prevWaitingCount  = null;
-let smoothedGrowthRate = 0;
+// smoothedGrowthRate: EMA (α=0.7) of per-second growth rate — reacts fast to surges.
+// lastObservationAt: timestamp (ms) when the latest queue snapshot was fetched.
+// prevObservationAt: timestamp of the previous snapshot — used to get elapsed seconds.
+// biasCorrection: median of recent (actual - target) landing errors, updated periodically.
+//   If positive, drivers are landing too far back → added to prediction so bot fires earlier.
+// biasPollCount: counts poll ticks to know when to refresh the bias correction.
+let prevWaitingCount   = null;
+let smoothedGrowthRate = 0;       // drivers/second
+let lastObservationAt  = null;    // ms timestamp of latest observation
+let prevObservationAt  = null;    // ms timestamp of previous observation
+let biasCorrection     = 0;       // positions — loaded from position_tracking history
+let biasPollCount      = 0;
+const BIAS_REFRESH_EVERY = 20;    // recalculate bias every N poll ticks
+// Circular buffer of recent {count, observedAt} snapshots for short-window rate.
+// Oldest entry first; capped at SHORT_WINDOW_POLLS + 1 entries.
+const recentObservations = [];
 
 // EventEmitter — decouples SSE clients from service logic
 const emitter = new EventEmitter();
@@ -423,13 +445,26 @@ async function triggerRequeue(driverId, state, { delayMs = 0 } = {}) {
 // re-add after dispatch, so the SAN server is always ready to accept it.
 // positionFiredToday is set BEFORE enqueuing so concurrent polls cannot
 // double-trigger the same driver.
-async function triggerPositionSchedule(driverId, state, effectivePosition) {
+async function triggerPositionSchedule(driverId, state, effectivePosition, { growthRate = 0, estimatedDrift = 0 } = {}) {
   state.state          = 'requeuing';
   state.lastRequeuedAt = new Date();
   broadcast('driver_state',      { driverId, state: snap(state) });
   broadcast('requeue_triggered', { driverId, vehicleNumber: state.vehicleNumber });
 
-  console.log(`[Pos] 📍 Bot queued for #${state.vehicleNumber} — target: ${effectivePosition}, queue now: ${state._lastQueueSize ?? '?'}`);
+  const queueSizeAtFire = state._lastQueueSize ?? 0;
+  console.log(`[Pos] 📍 Bot queued for #${state.vehicleNumber} — target: ${effectivePosition}, queue now: ${queueSizeAtFire}`);
+
+  // Record the fire event for accuracy tracking — non-blocking
+  PositionTracking.create({
+    driverId,
+    vehicleNumber:    state.vehicleNumber,
+    targetPosition:   effectivePosition,
+    queueSizeAtFire,
+    growthRate,
+    estimatedDrift,
+  }).then((trackingId) => {
+    state.pendingTrackingId = trackingId; // filled in when driver appears in queue
+  }).catch((err) => console.error('[PosTracking] Failed to insert record:', err.message));
 
   jobQueue.enqueue(() =>
     _runBot(driverId, state, 'position_schedule').catch((err) => {
@@ -507,6 +542,8 @@ async function poll() {
   }
 
   const fetchMs = Date.now() - t0;
+  prevObservationAt = lastObservationAt;
+  lastObservationAt = Date.now(); // record when this snapshot was taken
   const { dispatched, waiting, notAuthorized } = parseQueue(html);
 
   lastPollStats = {
@@ -528,17 +565,59 @@ async function poll() {
   const waitingCount = waiting.size;
 
   // ─── Queue growth rate (used by position-schedule lead calculation) ──────────
-  // rawGrowth: how many drivers joined since the last poll tick.
-  // smoothedGrowthRate: EMA (α=0.5) — dampens noise while staying reactive.
-  // effectiveGrowthRate: max(raw, smoothed) — catches single-tick surges immediately.
+  // Rate is in drivers/second so horizon math stays correct even if poll intervals drift.
+  //
+  // Three rate signals, take the max:
+  //   lastPollRate      — drivers added since the previous poll ÷ elapsed seconds
+  //   shortWindowRate   — drivers added over the last SHORT_WINDOW_POLLS polls ÷ elapsed
+  //                       more stable than a single delta, reacts faster than EMA
+  //   EMERGENCY_SURGE_RATE — configurable floor (default 0.5/s) that protects the
+  //                       cold-start case (first poll of the morning, no prior data)
+  //
+  // smoothedGrowthRate (EMA α=0.7) is kept as an additional signal alongside the others.
   // prevWaitingCount is null on first tick → skip to avoid a false 0→N spike.
-  let effectiveGrowthRate = 0;
-  if (prevWaitingCount !== null) {
-    const rawGrowth = Math.max(0, waitingCount - prevWaitingCount);
-    smoothedGrowthRate = smoothedGrowthRate * 0.5 + rawGrowth * 0.5;
-    effectiveGrowthRate = Math.max(rawGrowth, smoothedGrowthRate);
+
+  // Maintain rolling observation buffer (oldest first)
+  recentObservations.push({ count: waitingCount, observedAt: lastObservationAt });
+  if (recentObservations.length > SHORT_WINDOW_POLLS + 1) recentObservations.shift();
+
+  let effectiveGrowthRate = EMERGENCY_SURGE_RATE; // floor — never starts at zero
+  if (prevWaitingCount !== null && prevObservationAt !== null) {
+    const secondsElapsed = Math.max(1, (lastObservationAt - prevObservationAt) / 1000);
+    const rawGrowth      = Math.max(0, waitingCount - prevWaitingCount);
+    const lastPollRate   = rawGrowth / secondsElapsed;
+
+    smoothedGrowthRate = smoothedGrowthRate * 0.3 + lastPollRate * 0.7; // EMA α=0.7
+
+    // Short-window rate: slope over the last SHORT_WINDOW_POLLS observations
+    let shortWindowRate = 0;
+    if (recentObservations.length >= SHORT_WINDOW_POLLS) {
+      const oldest = recentObservations[0];
+      const windowSecs = Math.max(1, (lastObservationAt - oldest.observedAt) / 1000);
+      shortWindowRate = Math.max(0, (waitingCount - oldest.count) / windowSecs);
+    }
+
+    effectiveGrowthRate = Math.max(
+      lastPollRate,
+      shortWindowRate,
+      smoothedGrowthRate,
+      EMERGENCY_SURGE_RATE,
+    );
   }
   prevWaitingCount = waitingCount;
+
+  // ─── Periodic bias correction refresh ─────────────────────────────────────
+  // Recomputes median(actual - target) from recent position_tracking records.
+  // Only runs every BIAS_REFRESH_EVERY ticks and only when we have enough data.
+  biasPollCount++;
+  if (biasPollCount % BIAS_REFRESH_EVERY === 0) {
+    PositionTracking.medianRecentError(30).then((med) => {
+      if (med !== null) {
+        biasCorrection = med;
+        console.log(`[PosTracking] Bias correction updated: ${biasCorrection > 0 ? '+' : ''}${biasCorrection.toFixed(1)} positions`);
+      }
+    }).catch(() => {}); // non-blocking — ignore DB errors here
+  }
 
   // One pass — O(n) with n = number of watches; each lookup is O(1) Map op
   const returnedFromTerminal = []; // drivers SAN auto-returned to V Holding mid-terminal
@@ -569,7 +648,18 @@ async function poll() {
       if (prev !== 'dispatched') state.lastDispatchAt = new Date();
       next = 'dispatched';
     } else if (inWaiting) {
-      if (!state.hasBeenSeen) state.hasBeenSeen = true;
+      if (!state.hasBeenSeen) {
+        state.hasBeenSeen = true;
+        // Driver just appeared in queue — record actual landing position
+        if (state.pendingTrackingId && livePosition) {
+          PositionTracking.updateActualPosition(state.pendingTrackingId, livePosition)
+            .then(() => {
+              console.log(`[PosTracking] #${state.vehicleNumber} landed at ${livePosition} (target was recorded)`);
+              state.pendingTrackingId = null;
+            })
+            .catch((err) => console.error('[PosTracking] Failed to update actual position:', err.message));
+        }
+      }
       state.lastSeenAt = new Date();
       // If transitioning from at_terminal → in_queue, SAN auto-returned the driver
       // to V Holding before the terminal poll could detect they'd left. Collect for
@@ -718,20 +808,22 @@ async function poll() {
   // positionFiredToday also survives queue resets: once fired it stays true for
   // the rest of the day regardless of what happens to the queue.
   //
-  // Dynamic lead: estimatedDrift = effectiveGrowthRate × (poll_staleness + bot_exec_time) / poll_interval
-  // The +1 term accounts for poll staleness: the snapshot we're reading may already be up to
-  // one full poll interval (90 s) old before the bot even starts. Adding 1.0 to the fraction
-  // means we project drift across both the staleness window AND the bot execution window.
-  //   botTimeFraction = (45 000 / 90 000) + 1.0 = 1.5  →  1.5 poll-intervals of growth covered
-  // The hard floor of 20 ensures the bot fires early enough on calm days even when growth ≈ 0,
-  // preventing systematic undershoots like 115→187 seen on surge mornings.
+  // Dynamic lead using real poll age + bot execution time (both in seconds).
+  // horizonSeconds = how far into the future we need to predict queue size:
+  //   pollAgeSeconds  — data already stale by this many seconds when we read it
+  //   POS_BOT_EXEC_MS — bot takes this long to execute and claim the slot
+  // estimatedDrift = rate(drivers/sec) × horizonSeconds → positions added during that window.
+  // biasCorrection  — median of recent (actual - target) landing errors from position_tracking.
+  //   If positive (we keep landing too far back), the prediction is bumped up so the bot fires earlier.
+  // Floor of 20 ensures the bot fires early enough on slow-growth mornings.
   if (isWithinPositionHours()) {
   const todayDayStr = new Date().toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/Los_Angeles' });
   const DAY_KEY_MAP = { Sun: '0', Mon: '1', Tue: '2', Wed: '3', Thu: '4', Fri: '5', Sat: '6' };
   const todayDayKey = DAY_KEY_MAP[todayDayStr];
 
-  const botTimeFraction  = (POS_BOT_EXEC_MS / POLL_INTERVAL_MS) + 1; // +1 covers poll-staleness window
-  const estimatedDrift   = Math.max(20, Math.ceil(effectiveGrowthRate * botTimeFraction));
+  const pollAgeSeconds   = lastObservationAt ? (Date.now() - lastObservationAt) / 1000 : POLL_INTERVAL_MS / 1000;
+  const horizonSeconds   = pollAgeSeconds + (POS_BOT_EXEC_MS / 1000) + SAFETY_BUFFER_SECS;
+  const estimatedDrift   = Math.max(20, Math.ceil(effectiveGrowthRate * horizonSeconds));
 
   for (const [driverId, state] of watches) {
     // Resolve today's effective position — skips drivers with no target today
@@ -757,19 +849,23 @@ async function poll() {
       continue;
     }
 
-    // Fire when projected landing position (queue + drift during bot run) hits target
-    const projectedLanding = waitingCount + estimatedDrift;
+    // Fire when (projected landing + bias correction) reaches the target.
+    // biasCorrection > 0 means we've been landing too far back historically —
+    // adding it to the projection makes the bot fire earlier to compensate.
+    const projectedLanding = waitingCount + estimatedDrift + biasCorrection;
     if (projectedLanding >= effectivePosition) {
       console.log(
-        `[Pos] #${state.vehicleNumber} — ✓ queue ${waitingCount} + drift ${estimatedDrift} ` +
-        `= ${projectedLanding} ≥ ${effectivePosition} (growth: ${Math.round(effectiveGrowthRate)}/tick) — firing bot`,
+        `[Pos] #${state.vehicleNumber} — ✓ queue ${waitingCount} + drift ${estimatedDrift}` +
+        `${biasCorrection !== 0 ? ` + bias ${biasCorrection.toFixed(1)}` : ''} ` +
+        `= ${projectedLanding.toFixed(1)} ≥ ${effectivePosition} ` +
+        `(rate: ${effectiveGrowthRate.toFixed(2)}/s, horizon: ${(pollAgeSeconds + POS_BOT_EXEC_MS/1000).toFixed(0)}s) — firing bot`,
       );
       state.positionFiredToday = true; // mark before enqueuing — prevents double-trigger
-      triggerPositionSchedule(driverId, state, effectivePosition).catch(console.error);
+      triggerPositionSchedule(driverId, state, effectivePosition, { growthRate: effectiveGrowthRate, estimatedDrift }).catch(console.error);
     } else {
       console.log(
         `[Pos] #${state.vehicleNumber} — waiting ` +
-        `(queue: ${waitingCount}, drift: ${estimatedDrift}, projected: ${projectedLanding}, target: ${effectivePosition})`,
+        `(queue: ${waitingCount}, drift: ${estimatedDrift}, bias: ${biasCorrection.toFixed(1)}, projected: ${projectedLanding.toFixed(1)}, target: ${effectivePosition})`,
       );
     }
   }
@@ -1080,6 +1176,11 @@ function stopMonitor() {
   manualWatchIds.clear();
   prevWaitingCount   = null;
   smoothedGrowthRate = 0;
+  lastObservationAt  = null;
+  prevObservationAt  = null;
+  biasCorrection     = 0;
+  biasPollCount      = 0;
+  recentObservations.length = 0;
 }
 
 /** Seconds until next scheduled poll. */

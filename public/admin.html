@@ -453,6 +453,9 @@
       <span class="icon">🔍</span><span>Queue Monitor</span>
       <span id="monitor-live-dot" style="display:none;margin-left:auto;width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);"></span>
     </button>
+    <button class="nav-link" data-page="page-pos-tracking">
+      <span class="icon">🎯</span><span>Position Accuracy</span>
+    </button>
   </div>
 
   <div class="sidebar-footer">
@@ -817,6 +820,41 @@
     </div>
   </div>
 
+
+  <!-- ── Position Accuracy page ────────────────────────────────────────────── -->
+  <div class="page" id="page-pos-tracking">
+    <div class="page-header">
+      <h1>Position Accuracy</h1>
+      <p>Where drivers targeted vs where they actually landed</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Date / Time</th>
+          <th>Driver</th>
+          <th>Vehicle</th>
+          <th>Target</th>
+          <th>Queue at Fire</th>
+          <th>Drift Used</th>
+          <th>Growth Rate</th>
+          <th>Actual</th>
+          <th>Diff</th>
+        </tr></thead>
+        <tbody id="pos-tracking-body">
+          <tr><td colspan="9" style="text-align:center;color:var(--muted2);padding:24px;">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="pos-tracking-pagination" style="display:none; align-items:center; justify-content:space-between;
+         padding:14px 24px 20px; gap:12px; flex-wrap:wrap;">
+      <span id="pos-tracking-page-info" style="font-size:13px;color:var(--muted2);"></span>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-ghost btn-sm" id="pos-tracking-prev">← Prev</button>
+        <button class="btn btn-ghost btn-sm" id="pos-tracking-next">Next →</button>
+      </div>
+    </div>
+  </div>
+
 </main>
 
 <!-- ══════════════════════════ ADD/EDIT DRIVER MODAL ══════════════════════════ -->
@@ -1102,6 +1140,7 @@
 <script src="/js/admin/overview.controller.js"></script>
 <script src="/js/admin/watchlist.controller.js"></script>
 <script src="/js/admin/monitor.controller.js"></script>
+<script src="/js/admin/posTracking.controller.js"></script>
 <script src="/js/admin/auth.controller.js"></script>
 <script src="/js/admin/app.js"></script>
 <script>

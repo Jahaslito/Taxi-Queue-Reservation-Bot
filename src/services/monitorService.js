@@ -128,13 +128,15 @@ function buildPollDispatcher() {
 
   // Embed credentials into the proxy URL so undici ProxyAgent can authenticate.
   // Format: http://user:pass@host:port  (works for HTTP CONNECT tunnelling)
+  // Normalise: add http:// if the server value has no protocol.
+  const normalised = /^https?:\/\//i.test(server) ? server : `http://${server}`;
   let proxyUrl;
   try {
-    const u = new URL(server);
-    if (user) { u.username = user; u.password = pass; }
+    const u = new URL(normalised);
+    if (user) { u.username = encodeURIComponent(user); u.password = encodeURIComponent(pass); }
     proxyUrl = u.toString();
   } catch {
-    proxyUrl = server; // already has creds embedded, or plain host
+    proxyUrl = normalised;
   }
 
   console.log('[Monitor] Proxy enabled for polling →', new URL(proxyUrl).host);
@@ -332,9 +334,18 @@ function parseTerminalPage(html) {
   return vehicles;
 }
 
+// ─── Recent requeue events ring buffer (survives page navigations) ───────────
+const MAX_RECENT_EVENTS = 50;
+const recentRequeuEvents = [];   // newest first
+
 // ─── SSE broadcast ───────────────────────────────────────────────────────────
 function broadcast(type, payload) {
-  emitter.emit('event', { type, payload, ts: Date.now() });
+  const ts = Date.now();
+  if (type === 'requeue_result') {
+    recentRequeuEvents.unshift({ type, payload, ts });
+    if (recentRequeuEvents.length > MAX_RECENT_EVENTS) recentRequeuEvents.length = MAX_RECENT_EVENTS;
+  }
+  emitter.emit('event', { type, payload, ts });
 }
 
 // ─── State snapshot (safe for JSON / SSE) ────────────────────────────────────
@@ -1093,6 +1104,7 @@ function getState() {
     pollIntervalMs:   POLL_INTERVAL_MS,
     queueUrl:         QUEUE_URL,
     watches:          [...watches.values()].map(snap),
+    recentEvents:     recentRequeuEvents.slice(),
     jobQueue: {
       active:  jobQueue.activeCount,
       pending: jobQueue.pendingCount,

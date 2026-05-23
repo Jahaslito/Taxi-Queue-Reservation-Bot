@@ -98,7 +98,7 @@ async function loadDrivers(page) {
             <div style="display:flex;gap:6px;">
               <button class="btn btn-trigger btn-sm" data-action="trigger"    data-id="${Number(d.id)}" data-name="${esc(d.name)}">▶ Run</button>
               <button class="btn btn-ghost btn-sm"   data-action="edit"       data-id="${Number(d.id)}">Edit</button>
-              <button class="btn btn-ghost btn-sm"   data-action="send-reset" data-id="${Number(d.id)}" data-name="${esc(d.name)}" data-email="${esc(d.email || '')}" title="Send password reset email">🔑</button>
+              <button class="btn btn-ghost btn-sm"   data-action="send-reset" data-id="${Number(d.id)}" data-name="${esc(d.name)}" data-email="${esc(d.email || '')}" title="Send password reset email">Reset Password</button>
             </div>
           </td>
         </tr>`;
@@ -111,9 +111,12 @@ async function loadDrivers(page) {
 }
 
 // ─── Confirm dialog (promise-based) ──────────────────────────────────────────
-function showConfirm(message) {
+function showConfirm(message, { title = 'Run Bot', okLabel = 'Run Now', icon = '▶' } = {}) {
   return new Promise(resolve => {
     document.getElementById('confirm-message').textContent = message;
+    document.getElementById('confirm-title').textContent   = title;
+    document.getElementById('confirm-icon').textContent    = icon;
+    document.getElementById('btn-confirm-ok').textContent  = okLabel;
     document.getElementById('confirm-modal').classList.add('open');
 
     function onOk()     { cleanup(); resolve(true);  }
@@ -172,7 +175,7 @@ async function sendPasswordReset(id, name, email, btn) {
     showToast(`${esc(name)} has no email address — add one via Edit first.`, 'error', 5000);
     return;
   }
-  if (!await showConfirm(`Send a password reset link to ${esc(name)} (${esc(email)})?`)) return;
+  if (!await showConfirm(`Send a password reset link to ${esc(name)} (${esc(email)})?`, { title: 'Send Email', okLabel: 'Send', icon: '✉️' })) return;
 
   const originalHTML = btn.innerHTML;
   btn.disabled = true;

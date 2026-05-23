@@ -151,6 +151,16 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
 
     page = await context.newPage();
 
+    // Block fonts, images, media and stylesheets — the bot only needs page logic,
+    // not visual rendering. This cuts proxy bandwidth by ~60-70%.
+    await page.route('**/*', route => {
+      const type = route.request().resourceType();
+      if (['image', 'font', 'stylesheet', 'media'].includes(type)) {
+        return route.abort();
+      }
+      return route.continue();
+    });
+
     // ─── STEP 1: Navigate ─────────────────────────────────────────────────────
     // With a valid saved session the app loads directly (no OIDC redirect).
     // Without one (first run or expired) SAN redirects to the identity server.

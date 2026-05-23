@@ -259,6 +259,20 @@ function connectSSE() {
         monitorWatches = {};
         (p.watches || []).forEach(w => { monitorWatches[w.driverId] = w; });
         document.getElementById('mon-queue-url').textContent = p.queueUrl || '';
+
+        // Hydrate event log from server ring buffer so events survive page navigations
+        if (p.recentEvents?.length) {
+          monitorEvents = p.recentEvents.map(e => ({
+            driverId:      e.payload.driverId,
+            driverName:    e.payload.driverName || '—',
+            vehicleNumber: e.payload.vehicleNumber,
+            result:        e.payload.result,
+            ts:            e.ts ? new Date(e.ts) : new Date(),
+          }));
+          document.getElementById('monitor-events-wrap').style.display = 'block';
+          renderEventsTable();
+        }
+
         renderWatches();
         updateStatusBar();
         if (p.operatingHours) updateHoursBanner(p.operatingHours);

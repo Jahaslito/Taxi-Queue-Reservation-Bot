@@ -42,6 +42,7 @@ const { EventEmitter }    = require('events');
 const Driver              = require('../models/Driver');
 const Log                 = require('../models/Log');
 const PositionTracking    = require('../models/PositionTracking');
+const QueueSnapshot       = require('../models/QueueSnapshot');
 
 // ─── Constants (overridable via env for testing / tuning) ────────────────────
 // POLL_INTERVAL_MS is the maximum (idle) cadence. Adaptive polling tightens to
@@ -856,16 +857,19 @@ async function poll() {
   recentObservations.push({ count: waitingCount, observedAt: lastObservationAt });
   if (recentObservations.length > SHORT_WINDOW_POLLS + 1) recentObservations.shift();
 
+  // Hoisted so the snapshot recording below has access to the raw signals.
+  let lastPollRate        = null;
+  let shortWindowRate     = null;
   let effectiveGrowthRate = EMERGENCY_SURGE_RATE; // floor — never starts at zero
   if (prevWaitingCount !== null && prevObservationAt !== null) {
     const secondsElapsed = Math.max(1, (lastObservationAt - prevObservationAt) / 1000);
     const rawGrowth      = Math.max(0, waitingCount - prevWaitingCount);
-    const lastPollRate   = rawGrowth / secondsElapsed;
+    lastPollRate         = rawGrowth / secondsElapsed;
 
     smoothedGrowthRate = smoothedGrowthRate * 0.3 + lastPollRate * 0.7; // EMA α=0.7
 
     // Short-window rate: slope over the last SHORT_WINDOW_POLLS observations
-    let shortWindowRate = 0;
+    shortWindowRate = 0;
     if (recentObservations.length >= SHORT_WINDOW_POLLS) {
       const oldest = recentObservations[0];
       const windowSecs = Math.max(1, (lastObservationAt - oldest.observedAt) / 1000);
@@ -880,6 +884,25 @@ async function poll() {
     );
   }
   prevWaitingCount = waitingCount;
+
+  // ─── Snapshot for burst-pattern analysis ─────────────────────────────────
+  // Fire-and-forget. One row per poll captures the full queue + prediction
+  // state so we can later analyse position-dependent growth bursts
+  // (e.g. "queue surges around position 115 on Saturdays at 5:30 AM").
+  // The scheduler doesn't use this data at runtime — it's pure data collection.
+  QueueSnapshot.record({
+    waitingCount,
+    dispatchedCount:     dispatched.size,
+    notAuthorizedCount:  notAuthorized.size,
+    lastPollRate,
+    shortWindowRate,
+    smoothedGrowthRate,
+    effectiveGrowthRate,
+    botP95Ms:            botExecutionEstimateMs(),
+    botLatencySamples:   botLatencySamples.length,
+    biasCorrection,
+    pollIntervalMs:      currentPollDelayMs,
+  }).catch((err) => console.error('[QueueSnapshot] insert failed:', err.message));
 
   // ─── Periodic bias correction refresh ─────────────────────────────────────
   // Recomputes median(actual - target) from recent position_tracking records.

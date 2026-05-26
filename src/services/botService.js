@@ -14,7 +14,7 @@ function sanitizeError(msg = '') {
   if (m.includes('net::err') || m.includes('name not resolved') || m.includes('connection refused') || m.includes('econnrefused'))
     return 'Could not reach the SAN website — please try again';
   if (m.includes('invalid') || m.includes('incorrect') || m.includes('wrong') || m.includes('credentials'))
-    return 'Invalid SAN username or password — check your credentials';
+    return 'Invalid SAN eDispatch username or password — check your credentials';
   if (m.includes('not found'))
     return 'Vehicle number not found in SAN eDispatch';
   if (m.includes('navigation') || m.includes('page crashed'))
@@ -211,7 +211,7 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
         await debugCapture(page, vehicleNumber, 'invalid_credentials').catch(() => {});
         // The literal substring "Invalid SAN" is what sanitizeError matches
         // and what schedulerService.isTransientError keys off — keep it.
-        throw new Error('Invalid SAN username or password — check your credentials');
+        throw new Error('Invalid SAN eDispatch username or password — check your credentials');
       }
 
       console.log(`[Bot] ${vehicleNumber} → OIDC callback complete — back on eDispatch.`);

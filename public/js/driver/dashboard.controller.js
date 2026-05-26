@@ -66,7 +66,7 @@ async function loadDashboard() {
     document.getElementById('dash-verify-banner').style.display = needsVerify ? 'block' : 'none';
 
     const statusData = await api('/api/driver/status/today');
-    renderTodayStatus(statusData.todayLog);
+    renderTodayStatus(statusData);
 
     const logsData = await api('/api/driver/logs?limit=5');
     renderDashLogs(logsData.logs);
@@ -79,23 +79,39 @@ async function loadDashboard() {
 }
 
 // ─── Remove-from-queue button visibility ──────────────────────────────────────
-// Show the red "Remove from Queue" button ONLY when today's status indicates
-// the driver is currently in V Holding (status: success / already_queued with
-// a queue_position). Hide otherwise so the button doesn't appear when it would
-// have nothing to remove.
-function updateRemoveQueueButtonVisibility(log) {
+// Show the red "Remove from Queue" button whenever the driver is observably in
+// the queue RIGHT NOW. Source of truth is the monitor's live state
+// (statusData.liveQueueState), not the log table — a stale log row may have a
+// different status (pending requeue, monitor_requeue) even while the driver is
+// still sitting in V Holding.
+//
+// Fallback to the log-based check only if the monitor has no opinion (driver
+// not currently watched, monitor service unreachable, etc.) so we degrade
+// gracefully rather than hiding the button when in doubt.
+function updateRemoveQueueButtonVisibility(statusData) {
   const btn = document.getElementById('btn-remove-queue');
   if (!btn) return;
-  const isInQueue = log
-    && (log.status === 'success' || log.status === 'already_queued')
-    && Number.isFinite(log.queue_position);
+  const live = statusData && statusData.liveQueueState;
+  let isInQueue;
+  if (live) {
+    isInQueue = live.inQueue === true;
+  } else {
+    const log = statusData && statusData.todayLog;
+    isInQueue = log
+      && (log.status === 'success' || log.status === 'already_queued')
+      && Number.isFinite(log.queue_position);
+  }
   btn.style.display = isInQueue ? 'flex' : 'none';
 }
 
 // ─── Today status card ────────────────────────────────────────────────────────
-function renderTodayStatus(log) {
+// `statusData` is the full /api/driver/status/today payload (todayLog + liveQueueState).
+// Accepting the whole payload — not just `todayLog` — lets us key the
+// Remove-from-Queue button off the monitor's live state instead of stale log rows.
+function renderTodayStatus(statusData) {
   // Show or hide the "Remove from Queue" button based on current state
-  updateRemoveQueueButtonVisibility(log);
+  updateRemoveQueueButtonVisibility(statusData);
+  const log = statusData && statusData.todayLog;
 
   const el = document.getElementById('today-status-content');
 
@@ -227,7 +243,7 @@ async function triggerRequeue() {
       }
 
       // ── Update UI (isolated so a render error never swallows the toast) ───
-      try { renderTodayStatus(statusData.todayLog); } catch {}
+      try { renderTodayStatus(statusData); } catch {}
       try { renderDashLogs(logsData.logs);           } catch {}
 
       // ── Decide if we're done ──────────────────────────────────────────────
@@ -365,7 +381,7 @@ async function performRemoveFromQueue() {
       dashBtn.style.display = 'none';
       // Refresh status so the dashboard updates
       const statusData = await api('/api/driver/status/today');
-      renderTodayStatus(statusData.todayLog);
+      renderTodayStatus(statusData);
     } else if (data && data.reason === 'not_in_queue') {
       // Soft failure — driver wasn't in queue to begin with
       showToast('ℹ ' + (data.message || 'You are not in the queue.'), 'success', 4000);

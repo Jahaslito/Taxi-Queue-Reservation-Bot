@@ -9,6 +9,11 @@ flyers
 tests
 jest.config.js
 deploy
-scripts
+# Ops scripts (create-admin, backfill-position-tracking) ship with the image
+# so they can be run via `docker compose exec app node scripts/<name>.js`.
+# Dev / one-shot scripts are explicitly excluded so they don't bloat the image.
+scripts/migrate-sqlite-to-pg.js
+scripts/simulate_position.js
+scripts/generate-pwa-icons.js
 *.log
 .DS_Store

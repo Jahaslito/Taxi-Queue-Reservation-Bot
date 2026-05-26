@@ -155,7 +155,28 @@ async function getTodayStatus(req, res, next) {
       Driver.findById(req.driverId),
     ]);
 
-    res.json({ todayLog: todayLog || null, driver });
+    // Pull the monitor's live view of this driver. The monitor is the source of
+    // truth for "is this driver currently in the queue right now" — the log
+    // table only reflects what the bot did, not the current SAN state. The
+    // "Remove from Queue" button uses this so it shows whenever the driver is
+    // observably in the queue, regardless of which log row is most recent.
+    let liveQueueState = null;
+    try {
+      // Lazy-require avoids the circular import chain
+      // (monitorService → schedulerService → controllers).
+      const monitorService = require('../services/monitorService');
+      const state = monitorService.getState();
+      const watch = state.watches.find((w) => w.driverId === req.driverId);
+      if (watch) {
+        liveQueueState = {
+          state:           watch.state,           // watching|in_queue|dispatched|at_terminal|requeuing
+          inQueue:         watch.state === 'in_queue',
+          currentPosition: watch.currentPosition ?? null,
+        };
+      }
+    } catch { /* monitor unavailable — fall back to log-based UI */ }
+
+    res.json({ todayLog: todayLog || null, driver, liveQueueState });
   } catch (err) {
     next(err);
   }

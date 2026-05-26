@@ -30,10 +30,14 @@ function showToast(msg, type = 'success', duration = 3500) {
 
 // ─── API helper ──────────────────────────────────────────────────────────────
 function friendlyNetworkError() {
-  if (location.protocol === 'https:') {
-    return 'Connection failed — please open this page using http:// instead of https://';
+  // Local-dev only: warn when accidentally hitting https on a non-TLS dev server.
+  // In production the site is always HTTPS (required for PWA install + service
+  // workers), so this branch never fires.
+  const isLocal = ['localhost', '127.0.0.1'].includes(location.hostname);
+  if (isLocal && location.protocol === 'https:') {
+    return 'Local dev tip — open this page via http:// instead of https://';
   }
-  return 'Cannot connect to the server. Please make sure the server is running.';
+  return 'Connection failed. Please check your internet and try again.';
 }
 
 function friendlyHttpError(status, serverMsg) {

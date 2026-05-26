@@ -947,18 +947,22 @@ async function poll() {
       if (prev !== 'dispatched') state.lastDispatchAt = new Date();
       next = 'dispatched';
     } else if (inWaiting) {
-      if (!state.hasBeenSeen) {
-        state.hasBeenSeen = true;
-        // Driver just appeared in queue — record actual landing position
-        if (state.pendingTrackingId && livePosition) {
-          PositionTracking.updateActualPosition(state.pendingTrackingId, livePosition)
-            .then(() => {
-              console.log(`[PosTracking] #${state.vehicleNumber} landed at ${livePosition} (target was recorded)`);
-              state.pendingTrackingId = null;
-            })
-            .catch((err) => console.error('[PosTracking] Failed to update actual position:', err.message));
-        }
+      // Record actual landing position whenever we see a fired driver in the
+      // queue with a pending tracking row — independent of hasBeenSeen, which
+      // _runBot already flips to true on success. Gating on hasBeenSeen used to
+      // mean successful bot fires NEVER landed their actual_position (the bot
+      // set hasBeenSeen=true before the next poll could observe the entry),
+      // so every successful fire showed up as "pending" in the admin UI.
+      // pendingTrackingId is the single-shot guard: cleared before awaiting
+      // to prevent a second poll racing this update.
+      if (state.pendingTrackingId && livePosition) {
+        const trackingId = state.pendingTrackingId;
+        state.pendingTrackingId = null;
+        PositionTracking.updateActualPosition(trackingId, livePosition)
+          .then(() => console.log(`[PosTracking] #${state.vehicleNumber} landed at ${livePosition} (target was recorded)`))
+          .catch((err) => console.error('[PosTracking] Failed to update actual position:', err.message));
       }
+      if (!state.hasBeenSeen) state.hasBeenSeen = true;
       state.lastSeenAt = new Date();
       // If transitioning from at_terminal → in_queue, SAN auto-returned the driver
       // to V Holding before the terminal poll could detect they'd left. Collect for

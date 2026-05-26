@@ -60,6 +60,12 @@
     .view { display: none; flex-direction: column; min-height: 100vh; padding: 0 20px 40px; position: relative; z-index: 1; }
     .view.active { display: flex; }
 
+    /* Boot splash — shown until the profile fetch resolves and the boot script
+       routes to the correct view. Prevents a flash of the login screen during
+       post-Stripe redirects, page reloads, etc. */
+    #view-splash { align-items: center; justify-content: center; padding: 0; }
+    .splash-dot { width: 14px; height: 14px; border-radius: 50%; background: var(--teal); box-shadow: 0 0 24px var(--teal); animation: pulse 1.4s ease-in-out infinite; }
+
     /* ── Header ── */
     .app-header {
       display: flex; align-items: center; justify-content: space-between;
@@ -342,8 +348,13 @@
 </head>
 <body>
 
+<!-- ════════════════════════════════════════════ BOOT SPLASH ════ -->
+<div class="view active" id="view-splash">
+  <div class="splash-dot"></div>
+</div>
+
 <!-- ════════════════════════════════════════════════ LOGIN VIEW ════ -->
-<div class="view active" id="view-login">
+<div class="view" id="view-login">
   <header class="app-header">
     <div class="logo">
       <div class="logo-dot"></div>

@@ -64,7 +64,9 @@ describe('POST /api/auth/driver/register', () => {
     const tokenCookie = cookies.find(c => c.startsWith('token='));
     expect(tokenCookie).toBeDefined();
     expect(tokenCookie).toMatch(/HttpOnly/i);
-    expect(tokenCookie).toMatch(/SameSite=Strict/i);
+    // 'Lax' (not 'Strict') so the cookie rides along on top-level navigations
+    // from external sites — required for the Stripe Checkout return flow.
+    expect(tokenCookie).toMatch(/SameSite=Lax/i);
   });
 
   // 7 — Duplicate email

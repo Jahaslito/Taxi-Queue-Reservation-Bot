@@ -68,13 +68,47 @@ jobs:
             set -euo pipefail
             cd /opt/san-queue
 
+            # ─── Capture the currently-deployed SHA BEFORE we change anything ───
+            # Needed by the rollback path below. We use the commit SHA (not the
+            # tag/branch name) because tags can be moved and branches advance —
+            # the SHA pinpoints exactly the version that was running.
+            PREVIOUS_SHA=$(git rev-parse HEAD)
+            echo "── Previous version: $PREVIOUS_SHA ──"
+
             echo "── Pulling ref: ${{ steps.ref.outputs.ref }} ──"
             git fetch --tags origin
             git checkout ${{ steps.ref.outputs.ref }}
             git reset --hard ${{ steps.ref.outputs.ref }}
 
+            NEW_SHA=$(git rev-parse HEAD)
+            echo "── New version: $NEW_SHA ──"
+
+            # ─── Rollback helper ─────────────────────────────────────────────────
+            # Restores the previous SHA, rebuilds the image, and waits for /health.
+            # Called on migration failure OR health-check timeout. Migrations only
+            # add columns (never drop), so reverting code to PREVIOUS_SHA is safe
+            # even if new migrations already ran — old code ignores new columns.
+            rollback() {
+              echo "── Rolling back to $PREVIOUS_SHA ──"
+              git reset --hard "$PREVIOUS_SHA"
+              docker compose up -d --build --no-deps app
+              for i in $(seq 1 12); do
+                STATUS=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:3000/api/health || echo "000")
+                if [ "$STATUS" = "200" ]; then
+                  echo "✓ Rolled back successfully — production restored to $PREVIOUS_SHA"
+                  return 0
+                fi
+                echo "  rollback health-check waiting… (${i}/12)"
+                sleep 5
+              done
+              echo "⚠ Rollback rebuild started but health check did NOT recover"
+              echo "⚠ Manual intervention required — SSH in and inspect"
+              docker compose logs --tail=80 app
+              return 1
+            }
+
             echo "── Running database migrations ──"
-            docker compose run --rm app node -e "
+            if ! docker compose run --rm app node -e "
               process.env.DATABASE_SSL = 'false';
               const knex = require('knex')(require('./knexfile').production);
               knex.migrate.latest()
@@ -84,7 +118,11 @@ jobs:
                   process.exit(0);
                 })
                 .catch(e => { console.error(e.message); process.exit(1); });
-            "
+            "; then
+              echo "✗ Migrations failed — rolling back"
+              rollback || true
+              exit 1
+            fi
 
             echo "── Rebuilding and restarting app ──"
             docker compose up -d --build --no-deps app
@@ -93,15 +131,16 @@ jobs:
             for i in $(seq 1 18); do
               STATUS=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:3000/api/health || echo "000")
               if [ "$STATUS" = "200" ]; then
-                echo "✓ Production healthy after ${i}x5s"
+                echo "✓ Production healthy after ${i}x5s — deploy of $NEW_SHA complete"
                 exit 0
               fi
               echo "  waiting… (${i}/18)"
               sleep 5
             done
+
             echo "✗ Health check timed out — rolling back"
-            git stash
-            docker compose up -d --build --no-deps app
+            docker compose logs --tail=60 app
+            rollback || true
             exit 1
 
       - name: Notify success

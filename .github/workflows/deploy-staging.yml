@@ -42,13 +42,43 @@ jobs:
             set -euo pipefail
             cd /opt/san-queue
 
+            # ─── Capture previously-running SHA for the rollback path ───────────
+            # Mirrors deploy-production.yml so both workflows have consistent
+            # behaviour. Migrations only add columns, never drop, so reverting
+            # code is always safe even after migrations have already run.
+            PREVIOUS_SHA=$(git rev-parse HEAD)
+            echo "── Previous version: $PREVIOUS_SHA ──"
+
             echo "── Pulling latest code ──"
             git fetch origin
             git checkout main
             git reset --hard origin/main
 
+            NEW_SHA=$(git rev-parse HEAD)
+            echo "── New version: $NEW_SHA ──"
+
+            # ─── Rollback helper ─────────────────────────────────────────────────
+            rollback() {
+              echo "── Rolling back staging to $PREVIOUS_SHA ──"
+              git reset --hard "$PREVIOUS_SHA"
+              docker compose up -d --build --no-deps app
+              for i in $(seq 1 12); do
+                STATUS=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:3000/api/health || echo "000")
+                if [ "$STATUS" = "200" ]; then
+                  echo "✓ Rolled back successfully — staging restored to $PREVIOUS_SHA"
+                  return 0
+                fi
+                echo "  rollback health-check waiting… (${i}/12)"
+                sleep 5
+              done
+              echo "⚠ Rollback rebuild started but health check did NOT recover"
+              echo "⚠ Manual intervention required — SSH in and inspect"
+              docker compose logs --tail=80 app
+              return 1
+            }
+
             echo "── Running database migrations ──"
-            docker compose run --rm app node -e "
+            if ! docker compose run --rm app node -e "
               process.env.DATABASE_SSL = 'false';
               const knex = require('knex')(require('./knexfile').production);
               knex.migrate.latest()
@@ -58,7 +88,11 @@ jobs:
                   process.exit(0);
                 })
                 .catch(e => { console.error(e.message); process.exit(1); });
-            "
+            "; then
+              echo "✗ Migrations failed — rolling back"
+              rollback || true
+              exit 1
+            fi
 
             echo "── Rebuilding and restarting app ──"
             docker compose up -d --build --no-deps app
@@ -67,14 +101,16 @@ jobs:
             for i in $(seq 1 12); do
               STATUS=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:3000/api/health || echo "000")
               if [ "$STATUS" = "200" ]; then
-                echo "✓ Staging healthy after ${i}x5s"
+                echo "✓ Staging healthy after ${i}x5s — deploy of $NEW_SHA complete"
                 exit 0
               fi
               echo "  waiting… (${i}/12)"
               sleep 5
             done
-            echo "✗ Health check timed out"
-            docker compose logs --tail=40 app
+
+            echo "✗ Health check timed out — rolling back"
+            docker compose logs --tail=60 app
+            rollback || true
             exit 1
 
       - name: Notify success

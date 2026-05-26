@@ -51,8 +51,10 @@ jobs:
 
             echo "── Pulling latest code ──"
             git fetch origin
-            git checkout main
+            # Reset directly instead of checkout + reset — handles any local
+            # drift cleanly. Target ref is the source of truth.
             git reset --hard origin/main
+            git clean -fd
 
             NEW_SHA=$(git rev-parse HEAD)
             echo "── New version: $NEW_SHA ──"
@@ -61,6 +63,7 @@ jobs:
             rollback() {
               echo "── Rolling back staging to $PREVIOUS_SHA ──"
               git reset --hard "$PREVIOUS_SHA"
+              git clean -fd
               docker compose up -d --build --no-deps app
               for i in $(seq 1 12); do
                 STATUS=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:3000/api/health || echo "000")

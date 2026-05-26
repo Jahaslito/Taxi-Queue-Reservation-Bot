@@ -77,8 +77,14 @@ jobs:
 
             echo "── Pulling ref: ${{ steps.ref.outputs.ref }} ──"
             git fetch --tags origin
-            git checkout ${{ steps.ref.outputs.ref }}
+            # Use reset --hard directly (instead of checkout + reset) so any
+            # uncommitted local drift on the droplet — e.g. emergency hotfix
+            # scp'd before this commit hit git — is wiped cleanly. The target
+            # ref is the source of truth.
             git reset --hard ${{ steps.ref.outputs.ref }}
+            # Remove untracked files / dirs too so the working tree exactly
+            # matches the committed state.
+            git clean -fd
 
             NEW_SHA=$(git rev-parse HEAD)
             echo "── New version: $NEW_SHA ──"
@@ -91,6 +97,7 @@ jobs:
             rollback() {
               echo "── Rolling back to $PREVIOUS_SHA ──"
               git reset --hard "$PREVIOUS_SHA"
+              git clean -fd
               docker compose up -d --build --no-deps app
               for i in $(seq 1 12); do
                 STATUS=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:3000/api/health || echo "000")

@@ -3,11 +3,12 @@
 // verification. Uses express.raw() locally.
 //
 // Registered events:
-//   checkout.session.completed   → subscription created / trial started
-//   customer.subscription.updated → status change (active, past_due, etc.)
-//   customer.subscription.deleted → subscription cancelled
-//   invoice.paid                 → payment succeeded → ensure status = active
-//   invoice.payment_failed       → payment failed → status = past_due
+//   checkout.session.completed         → subscription created / trial started
+//   customer.subscription.created      → fallback link if checkout.session.completed isn't subscribed
+//   customer.subscription.updated      → status change (active, past_due, etc.)
+//   customer.subscription.deleted      → subscription cancelled
+//   invoice.payment_succeeded / paid   → payment succeeded → ensure status = active
+//   invoice.payment_failed             → payment failed → status = past_due
 
 const express = require('express');
 const Driver  = require('../models/Driver');
@@ -64,6 +65,7 @@ router.post(
           break;
         }
 
+        case 'customer.subscription.created':
         case 'customer.subscription.updated':
         case 'customer.subscription.deleted': {
           const sub    = event.data.object;
@@ -73,22 +75,28 @@ router.post(
             break;
           }
 
+          // Also persist stripe_subscription_id here so the link is recoverable
+          // even if checkout.session.completed never reached this endpoint.
           await Driver.update(driver.id, {
-            subscription_status: sub.status,
-            trial_ends_at:       sub.trial_end ? new Date(sub.trial_end * 1000) : null,
+            stripe_subscription_id: sub.id,
+            subscription_status:    sub.status,
+            trial_ends_at:          sub.trial_end ? new Date(sub.trial_end * 1000) : null,
           });
 
           console.log(`[Stripe Webhook] Driver ${driver.id} ${event.type}: ${sub.status}`);
           break;
         }
 
-        case 'invoice.paid': {
+        // Stripe emits `invoice.payment_succeeded` on newer API versions;
+        // older accounts still see `invoice.paid`. Handle both.
+        case 'invoice.paid':
+        case 'invoice.payment_succeeded': {
           const invoice = event.data.object;
           const driver  = await Driver.findByStripeCustomerId(invoice.customer);
           if (!driver) break;
 
           await Driver.update(driver.id, { subscription_status: 'active' });
-          console.log(`[Stripe Webhook] Driver ${driver.id} invoice paid → active`);
+          console.log(`[Stripe Webhook] Driver ${driver.id} ${event.type} → active`);
           break;
         }
 

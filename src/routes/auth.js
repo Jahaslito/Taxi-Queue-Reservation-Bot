@@ -29,7 +29,13 @@ router.post(
     body('sanUsername').trim().notEmpty().withMessage('SAN username is required'),
     body('sanPassword').notEmpty().withMessage('SAN password is required'),
     body('vehicleNumber').trim().notEmpty().withMessage('Vehicle number is required'),
-    body('scheduledTime').matches(/^([01]\d|2[0-3]):[0-5]\d$/).withMessage('scheduledTime must be a valid HH:MM time (00:00–23:59)'),
+    // Schedule is configured after registration (time-based OR position-based)
+    // via the dashboard, so these fields are optional here. The registration
+    // endpoint just creates the account with no schedule set.
+    body('scheduledTime')
+      .optional({ checkFalsy: true })
+      .matches(/^([01]\d|2[0-3]):[0-5]\d$/)
+      .withMessage('scheduledTime must be a valid HH:MM time (00:00–23:59)'),
     body('scheduledDays')
       .optional({ checkFalsy: true })
       .matches(/^[0-6](,[0-6]){0,6}$/)

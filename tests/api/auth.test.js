@@ -36,7 +36,9 @@ describe('POST /api/auth/driver/register', () => {
     ['sanUsername is empty',        { ...validRegBody, sanUsername: '' }],
     ['sanPassword is empty',        { ...validRegBody, sanPassword: '' }],
     ['vehicleNumber is empty',      { ...validRegBody, vehicleNumber: '' }],
-    ['scheduledTime is missing',    { ...validRegBody, scheduledTime: undefined }],
+    // scheduledTime is now optional — drivers pick time-based vs position-based
+    // mode post-registration from the dashboard. Format is still validated
+    // if a value is supplied.
     ['scheduledTime is invalid',    { ...validRegBody, scheduledTime: '25:00' }],
     ['scheduledTime has no padding',{ ...validRegBody, scheduledTime: '5:00' }],
     ['scheduledDays has day 7',     { ...validRegBody, scheduledDays: '0,7' }],
@@ -67,6 +69,26 @@ describe('POST /api/auth/driver/register', () => {
     // 'Lax' (not 'Strict') so the cookie rides along on top-level navigations
     // from external sites — required for the Stripe Checkout return flow.
     expect(tokenCookie).toMatch(/SameSite=Lax/i);
+  });
+
+  // Registration without scheduledTime succeeds and stores null schedule fields.
+  // Drivers pick their schedule mode (time-based vs position-based) from the
+  // dashboard after creating the account — registering must NOT silently set
+  // a default 05:00 schedule for everyone, since that caused drivers who later
+  // chose position-based scheduling to still get auto-checked-in at 5 AM.
+  test('registration without scheduledTime succeeds and leaves schedule fields null', async () => {
+    const { scheduledTime, scheduledDays, daySchedules, ...bodyWithoutSchedule } = validRegBody;
+    const res = await request(app)
+      .post('/api/auth/driver/register')
+      .send(bodyWithoutSchedule);
+
+    expect(res.status).toBe(201);
+    expect(res.body.driver).toHaveProperty('id');
+
+    const row = await db('drivers').where({ id: res.body.driver.id }).first();
+    expect(row.scheduled_time).toBeNull();
+    expect(row.scheduled_days).toBeNull();
+    expect(row.day_schedules).toBeNull();
   });
 
   // 7 — Duplicate email

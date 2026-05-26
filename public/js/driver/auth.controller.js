@@ -109,14 +109,10 @@ document.getElementById('btn-register').addEventListener('click', async () => {
   const sanUsername   = document.getElementById('reg-san-username').value.trim();
   const sanPassword   = document.getElementById('reg-san-password').value;
   const vehicleNumber = document.getElementById('reg-vehicle').value.trim();
-  const hour          = document.getElementById('reg-time-hour').value;
-  const min           = document.getElementById('reg-time-min').value;
-  const scheduledTime = `${hour}:${min}`;
-  const scheduledDays = getDayPickerValue('reg-day-picker');
   const errEl         = document.getElementById('reg-error');
   errEl.textContent   = '';
 
-  if (!name || !appPassword || !sanUsername || !sanPassword || !vehicleNumber || !scheduledTime) {
+  if (!name || !appPassword || !sanUsername || !sanPassword || !vehicleNumber) {
     errEl.textContent = 'Please fill in all required fields'; return;
   }
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -129,7 +125,7 @@ document.getElementById('btn-register').addEventListener('click', async () => {
   try {
     const data = await api('/api/auth/driver/register', {
       method: 'POST',
-      body: JSON.stringify({ name, phone, email, appPassword, sanUsername, sanPassword, vehicleNumber, scheduledTime, scheduledDays }),
+      body: JSON.stringify({ name, phone, email, appPassword, sanUsername, sanPassword, vehicleNumber }),
     });
     showToast('Account created! Welcome 🎉');
     routeDriver(data.driver);

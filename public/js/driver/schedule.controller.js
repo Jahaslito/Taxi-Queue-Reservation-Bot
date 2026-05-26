@@ -1,22 +1,19 @@
 // ─── Driver Schedule Controller ───────────────────────────────────────────────
 // Handles: schedule summary display, per-day schedule modal, credential updates.
-// Also wires the day-picker click toggle for both the registration form
-// (reg-day-picker) and the schedule page (sched-day-picker).
+// Also wires the day-picker click toggle on the schedule page.
 // Depends on: utils.js (api, showToast, getDayPickerValue, driverProfile)
 
 const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const DAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-// ─── Day-picker toggle (registration + schedule pages) ───────────────────────
-['reg-day-picker', 'sched-day-picker'].forEach(pickerId => {
-  const picker = document.getElementById(pickerId);
-  if (picker) {
-    picker.addEventListener('click', e => {
-      const btn = e.target.closest('.day-btn');
-      if (btn) btn.classList.toggle('active');
-    });
-  }
-});
+// ─── Day-picker toggle (schedule page) ───────────────────────────────────────
+const schedPicker = document.getElementById('sched-day-picker');
+if (schedPicker) {
+  schedPicker.addEventListener('click', e => {
+    const btn = e.target.closest('.day-btn');
+    if (btn) btn.classList.toggle('active');
+  });
+}
 
 // ─── Schedule mode toggle ─────────────────────────────────────────────────────
 function setSchedMode(mode) {
@@ -198,15 +195,18 @@ function openDayScheduleModal(profile) {
 
   if (daySchedulesStr) {
     try { ds = JSON.parse(daySchedulesStr); } catch {}
-  } else if (profile && typeof profile === 'object') {
-    // Legacy fallback: build from scheduled_days + scheduled_time
+  } else if (profile && typeof profile === 'object' && profile.scheduled_time) {
+    // Legacy fallback — ONLY when the driver actually has a scheduled_time.
+    // Previously this defaulted to "all 7 days at 05:00" which silently turned
+    // a position-scheduled driver into a 5 AM time-scheduled driver on accidental
+    // save (because clicking Configure → Save would write the bogus defaults back).
     const activeDays = (profile.scheduled_days || '0,1,2,3,4,5,6').split(',').map(String);
     for (let d = 0; d < 7; d++) {
-      ds[String(d)] = activeDays.includes(String(d))
-        ? (profile.scheduled_time || '05:00')
-        : null;
+      ds[String(d)] = activeDays.includes(String(d)) ? profile.scheduled_time : null;
     }
   }
+  // Otherwise leave ds = {} so every day starts toggled OFF — the driver
+  // has to opt in explicitly before any time gets persisted.
 
   buildDayScheduleRows(ds);
   document.getElementById('day-schedule-modal').classList.add('open');
@@ -324,9 +324,18 @@ document.getElementById('btn-day-sched-save').addEventListener('click', async ()
   const daySchedules  = readDayScheduleRows();
   const ds            = JSON.parse(daySchedules);
   const activeDays    = Object.keys(ds).filter(k => ds[k] !== null);
+
+  // Refuse to save an empty schedule — mirrors the position-save guard.
+  // Without this, an accidental Save in the time modal would wipe out a
+  // driver's existing position schedule and replace it with a 5 AM default.
+  if (activeDays.length === 0) {
+    setError('sched-error', 'Enable at least one day before saving.');
+    return;
+  }
+
   const times         = activeDays.map(k => ds[k]).filter(Boolean);
-  const scheduledTime = times[0] || '05:00';
-  const scheduledDays = activeDays.join(',') || '0,1,2,3,4,5,6';
+  const scheduledTime = times[0];
+  const scheduledDays = activeDays.join(',');
 
   try {
     setError('sched-error', '');

@@ -45,15 +45,21 @@ async function registerDriver(req, res, next) {
       throw err;
     }
 
-    // Build day_schedules JSON
-    let daySchedulesJson;
+    // Schedule fields are configured after registration via the dashboard
+    // (drivers pick time-based OR position-based mode). Only build a
+    // day_schedules payload here if the caller actually supplied one — we
+    // explicitly do NOT default to "all days at 05:00" because that turned
+    // into a real bug: drivers who later set up a position schedule could
+    // still get auto-checked-in at 5 AM if the time fields weren't cleared
+    // by a subsequent edit.
+    let daySchedulesJson = null;
     if (daySchedules) {
       daySchedulesJson = daySchedules; // already a JSON string from frontend
-    } else {
+    } else if (scheduledTime) {
       const activeDays = (scheduledDays || '0,1,2,3,4,5,6').split(',').map(String);
       const ds = {};
       for (let d = 0; d < 7; d++) {
-        ds[String(d)] = activeDays.includes(String(d)) ? (scheduledTime || '05:00') : null;
+        ds[String(d)] = activeDays.includes(String(d)) ? scheduledTime : null;
       }
       daySchedulesJson = JSON.stringify(ds);
     }
@@ -70,8 +76,8 @@ async function registerDriver(req, res, next) {
       san_username:                   sanUsername,
       san_password:                   encrypt(sanPassword),
       vehicle_number:                 vehicleNumber,
-      scheduled_time:                 scheduledTime,
-      scheduled_days:                 scheduledDays || '0,1,2,3,4,5,6',
+      scheduled_time:                 scheduledTime || null,
+      scheduled_days:                 scheduledTime ? (scheduledDays || '0,1,2,3,4,5,6') : null,
       day_schedules:                  daySchedulesJson,
       email_verification_token:       verificationToken,
       email_verification_expires_at:  verificationExpires,

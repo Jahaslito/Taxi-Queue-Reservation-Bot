@@ -107,6 +107,31 @@ if ('serviceWorker' in navigator) {
   });
 }
 
+// ─── Manual refresh fallback ─────────────────────────────────────────────────
+// The controllerchange handler above auto-reloads when sw.js bumps its
+// CACHE_VERSION. But if the SW didn't change yet the UI looks stale (e.g.
+// a hotfix shipped without a version bump, or the SW hasn't re-checked),
+// users in standalone PWA mode have no pull-to-refresh. This button forces
+// an SW update check, purges caches, then reloads from network.
+document.getElementById('btn-refresh-app')?.addEventListener('click', async function () {
+  const original = this.textContent;
+  this.disabled  = true;
+  this.innerHTML = '<span class="spinner"></span> Refreshing…';
+  try {
+    if ('serviceWorker' in navigator) {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (reg) await reg.update().catch(() => {});
+    }
+    if ('caches' in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k)));
+    }
+  } catch { /* ignore — reload is still useful */ }
+  window.location.reload();
+  // Keep the button in its loading state until the reload happens
+  setTimeout(() => { this.disabled = false; this.textContent = original; }, 5000);
+});
+
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 // Try to load the profile using the existing session cookie.
 // Success → routeDriver() picks the right screen based on account state.

@@ -491,11 +491,11 @@
 
     <div class="section-label">SAN eDispatch Credentials</div>
     <div class="form-group">
-      <label>SAN Username</label>
+      <label>SAN eDispatch Username</label>
       <input type="text" id="reg-san-username" placeholder="Your SAN eDispatch username" autocomplete="off" />
     </div>
     <div class="form-group">
-      <label>SAN Password</label>
+      <label>SAN eDispatch Password</label>
       <input type="password" id="reg-san-password" placeholder="Your SAN eDispatch password" autocomplete="new-password" />
     </div>
     <div class="form-group">
@@ -540,7 +540,7 @@
   </div>
 
   <button class="btn btn-ghost" id="btn-resend-verify-email" style="margin-bottom:12px;">Resend verification email</button>
-  <button class="btn btn-ghost" onclick="doLogout()" style="opacity:0.6;">Log out</button>
+  <button class="btn btn-ghost" id="btn-logout-verify" style="opacity:0.6;">Log out</button>
 </div>
 
 <!-- ══════════════════════════════════════════════ BILLING VIEW ════ -->
@@ -610,7 +610,7 @@
   <p style="text-align:center;font-size:13px;color:var(--muted);margin-bottom:24px;">
     Card required — you won't be charged until day 15. Cancel any time.
   </p>
-  <button class="btn btn-ghost" onclick="doLogout()" style="opacity:0.5;font-size:14px;">Log out</button>
+  <button class="btn btn-ghost" id="btn-logout-billing" style="opacity:0.5;font-size:14px;">Log out</button>
 
   <!-- Shown for past_due / canceled drivers instead of the trial button -->
   <div id="billing-manage-section" style="display:none;">
@@ -618,7 +618,7 @@
       Update Payment Method
     </button>
     <p style="text-align:center;font-size:13px;color:var(--muted);margin-bottom:24px;">Update your card to restore full access.</p>
-    <button class="btn btn-ghost" onclick="doLogout()" style="opacity:0.5;font-size:14px;">Log out</button>
+    <button class="btn btn-ghost" id="btn-logout-billing-manage" style="opacity:0.5;font-size:14px;">Log out</button>
   </div>
 </div>
 
@@ -632,10 +632,13 @@
     <button class="menu-btn visible" id="btn-logout-menu" title="Logout">⎋</button>
   </header>
 
-  <div class="dash-greeting">
-    <div class="sub">Welcome back</div>
-    <h2 id="dash-name">Loading…</h2>
-    <div id="dash-date" style="font-size:13px;color:var(--muted2);margin-top:6px;margin-bottom:16px;"></div>
+  <div class="dash-greeting" style="display:flex;align-items:center;justify-content:space-between;gap:14px;">
+    <div style="min-width:0;flex:1;">
+      <div class="sub">Welcome back</div>
+      <h2 id="dash-name">Loading…</h2>
+      <div id="dash-date" style="font-size:13px;color:var(--muted2);margin-top:6px;margin-bottom:16px;"></div>
+    </div>
+    <img src="/icons/logo.png" alt="SAN Queue" style="width:64px;height:64px;border-radius:50%;object-fit:cover;background:rgba(0,194,212,0.08);box-shadow:0 8px 24px rgba(0,194,212,0.25);flex-shrink:0;" />
   </div>
 
   <!-- Deactivation banner -->
@@ -783,15 +786,15 @@
 
   <div class="success-msg" id="sched-success" style="display:none;"></div>
 
-  <div class="section-label" style="margin-top:8px;">Update SAN Credentials</div>
+  <div class="section-label" style="margin-top:8px;">Update SAN eDispatch Credentials</div>
   <p style="font-size:12px;color:var(--muted);margin-bottom:12px;margin-top:-8px;">Leave blank to keep existing credentials</p>
 
   <div class="form-group">
-    <label>SAN Username</label>
+    <label>SAN eDispatch Username</label>
     <input type="text" id="sched-san-username" placeholder="Leave blank to keep current" autocomplete="off" />
   </div>
   <div class="form-group">
-    <label>SAN Password</label>
+    <label>SAN eDispatch Password</label>
     <input type="password" id="sched-san-password" placeholder="Leave blank to keep current" autocomplete="new-password" />
   </div>
   <div class="form-group">
@@ -867,6 +870,14 @@
     <div class="error-msg" id="cp-error"></div>
     <div class="success-msg" id="cp-success" style="display:none;color:var(--green);font-size:13px;margin-bottom:12px;"></div>
     <button class="btn btn-primary" id="btn-change-password">Update Password</button>
+  </div>
+
+  <div class="status-card" style="margin-top:16px;">
+    <div class="card-label">App</div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;flex-wrap:wrap;gap:10px;">
+      <div style="font-size:13px;color:var(--muted);max-width:220px;">Force-refresh to pick up the latest version if the app looks stale.</div>
+      <button class="btn btn-ghost" id="btn-refresh-app" style="font-size:13px;padding:8px 16px;">Refresh App</button>
+    </div>
   </div>
 </div>
 

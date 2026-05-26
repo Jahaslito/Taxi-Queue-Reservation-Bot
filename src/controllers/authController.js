@@ -287,11 +287,30 @@ async function createCheckoutSession(req, res, next) {
 // Returns { url } — the frontend redirects to Stripe's hosted portal.
 async function billingPortal(req, res, next) {
   try {
-    const driver = await Driver.findById(req.driverId);
-    if (!driver?.stripe_customer_id) {
-      const err = new Error('No billing account found. Please start a subscription first.');
-      err.statusCode = 400;
+    const driver = await Driver.findByIdWithCredentials(req.driverId);
+    if (!driver) {
+      const err = new Error('Driver not found');
+      err.statusCode = 404;
       throw err;
+    }
+
+    // Grandfathered drivers (migrated from pre-billing era) have
+    // subscription_status='active' but no Stripe customer record. Redirect
+    // them through Checkout instead of erroring — this creates the customer
+    // on first click and self-heals the account.
+    if (!driver.stripe_customer_id) {
+      if (!driver.email_verified_at) {
+        const err = new Error('Please verify your email address before setting up billing.');
+        err.statusCode = 403;
+        throw err;
+      }
+      const customer = await stripeService.createCustomer(driver);
+      await Driver.update(driver.id, { stripe_customer_id: customer.id });
+      const checkout = await stripeService.createCheckoutSession({
+        customerId: customer.id,
+        driverId:   driver.id,
+      });
+      return res.json({ url: checkout.url });
     }
 
     const session = await stripeService.createPortalSession(

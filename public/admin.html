@@ -119,6 +119,16 @@
     .stat-card.green .stat-value { color: var(--green); }
     .stat-card.red .stat-value   { color: var(--red); }
     .stat-card.amber .stat-value { color: var(--amber); }
+    .stat-card.clickable {
+      cursor: pointer;
+      transition: transform 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+    }
+    .stat-card.clickable:hover {
+      transform: translateY(-2px);
+      border-color: rgba(255,255,255,0.18);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+    }
+    .stat-card.clickable:active { transform: translateY(0); }
 
     /* ── Table ── */
     .table-wrap {
@@ -502,22 +512,22 @@
     </div>
 
     <div class="stats-grid">
-      <div class="stat-card teal" data-icon="🚕">
+      <div class="stat-card teal clickable" data-icon="🚕" data-stat="drivers" title="All registered drivers. Click to view the full drivers list.">
         <div class="stat-label">Total Drivers</div>
         <div class="stat-value" id="stat-total">—</div>
         <div class="stat-sub" id="stat-active-sub">— active</div>
       </div>
-      <div class="stat-card green" data-icon="✅">
+      <div class="stat-card green clickable" data-icon="✅" data-stat="today-success" title="Bot runs today that successfully added a driver to the queue. Click to view today's successful logs.">
         <div class="stat-label">Today — Success</div>
         <div class="stat-value" id="stat-today-success">—</div>
         <div class="stat-sub" id="stat-today-total-sub">of — total</div>
       </div>
-      <div class="stat-card red" data-icon="❌">
+      <div class="stat-card red clickable" data-icon="❌" data-stat="today-failed" title="Bot runs today that failed to add the driver. Click to view today's failed logs.">
         <div class="stat-label">Today — Failed</div>
         <div class="stat-value" id="stat-today-failed">—</div>
         <div class="stat-sub">runs failed today</div>
       </div>
-      <div class="stat-card amber" data-icon="📈">
+      <div class="stat-card amber clickable" data-icon="📈" data-stat="alltime-success" title="All-time successful queue adds across every driver and day. Click to view all successful logs.">
         <div class="stat-label">All-time Success</div>
         <div class="stat-value" id="stat-alltime">—</div>
         <div class="stat-sub">successful queue adds</div>

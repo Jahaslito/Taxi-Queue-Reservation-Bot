@@ -131,6 +131,38 @@ document.getElementById('btn-manage-billing').addEventListener('click', async fu
   }
 });
 
+// ─── bfcache restore — reset stuck Stripe-redirect buttons ──────────────────
+// Each Stripe button (Manage Billing, Update Payment, Start Trial) flips to
+// a "loading" state before redirecting via window.location.href. Stripe's
+// "Back to SAN Queue" link does a fresh navigation (state resets naturally),
+// but Stripe's "Close" button uses history.back(), which restores this page
+// from the browser's back-forward cache with the disabled spinner state
+// preserved. This handler detects bfcache restore (event.persisted === true)
+// and reverts each button to its idle text.
+window.addEventListener('pageshow', event => {
+  if (!event.persisted) return;
+
+  const resets = [
+    { id: 'btn-acct-billing',   text: 'Manage Billing'        },
+    { id: 'btn-manage-billing', text: 'Update Payment Method' },
+    { id: 'btn-start-billing',  text: 'Start Free Trial →'    },
+  ];
+  for (const { id, text } of resets) {
+    const btn = document.getElementById(id);
+    if (btn && btn.disabled) {
+      btn.disabled    = false;
+      btn.textContent = text;
+    }
+  }
+
+  // btn-start-billing's correct text varies by subscription state
+  // ("Resubscribe →" for canceled/unpaid). Re-run prepareBillingView with
+  // the cached profile so the label matches reality.
+  if (typeof driverProfile !== 'undefined' && driverProfile && window.prepareBillingView) {
+    window.prepareBillingView(driverProfile);
+  }
+});
+
 // ─── view-verify-email helpers ────────────────────────────────────────────────
 window.prepareVerifyEmailView = function (profile) {
   const addrEl = document.getElementById('verify-email-addr');

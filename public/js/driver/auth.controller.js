@@ -143,8 +143,11 @@ async function doLogout() {
   showView('view-login');
 }
 
-document.getElementById('btn-logout-menu').addEventListener('click',    doLogout);
-document.getElementById('btn-logout-account').addEventListener('click', doLogout);
+document.getElementById('btn-logout-menu').addEventListener('click',           doLogout);
+document.getElementById('btn-logout-account').addEventListener('click',        doLogout);
+document.getElementById('btn-logout-verify').addEventListener('click',         doLogout);
+document.getElementById('btn-logout-billing').addEventListener('click',        doLogout);
+document.getElementById('btn-logout-billing-manage').addEventListener('click', doLogout);
 
 // ─── Change password ──────────────────────────────────────────────────────────
 document.getElementById('btn-change-password').addEventListener('click', async () => {

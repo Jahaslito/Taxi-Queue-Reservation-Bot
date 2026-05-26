@@ -90,6 +90,40 @@ function filterLogsByTime(time) {
 // Manual refresh button
 document.getElementById('btn-refresh-overview').addEventListener('click', loadOverview);
 
+// Clickable stat cards — route to the right page with filters pre-applied
+document.querySelector('#page-overview .stats-grid').addEventListener('click', (e) => {
+  const card = e.target.closest('.stat-card[data-stat]');
+  if (!card) return;
+  const todayPT = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+
+  switch (card.dataset.stat) {
+    case 'drivers':
+      showPage('page-drivers');
+      break;
+    case 'today-success':
+      document.getElementById('log-search').value        = '';
+      document.getElementById('log-date-filter').value   = todayPT;
+      document.getElementById('log-status-filter').value = 'success';
+      showPage('page-logs');
+      loadLogs(1);
+      break;
+    case 'today-failed':
+      document.getElementById('log-search').value        = '';
+      document.getElementById('log-date-filter').value   = todayPT;
+      document.getElementById('log-status-filter').value = 'failed';
+      showPage('page-logs');
+      loadLogs(1);
+      break;
+    case 'alltime-success':
+      document.getElementById('log-search').value        = '';
+      document.getElementById('log-date-filter').value   = '';
+      document.getElementById('log-status-filter').value = 'success';
+      showPage('page-logs');
+      loadLogs(1);
+      break;
+  }
+});
+
 // Event delegation for "View Drivers" / "View Logs" buttons in the breakdown table
 document.getElementById('schedule-breakdown-body').addEventListener('click', e => {
   const btn = e.target.closest('[data-action]');

@@ -369,4 +369,169 @@ async function extractQueueInfo(page) {
   }
 }
 
-module.exports = { addToQueue, sanitizeError };
+/**
+ * Removes a driver from the SAN queue. Same login flow as addToQueue, but
+ * clicks the "Remove From Queue" button on the WAIT screen instead of adding.
+ *
+ * Returns:
+ *   { success: true, removed: true, durationMs, message }  → removed cleanly
+ *   { success: false, notInQueue: true, ... }              → wasn't in queue
+ *   { success: false, dispatched: true, ... }              → at terminal, can't remove
+ *   { success: false, error, message, ... }                → other failures
+ */
+async function removeFromQueue(sanUsername, sanPassword, vehicleNumber) {
+  const startTime = Date.now();
+  let browser = null;
+  let page    = null;
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--single-process',
+      ],
+    });
+
+    const proxyConfig  = getProxyConfig();
+    const savedSession = getStoredSession(sanUsername);
+
+    if (proxyConfig)  console.log(`[Bot] ${vehicleNumber} (remove) → proxy session active`);
+    if (savedSession) console.log(`[Bot] ${vehicleNumber} (remove) → restoring saved session for ${sanUsername}`);
+
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+      viewport: { width: 390, height: 844 },
+      permissions: [],
+      acceptDownloads: false,
+      storageState: savedSession,
+      ...(proxyConfig ? { proxy: proxyConfig } : {}),
+    });
+
+    page = await context.newPage();
+
+    // Block heavy resources to keep the bot fast (~60% bandwidth saved)
+    await page.route('**/*', route => {
+      const type = route.request().resourceType();
+      if (['image', 'font', 'stylesheet', 'media'].includes(type)) return route.abort();
+      return route.continue();
+    });
+
+    // ─── STEP 1: navigate ────────────────────────────────────────────────────
+    console.log(`[Bot] ${vehicleNumber} (remove) → navigating to SAN eDispatch…`);
+    await page.goto(SAN_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+    await page.waitForURL(
+      url => url.href.includes(OIDC_HOST) || url.href.includes(APP_HOST),
+      { timeout: TIMEOUT },
+    );
+
+    // ─── STEP 2: login if redirected to OIDC ─────────────────────────────────
+    if (page.url().includes(OIDC_HOST)) {
+      if (savedSession) {
+        sessionStore.delete(sanUsername);
+        console.log(`[Bot] ${vehicleNumber} (remove) → saved session rejected — full login`);
+      }
+      await page.waitForSelector('input[placeholder="Enter Username"]', { timeout: TIMEOUT });
+      await page.fill('input[placeholder="Enter Username"]', sanUsername);
+      await page.fill('input[placeholder="Enter Password"]', sanPassword);
+      await Promise.all([
+        page.waitForURL(`**/${APP_HOST}/**`, { timeout: NAV_TIMEOUT }),
+        page.click('button:has-text("Log In")'),
+      ]);
+      console.log(`[Bot] ${vehicleNumber} (remove) → OIDC callback complete`);
+    }
+
+    // Persist refreshed session for next runs
+    saveSession(sanUsername, await context.storageState());
+
+    await page.waitForLoadState('networkidle', { timeout: TIMEOUT }).catch(() => {});
+    await debugCapture(page, vehicleNumber, 'remove_after_login');
+
+    // ─── STEP 3: verify we're not back at OIDC (auth failed) ─────────────────
+    if (page.url().includes(OIDC_HOST)) {
+      const hint = 'Invalid SAN username or password';
+      return { success: false, durationMs: Date.now() - startTime, error: hint, message: hint };
+    }
+
+    // ─── STEP 4: wait for one of: WAIT screen, search page, or dispatched ────
+    await page.waitForFunction(
+      () => {
+        const hasSearch    = document.querySelector('input[placeholder="Vehicle Dispatch Name"]') !== null;
+        const onWaitScreen = document.body.innerText.includes('Remove From Queue');
+        const onDispatch   = document.body.innerText.includes('Dispatched: T');
+        return hasSearch || onWaitScreen || onDispatch;
+      },
+      null,
+      { timeout: TIMEOUT },
+    );
+
+    // ─── STEP 5: dispatched → can't remove ───────────────────────────────────
+    const isDispatched = await page.evaluate(() =>
+      document.body.innerText.includes('Dispatched: T'),
+    ).catch(() => false);
+    if (isDispatched) {
+      const bodyText  = await page.textContent('body').catch(() => '');
+      const termMatch = bodyText.match(/Dispatched:\s*(T\d+)/i);
+      const terminal  = termMatch ? termMatch[1] : 'terminal';
+      console.log(`[Bot] ${vehicleNumber} (remove) → dispatched to ${terminal} — cannot remove`);
+      return {
+        success: false,
+        dispatched: true,
+        durationMs: Date.now() - startTime,
+        error: `Already dispatched to ${terminal} — cannot remove`,
+        message: `You're currently dispatched to ${terminal}. Wait until you clear the terminal, then try again.`,
+      };
+    }
+
+    // ─── STEP 6: not on the WAIT screen → not in queue, nothing to remove ────
+    if (!(await isWaitScreen(page))) {
+      console.log(`[Bot] ${vehicleNumber} (remove) → not currently in queue`);
+      return {
+        success: false,
+        notInQueue: true,
+        durationMs: Date.now() - startTime,
+        error: 'Vehicle is not currently in queue',
+        message: 'You are not currently in the queue — nothing to remove.',
+      };
+    }
+
+    // ─── STEP 7: click Remove From Queue ─────────────────────────────────────
+    console.log(`[Bot] ${vehicleNumber} (remove) → clicking Remove From Queue…`);
+    await page.click('button:has-text("Remove From Queue")');
+
+    // Wait for confirmation — page transitions back to the search/vehicle page
+    await page.waitForFunction(
+      () => document.querySelector('input[placeholder="Vehicle Dispatch Name"]') !== null
+         || !document.body.innerText.includes('Remove From Queue'),
+      null,
+      { timeout: TIMEOUT },
+    );
+
+    console.log(`[Bot] ${vehicleNumber} (remove) → ✓ successfully removed from queue`);
+    return {
+      success:    true,
+      removed:    true,
+      durationMs: Date.now() - startTime,
+      message:    'Successfully removed from queue.',
+    };
+
+  } catch (err) {
+    console.error(`[Bot] ${vehicleNumber} (remove) → ERROR: ${err.message}`);
+    if (page) await debugCapture(page, vehicleNumber, 'remove_error');
+    const friendly = sanitizeError(err.message);
+    return {
+      success: false,
+      durationMs: Date.now() - startTime,
+      error: friendly,
+      message: friendly,
+      rawError: err.message,
+    };
+  } finally {
+    if (browser) await browser.close();
+  }
+}
+
+module.exports = { addToQueue, removeFromQueue, sanitizeError };

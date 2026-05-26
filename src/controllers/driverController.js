@@ -4,7 +4,7 @@ const Driver            = require('../models/Driver');
 const Log               = require('../models/Log');
 const PositionClaim     = require('../models/PositionClaim');
 const { encrypt }       = require('../services/cryptoService');
-const { runBotForDriver } = require('../services/schedulerService');
+const { runBotForDriver, runRemoveBotForDriver } = require('../services/schedulerService');
 
 async function getProfile(req, res, next) {
   try {
@@ -178,4 +178,73 @@ async function triggerSelf(req, res, next) {
   }
 }
 
-module.exports = { getProfile, updateProfile, getLogs, getTodayStatus, triggerSelf };
+/**
+ * POST /api/driver/remove-queue
+ *
+ * Triggers the remove-from-queue bot. Unlike triggerSelf, this awaits the bot
+ * result so we can update the driver's state synchronously based on the outcome:
+ *   • success           → set manually_removed_at, notify monitor to stop auto-requeueing
+ *   • dispatched        → 409, don't change state
+ *   • notInQueue        → 200 with informational message
+ *   • other failures    → 500/502 with friendly message
+ *
+ * Bot run time is 5–15 seconds. Frontend shows a loading state during the wait.
+ */
+async function removeFromQueue(req, res, next) {
+  try {
+    const driver = await Driver.findByIdWithCredentials(req.driverId);
+    if (!driver) {
+      const err = new Error('Driver not found'); err.statusCode = 404; throw err;
+    }
+    if (!driver.is_active) {
+      const err = new Error('Your account is inactive'); err.statusCode = 400; throw err;
+    }
+
+    const result = await runRemoveBotForDriver(driver, 'manual_remove');
+
+    // Hard failures (dispatched / not in queue / login error / network) — don't modify state
+    if (!result.success) {
+      if (result.dispatched) {
+        return res.status(409).json({
+          ok:      false,
+          reason:  'dispatched',
+          message: result.message,
+        });
+      }
+      if (result.notInQueue) {
+        return res.status(200).json({
+          ok:      false,
+          reason:  'not_in_queue',
+          message: result.message,
+        });
+      }
+      const err = new Error(result.message || result.error || 'Failed to remove from queue');
+      err.statusCode = 502;
+      throw err;
+    }
+
+    // Success — mark the driver removed and update the in-memory monitor state
+    // so it knows not to auto-requeue them for the rest of the day.
+    await Driver.update(req.driverId, { manually_removed_at: new Date() });
+
+    // Notify monitorService so the in-memory state matches the DB immediately.
+    // Lazy-require to avoid circular import (monitorService → schedulerService → controllers).
+    try {
+      const monitorService = require('../services/monitorService');
+      if (typeof monitorService.markManuallyRemoved === 'function') {
+        monitorService.markManuallyRemoved(req.driverId);
+      }
+    } catch (e) {
+      console.warn('[Driver] Could not notify monitor of manual removal:', e.message);
+    }
+
+    res.json({
+      ok:      true,
+      message: result.message,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { getProfile, updateProfile, getLogs, getTodayStatus, triggerSelf, removeFromQueue };

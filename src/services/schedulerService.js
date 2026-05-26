@@ -2,7 +2,7 @@ const cron    = require('node-cron');
 const Driver  = require('../models/Driver');
 const Log     = require('../models/Log');
 const { decrypt }    = require('./cryptoService');
-const { addToQueue, sanitizeError } = require('./botService');
+const { addToQueue, removeFromQueue, sanitizeError } = require('./botService');
 
 // In-memory set prevents the same driver from running twice simultaneously
 const runningJobs = new Set();
@@ -231,4 +231,58 @@ function startScheduler() {
   console.log('[Scheduler] ✓ Cron job registered');
 }
 
-module.exports = { startScheduler, runBotForDriver };
+/**
+ * Runs the remove-from-queue bot for a single driver. Mirrors runBotForDriver
+ * but calls removeFromQueue() instead of addToQueue() and uses the 'manual_remove'
+ * trigger_type. No retries — if it fails, the driver can simply try again.
+ */
+async function runRemoveBotForDriver(driver, triggerType = 'manual_remove') {
+  const jobKey = `driver-${driver.id}`;
+
+  if (runningJobs.has(jobKey)) {
+    console.log(`[Scheduler] (remove) Skipping ${driver.name} (${driver.vehicle_number}) — bot already running`);
+    return { success: false, error: 'Another bot is already running for this driver' };
+  }
+  runningJobs.add(jobKey);
+
+  const logId = await Log.create({
+    driver_id:    driver.id,
+    triggered_at: new Date(),
+    trigger_type: triggerType,
+    status:       'pending',
+  });
+
+  console.log(`[Scheduler] (remove) Starting bot for ${driver.name} (Vehicle: ${driver.vehicle_number})`);
+
+  try {
+    const sanPassword = decrypt(driver.san_password);
+    const result = await removeFromQueue(driver.san_username, sanPassword, driver.vehicle_number);
+
+    if (result.success) {
+      await Log.update(logId, {
+        status:        'success',
+        duration_ms:   result.durationMs,
+        error_message: 'manually_removed',  // tag for analytics
+      });
+      console.log(`[Scheduler] (remove) ✓ ${driver.name} → ${result.message}`);
+    } else {
+      await Log.update(logId, {
+        status:        'failed',
+        error_message: result.error || result.message,
+        duration_ms:   result.durationMs,
+      });
+      console.error(`[Scheduler] (remove) ✗ ${driver.name} → ${result.message}`);
+    }
+
+    return result;
+  } catch (err) {
+    const friendly = sanitizeError(err.message);
+    await Log.update(logId, { status: 'failed', error_message: friendly });
+    console.error(`[Scheduler] (remove) ✗ ${driver.name} → Unexpected error: ${err.message}`);
+    return { success: false, error: friendly };
+  } finally {
+    runningJobs.delete(jobKey);
+  }
+}
+
+module.exports = { startScheduler, runBotForDriver, runRemoveBotForDriver };

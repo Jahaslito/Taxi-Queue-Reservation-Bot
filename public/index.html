@@ -682,7 +682,7 @@
 
   <!-- Re-queue button -->
   <button id="btn-requeue" style="
-    width:100%; margin-bottom:16px;
+    width:100%; margin-bottom:12px;
     background:linear-gradient(135deg,rgba(0,180,255,0.18),rgba(108,99,255,0.18));
     border:1px solid rgba(0,180,255,0.5); border-radius:16px;
     padding:16px 20px; display:flex; align-items:center; gap:14px;
@@ -698,6 +698,48 @@
     <div id="btn-requeue-chevron" style="font-size:18px;color:rgba(0,180,255,0.6);flex-shrink:0;">›</div>
     <div id="btn-requeue-spinner" style="display:none;flex-shrink:0;"><span class="spinner"></span></div>
   </button>
+
+  <!-- Remove from queue button — only shown when driver is in_queue (toggled via JS) -->
+  <button id="btn-remove-queue" style="
+    display:none;
+    width:100%; margin-bottom:16px;
+    background:linear-gradient(135deg,rgba(239,68,68,0.12),rgba(244,114,182,0.12));
+    border:1px solid rgba(239,68,68,0.4); border-radius:16px;
+    padding:14px 20px; align-items:center; gap:14px;
+    cursor:pointer; text-align:left;
+    transition:transform .1s, box-shadow .1s, opacity .15s;
+    -webkit-tap-highlight-color: transparent;">
+    <div id="btn-remove-queue-icon" style="font-size:22px;line-height:1;flex-shrink:0;">✕</div>
+    <div style="flex:1;">
+      <div id="btn-remove-queue-label" style="font-weight:700;color:#fca5a5;font-size:14px;">Remove from Queue</div>
+      <div id="btn-remove-queue-sub" style="font-size:12px;color:rgba(252,165,165,0.7);margin-top:3px;">Done driving for today — opt out of auto-requeue</div>
+    </div>
+    <div id="btn-remove-queue-spinner" style="display:none;flex-shrink:0;"><span class="spinner"></span></div>
+  </button>
+
+  <!-- Confirm modal for remove-from-queue -->
+  <div class="modal-overlay" id="remove-queue-modal">
+    <div class="modal" style="max-width:380px;width:100%;">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">
+        <div style="font-size:26px;">⚠️</div>
+        <h3 id="remove-queue-modal-title" style="font-family:'Syne',sans-serif;font-size:20px;font-weight:700;margin:0;">Remove from Queue?</h3>
+      </div>
+      <p style="color:var(--muted);font-size:14px;line-height:1.5;margin:8px 0 4px;">
+        You'll be removed from the SAN queue and the bot won't auto-requeue you for the rest of the day.
+      </p>
+      <p style="color:var(--muted);font-size:13px;line-height:1.5;margin:0 0 16px;">
+        You can still tap <strong style="color:var(--teal);">Get Back in Queue</strong> any time to come back.
+      </p>
+      <div class="modal-actions" style="margin-top:12px;">
+        <button class="btn btn-ghost" id="btn-remove-queue-cancel">Cancel</button>
+        <button class="btn btn-primary" id="btn-remove-queue-confirm"
+                style="background:linear-gradient(135deg,#ef4444,#dc2626);box-shadow:0 8px 24px rgba(239,68,68,0.3);">
+          <span id="btn-remove-queue-confirm-label">Yes, remove me</span>
+          <span id="btn-remove-queue-confirm-spinner" style="display:none;margin-left:6px;vertical-align:middle;"><span class="spinner"></span></span>
+        </button>
+      </div>
+    </div>
+  </div>
 
   <!-- Schedule -->
   <div class="stats-row">

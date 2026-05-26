@@ -1,4 +1,14 @@
-const CACHE_VERSION = 'v1';
+// IMPORTANT: bump this on every frontend deploy that includes user-visible
+// changes (HTML/CSS/JS edits). Without a bump, installed PWA users keep
+// seeing the cached old version forever.
+//
+// What happens when this changes:
+//   1. Browser fetches the new sw.js on next app launch
+//   2. New SW installs in background, precaches the latest assets
+//   3. activate handler purges any caches not matching CACHE_NAME
+//   4. clients.claim() takes over open tabs immediately
+//   5. Next navigation (or app reopen) serves the new files
+const CACHE_VERSION = 'v3';
 const CACHE_NAME    = `san-queue-${CACHE_VERSION}`;
 
 const PRECACHE = [

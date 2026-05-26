@@ -799,6 +799,7 @@ async function poll() {
       s.terminalName       = null;
       s.terminalPosition   = null;
       s.atTerminalSince    = null;
+      s.manuallyRemovedAt  = null;  // new day → driver can be auto-managed again
     }
     console.log('[Monitor] Daily reset — counters and visibility state cleared');
     broadcast('daily_reset', { date: currentDayPT });
@@ -1179,7 +1180,11 @@ async function poll() {
     // Apply side effects per decision action
     switch (decision.action) {
       case 'skip_no_target':
-        // silent — driver has no position target today
+        // Driver has no position target today (e.g. day_positions[todayDayKey] is null).
+        // Mark positionFiredToday=true so the monitor's defer-to-position-scheduler
+        // condition releases. Otherwise the monitor would defer forever on this
+        // driver's terminal-cleared events, never requeueing them.
+        state.positionFiredToday = true;
         break;
 
       case 'skip_already_fired':
@@ -1187,10 +1192,18 @@ async function poll() {
         break;
 
       case 'skip_bot_inflight':
-      case 'skip_already_seen':
       case 'wait':
         console.log(decision.logLine);
         recordPositionDecision(state, decision.action, decision.reason, decision.metrics);
+        break;
+
+      case 'skip_already_seen':
+        console.log(decision.logLine);
+        recordPositionDecision(state, decision.action, decision.reason, decision.metrics);
+        // Driver is already in queue today — position scheduler's job is done.
+        // Mark positionFiredToday=true so the monitor's defer condition releases
+        // and it can requeue normally after dispatches throughout the day.
+        state.positionFiredToday = true;
         break;
 
       case 'fire':
@@ -1291,6 +1304,7 @@ async function addWatch(driverId, { isAuto = false, _ctx = null } = {}) {
     scheduledPosition:       driver.scheduled_position ?? null,
     dayPositions:            driver.day_positions ?? null,
     maxAcceptablePosition:   driver.max_acceptable_position ?? null, // null → default to target + 20
+    manuallyRemovedAt:       driver.manually_removed_at ?? null,
     positionFiredToday,
     currentPosition:    null,  // live position updated every poll tick
     lastPosition:       null,  // position bot placed them at (from bot result)
@@ -1333,6 +1347,40 @@ function removeWatch(driverId) {
     broadcast('watch_removed', { driverId, vehicleNumber: state.vehicleNumber });
     console.log(`[Monitor] Stopped watching #${state.vehicleNumber}`);
   }
+  return true;
+}
+
+/**
+ * Called by driverController.removeFromQueue after a manual-remove bot succeeds.
+ * Resets the driver's in-memory state so:
+ *   • monitor doesn't try to auto-requeue them (hasBeenSeen=false → at_terminal
+ *     transition never fires)
+ *   • position scheduler doesn't fire for them again today (positionFiredToday=true)
+ *   • driver can still manually trigger via "Get Back in Queue" — that path
+ *     bypasses both checks
+ *
+ * If the driver isn't currently being watched (rare — possible if they were
+ * deactivated mid-removal), this is a no-op.
+ */
+function markManuallyRemoved(driverId) {
+  const state = watches.get(driverId);
+  if (!state) {
+    console.warn(`[Monitor] markManuallyRemoved: driver ${driverId} not in watches`);
+    return false;
+  }
+
+  state.hasBeenSeen        = false;
+  state.state              = 'watching';
+  state.positionFiredToday = true;
+  state.terminalSeen       = false;
+  state.terminalCheckCount = 0;
+  state.terminalName       = null;
+  state.terminalPosition   = null;
+  state.atTerminalSince    = null;
+  state.manuallyRemovedAt  = new Date();
+
+  console.log(`[Monitor] #${state.vehicleNumber} marked manually-removed — auto-requeue suppressed for today`);
+  broadcast('driver_state', { driverId, state: snap(state) });
   return true;
 }
 
@@ -1559,6 +1607,7 @@ module.exports = {
   addWatch,
   removeWatch,
   manualRun,
+  markManuallyRemoved,
   watchAllActive,
   refreshAutoWatches,
   getState,

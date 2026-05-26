@@ -12,9 +12,15 @@ const stripeService     = require('../services/stripeService');
 function makeToken()  { return crypto.randomBytes(32).toString('hex'); }
 function hoursFromNow(h) { return new Date(Date.now() + h * 60 * 60 * 1000); }
 
+// 'lax' lets the JWT cookie ride along on top-level navigations from external
+// sites (e.g. when Stripe Checkout redirects back to /?billing=success).
+// 'strict' would block the cookie on that redirect, sending the user to the
+// login screen and breaking the post-checkout flow.
+// CSRF protection is still preserved — 'lax' blocks cross-site embedded
+// contexts (iframes, image tags, etc.).
 const COOKIE_OPTS = {
   httpOnly: true,
-  sameSite: 'strict',
+  sameSite: 'lax',
   secure:   nodeEnv === 'production',
 };
 
@@ -294,7 +300,7 @@ async function billingPortal(req, res, next) {
 }
 
 function logout(req, res) {
-  res.clearCookie('token', { httpOnly: true, sameSite: 'strict', secure: nodeEnv === 'production' });
+  res.clearCookie('token', { httpOnly: true, sameSite: 'lax', secure: nodeEnv === 'production' });
   res.json({ ok: true });
 }
 

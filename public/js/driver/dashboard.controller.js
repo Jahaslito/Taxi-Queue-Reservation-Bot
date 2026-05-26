@@ -78,8 +78,25 @@ async function loadDashboard() {
   }
 }
 
+// ─── Remove-from-queue button visibility ──────────────────────────────────────
+// Show the red "Remove from Queue" button ONLY when today's status indicates
+// the driver is currently in V Holding (status: success / already_queued with
+// a queue_position). Hide otherwise so the button doesn't appear when it would
+// have nothing to remove.
+function updateRemoveQueueButtonVisibility(log) {
+  const btn = document.getElementById('btn-remove-queue');
+  if (!btn) return;
+  const isInQueue = log
+    && (log.status === 'success' || log.status === 'already_queued')
+    && Number.isFinite(log.queue_position);
+  btn.style.display = isInQueue ? 'flex' : 'none';
+}
+
 // ─── Today status card ────────────────────────────────────────────────────────
 function renderTodayStatus(log) {
+  // Show or hide the "Remove from Queue" button based on current state
+  updateRemoveQueueButtonVisibility(log);
+
   const el = document.getElementById('today-status-content');
 
   if (!log) {
@@ -289,6 +306,111 @@ function renderDashLogs(logs) {
 
 // Trigger button
 document.getElementById('btn-requeue').addEventListener('click', triggerRequeue);
+
+// ─── Remove-from-queue flow ──────────────────────────────────────────────────
+// Confirmation modal → API call (8-15s) → toast + state update.
+// While the bot runs, the modal's confirm button shows a spinner and is disabled.
+let removeQueueInFlight = false;
+
+function openRemoveQueueModal() {
+  if (removeQueueInFlight) return;
+  document.getElementById('remove-queue-modal').classList.add('open');
+}
+
+function closeRemoveQueueModal() {
+  if (removeQueueInFlight) return; // can't dismiss while bot is running
+  document.getElementById('remove-queue-modal').classList.remove('open');
+}
+
+async function performRemoveFromQueue() {
+  if (removeQueueInFlight) return;
+  removeQueueInFlight = true;
+
+  const confirmBtn   = document.getElementById('btn-remove-queue-confirm');
+  const cancelBtn    = document.getElementById('btn-remove-queue-cancel');
+  const confirmLabel = document.getElementById('btn-remove-queue-confirm-label');
+  const confirmSpin  = document.getElementById('btn-remove-queue-confirm-spinner');
+
+  // Also disable the main "Remove from Queue" button on the dashboard
+  const dashBtn      = document.getElementById('btn-remove-queue');
+  const dashBtnLabel = document.getElementById('btn-remove-queue-label');
+  const dashBtnSub   = document.getElementById('btn-remove-queue-sub');
+  const dashBtnSpin  = document.getElementById('btn-remove-queue-spinner');
+  const dashBtnIcon  = document.getElementById('btn-remove-queue-icon');
+
+  // Loading state on the modal's confirm button
+  confirmBtn.disabled         = true;
+  cancelBtn.disabled          = true;
+  cancelBtn.style.opacity     = '0.5';
+  cancelBtn.style.cursor      = 'not-allowed';
+  confirmLabel.textContent    = 'Removing…';
+  confirmSpin.style.display   = 'inline-block';
+
+  // Mirror loading state on the dashboard button (in case modal closes early)
+  dashBtn.style.opacity       = '0.65';
+  dashBtn.style.cursor        = 'not-allowed';
+  dashBtn.style.pointerEvents = 'none';
+  dashBtnIcon.textContent     = '⏳';
+  dashBtnLabel.textContent    = 'Removing from queue…';
+  dashBtnSub.textContent      = 'Connecting to SAN eDispatch';
+  dashBtnSpin.style.display   = 'block';
+
+  try {
+    const data = await api('/api/driver/remove-queue', { method: 'POST' });
+
+    // Successful removal
+    if (data && data.ok) {
+      showToast('✅ ' + (data.message || 'Removed from queue.'), 'success', 5000);
+      // Hide the button immediately — driver is no longer in queue
+      dashBtn.style.display = 'none';
+      // Refresh status so the dashboard updates
+      const statusData = await api('/api/driver/status/today');
+      renderTodayStatus(statusData.todayLog);
+    } else if (data && data.reason === 'not_in_queue') {
+      // Soft failure — driver wasn't in queue to begin with
+      showToast('ℹ ' + (data.message || 'You are not in the queue.'), 'success', 4000);
+      dashBtn.style.display = 'none';
+    } else {
+      // Shouldn't reach here for 200 responses, but just in case
+      showToast('Could not remove: ' + (data && data.message ? data.message : 'unknown error'), 'error', 5000);
+    }
+  } catch (err) {
+    // 409 dispatched, 502 bot failure, network errors, etc.
+    const msg = err.message || 'Failed to remove from queue';
+    showToast('❌ ' + msg, 'error', 6000);
+  } finally {
+    // Reset modal + dashboard button state
+    removeQueueInFlight         = false;
+    confirmBtn.disabled         = false;
+    cancelBtn.disabled          = false;
+    cancelBtn.style.opacity     = '';
+    cancelBtn.style.cursor      = '';
+    confirmLabel.textContent    = 'Yes, remove me';
+    confirmSpin.style.display   = 'none';
+
+    dashBtn.style.opacity       = '';
+    dashBtn.style.cursor        = '';
+    dashBtn.style.pointerEvents = '';
+    dashBtnIcon.textContent     = '✕';
+    dashBtnLabel.textContent    = 'Remove from Queue';
+    dashBtnSub.textContent      = 'Done driving for today — opt out of auto-requeue';
+    dashBtnSpin.style.display   = 'none';
+
+    // Close modal
+    document.getElementById('remove-queue-modal').classList.remove('open');
+  }
+}
+
+document.getElementById('btn-remove-queue').addEventListener('click', openRemoveQueueModal);
+document.getElementById('btn-remove-queue-cancel').addEventListener('click', closeRemoveQueueModal);
+document.getElementById('btn-remove-queue-confirm').addEventListener('click', performRemoveFromQueue);
+
+// Dismiss modal by tapping outside the dialog (but not during loading)
+document.getElementById('remove-queue-modal').addEventListener('click', (e) => {
+  if (e.target.id === 'remove-queue-modal' && !removeQueueInFlight) {
+    closeRemoveQueueModal();
+  }
+});
 
 // Press effect: sink the button on mousedown/touchstart, lift on release
 (function () {

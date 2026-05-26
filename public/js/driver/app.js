@@ -87,6 +87,26 @@ document.getElementById('btn-resend-verification').addEventListener('click', asy
   }
 });
 
+// ─── Service worker update detection ─────────────────────────────────────────
+// When sw.js bumps its CACHE_VERSION, the browser installs a new SW in the
+// background. After skipWaiting() + clients.claim() take effect, the new SW
+// becomes the controller of this page — that fires 'controllerchange'.
+//
+// We catch that event, show the user a toast, then reload so they pick up the
+// fresh HTML/JS/CSS without having to close and reopen the PWA.
+//
+// The 'refreshing' guard prevents an infinite reload loop if multiple
+// controllerchange events fire (rare but possible during SW lifecycle).
+if ('serviceWorker' in navigator) {
+  let refreshing = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (refreshing) return;
+    refreshing = true;
+    showToast('🔄 New version available — refreshing…', 'success', 2000);
+    setTimeout(() => window.location.reload(), 1500);
+  });
+}
+
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 // Try to load the profile using the existing session cookie.
 // Success → routeDriver() picks the right screen based on account state.

@@ -5,7 +5,7 @@ const { authenticateDriver }    = require('../middleware/auth');
 const { apiLimiter }            = require('../middleware/rateLimiter');
 const requireSubscription       = require('../middleware/requireSubscription');
 const validate                  = require('../middleware/validate');
-const { getProfile, updateProfile, getLogs, getTodayStatus, triggerSelf } = require('../controllers/driverController');
+const { getProfile, updateProfile, getLogs, getTodayStatus, triggerSelf, removeFromQueue } = require('../controllers/driverController');
 
 const router = Router();
 
@@ -42,8 +42,9 @@ router.put(
   updateProfile,
 );
 
-router.get('/logs',         getLogs);
-router.get('/status/today', getTodayStatus);
-router.post('/trigger',     triggerSelf);
+router.get('/logs',          getLogs);
+router.get('/status/today',  getTodayStatus);
+router.post('/trigger',      triggerSelf);
+router.post('/remove-queue', removeFromQueue);
 
 module.exports = router;

@@ -30,6 +30,7 @@ const Log                  = require('../../src/models/Log');
 const monitor = require('../../src/services/monitorService');
 const {
   _isWithinOperatingHours,
+  _evaluatePositionScheduler,
   addWatch,
   manualRun,
   getState,
@@ -191,5 +192,76 @@ describe('manualRun() — operating hours bypass', () => {
   test('throws if driver is already requeuing (prevents double-run)', async () => {
     await manualRun(DRIVER_ID); // state → 'requeuing' (synchronous in triggerRequeue)
     await expect(manualRun(DRIVER_ID)).rejects.toThrow('Bot is already running');
+  });
+});
+
+// ─── Position scheduler decision logic ────────────────────────────────────────
+// Tests for the safety rails added after the 5/24-5/26 over-/under-shoot
+// incidents: hard skip when queue already past max, pause when queue is being
+// purged by SAN's dispatcher.
+describe('evaluatePositionScheduler — safety rails', () => {
+  const makeState = (over = {}) => ({
+    driverId:           42,
+    vehicleNumber:      '4007',
+    scheduledPosition:  100,
+    maxAcceptablePosition: 120,
+    state:              'watching',
+    hasBeenSeen:        false,
+    positionFiredToday: false,
+    ...over,
+  });
+
+  const baseCtx = {
+    waitingCount:           50,
+    effectiveGrowthRate:    1.0,
+    estimatedDrift:         55,
+    biasCorrection:         0,
+    horizonSeconds:         55,
+    botExecMs:              15000,
+    todayDayKey:            null,
+    botSamplesCount:        5,
+    queueShrinkageDetected: false,
+  };
+
+  test('queue already past max → missed_impossible (does NOT fire)', () => {
+    const decision = _evaluatePositionScheduler(
+      makeState(),
+      { ...baseCtx, waitingCount: 130 }, // > maxAcceptable (120)
+    );
+    expect(decision.action).toBe('missed_impossible');
+    expect(decision.reason).toBe('queue_already_past_max');
+  });
+
+  test('queue at max boundary → fires (not blocked)', () => {
+    const decision = _evaluatePositionScheduler(
+      makeState(),
+      { ...baseCtx, waitingCount: 120, estimatedDrift: 0 },
+    );
+    expect(decision.action).not.toBe('missed_impossible');
+  });
+
+  test('queue shrinking → wait (dispatch-purge guard)', () => {
+    const decision = _evaluatePositionScheduler(
+      makeState(),
+      { ...baseCtx, queueShrinkageDetected: true, waitingCount: 110 },
+    );
+    expect(decision.action).toBe('wait');
+    expect(decision.reason).toBe('queue_shrinking');
+  });
+
+  test('past_max takes precedence over shrinkage', () => {
+    const decision = _evaluatePositionScheduler(
+      makeState(),
+      { ...baseCtx, queueShrinkageDetected: true, waitingCount: 130 },
+    );
+    expect(decision.action).toBe('missed_impossible');
+  });
+
+  test('normal case still fires when projection ≥ target and below max', () => {
+    const decision = _evaluatePositionScheduler(
+      makeState(),
+      { ...baseCtx, waitingCount: 80, estimatedDrift: 30 }, // 80+30 = 110 ≥ 100
+    );
+    expect(decision.action).toBe('fire');
   });
 });

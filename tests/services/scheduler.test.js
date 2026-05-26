@@ -34,6 +34,10 @@ beforeEach(() => {
 
 afterEach(async () => {
   await truncateAll();
+  // The credential lockout is in-memory and keyed by driver.id. Since
+  // truncateAll restarts the id sequence, a lockout armed in one test can
+  // bleed into the next test's driver. Reset it here for isolation.
+  require('../../src/services/credentialLockoutService')._reset();
 });
 
 // ─── Pure driver-selection helper (mirrors the cron tick logic) ───────────

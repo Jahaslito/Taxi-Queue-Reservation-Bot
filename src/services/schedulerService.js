@@ -3,6 +3,7 @@ const Driver  = require('../models/Driver');
 const Log     = require('../models/Log');
 const { decrypt }    = require('./cryptoService');
 const { addToQueue, removeFromQueue, sanitizeError } = require('./botService');
+const credentialLockout = require('./credentialLockoutService');
 
 // In-memory set prevents the same driver from running twice simultaneously
 const runningJobs = new Set();
@@ -90,6 +91,26 @@ async function runBotForDriver(driver, triggerType = 'scheduled') {
     console.log(`[Scheduler] Skipping ${driver.name} (${driver.vehicle_number}) — already running`);
     return;
   }
+
+  // Credential breaker — if the bot already confirmed today that SAN rejects
+  // this driver's credentials, don't waste a Chromium slot retrying. The
+  // lockout self-expires at midnight PT, and clears immediately whenever the
+  // driver edits their SAN password via the API. Returns a result shaped like
+  // a normal bot failure so callers can log/render it uniformly.
+  const lockout = credentialLockout.getLockout(driver.id);
+  if (lockout) {
+    const msg = 'Invalid SAN username or password — update your SAN password and try again';
+    console.log(`[Scheduler] ⛔ Skipping ${driver.name} (${driver.vehicle_number}) — locked out (${lockout.reason})`);
+    await Log.create({
+      driver_id:     driver.id,
+      triggered_at:  new Date(),
+      trigger_type:  triggerType,
+      status:        'failed',
+      error_message: msg,
+    });
+    return { success: false, error: msg, message: msg, durationMs: 0 };
+  }
+
   runningJobs.add(jobKey);
 
   const logId = await Log.create({
@@ -131,6 +152,10 @@ async function runBotForDriver(driver, triggerType = 'scheduled') {
         queue_time:     result.queueTime,
         duration_ms:    result.durationMs,
       });
+      // Bot just logged in successfully — credentials must be valid, so any
+      // stale lockout from earlier today (e.g. driver since updated password)
+      // can be cleared.
+      credentialLockout.clearLockout(driver.id);
       console.log(`[Scheduler] ✓ ${driver.name} → ${result.message}`);
     } else {
       await Log.update(logId, {
@@ -138,6 +163,11 @@ async function runBotForDriver(driver, triggerType = 'scheduled') {
         error_message: result.error || result.message,
         duration_ms:   result.durationMs,
       });
+      // Arm the day-scoped breaker on credential errors so subsequent retries
+      // for this driver short-circuit instead of timing out the same way.
+      if (credentialLockout.isCredentialError(result.error || result.message)) {
+        credentialLockout.lockOut(driver.id, result.error || result.message);
+      }
       console.error(`[Scheduler] ✗ ${driver.name} → ${result.message}`);
     }
 

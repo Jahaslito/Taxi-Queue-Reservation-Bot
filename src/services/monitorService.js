@@ -1,5 +1,7 @@
 'use strict';
 
+const fs    = require('fs');
+const path  = require('path');
 const { fetch: ufetch, ProxyAgent } = require('undici');
 
 // ─── Queue Monitor Service ────────────────────────────────────────────────────
@@ -73,6 +75,11 @@ const POS_END_HOUR     = parseInt(process.env.MONITOR_POS_END_HOUR     ?? '23', 
 // Minimum lead buffer (positions). Small safety cushion for near-zero growth days.
 // The dynamic drift calculation takes over whenever growth exceeds ~10 drivers/tick.
 const POS_LEAD_BUFFER  = parseInt(process.env.MONITOR_POS_LEAD_BUFFER  ?? '5', 10);
+// Floor for the per-tick drift estimate. The old value of 20 was too aggressive
+// — it caused systematic over-firing on quiet/flat-queue mornings (drivers
+// landing 10-20+ positions BELOW target). 5 keeps a small cushion without
+// fabricating growth that isn't there.
+const POS_DRIFT_FLOOR  = parseInt(process.env.MONITOR_POS_DRIFT_FLOOR  ?? '5',  10);
 // Fallback estimate for Playwright bot execution time (ms) before we have real
 // data. Used to project how many positions will be added between the fire decision
 // and when SAN assigns the queue slot. The actual estimate is the rolling P95 of
@@ -296,11 +303,59 @@ const MAX_LATENCY_SAMPLES  = 30;
 const MIN_SAMPLES_FOR_P95  = 5;
 const botLatencySamples    = []; // ms; newest pushed to end, oldest shifted off
 
+// ─── Persistence — survives restarts so cold-start doesn't fall back to the
+// 15 s POS_BOT_EXEC_MS default on a busy morning ──────────────────────────────
+// Tiny JSON file. Reads once on boot; writes atomically (write-to-temp +
+// rename) so a crash mid-write can't corrupt the file. Throttled to one write
+// per ~5 s so a burst of bot completions doesn't hammer the disk.
+const LATENCY_PERSIST_PATH = process.env.BOT_LATENCY_PERSIST_PATH
+  ?? path.join(process.cwd(), 'data', 'bot-latency-samples.json');
+const LATENCY_PERSIST_THROTTLE_MS = 5000;
+let latencyPersistTimer = null;
+
+function loadBotLatencyFromDisk() {
+  try {
+    if (!fs.existsSync(LATENCY_PERSIST_PATH)) return;
+    const raw = JSON.parse(fs.readFileSync(LATENCY_PERSIST_PATH, 'utf8'));
+    if (!Array.isArray(raw)) return;
+    for (const ms of raw) {
+      if (Number.isFinite(ms) && ms > 0 && botLatencySamples.length < MAX_LATENCY_SAMPLES) {
+        botLatencySamples.push(ms);
+      }
+    }
+    if (botLatencySamples.length) {
+      console.log(`[Monitor] Restored ${botLatencySamples.length} bot-latency samples from disk`);
+    }
+  } catch (err) {
+    console.warn(`[Monitor] Could not load latency samples (${err.message}) — starting fresh`);
+  }
+}
+
+function schedulePersistBotLatency() {
+  if (latencyPersistTimer) return; // already pending
+  latencyPersistTimer = setTimeout(() => {
+    latencyPersistTimer = null;
+    const tmp = `${LATENCY_PERSIST_PATH}.tmp`;
+    try {
+      fs.mkdirSync(path.dirname(LATENCY_PERSIST_PATH), { recursive: true });
+      fs.writeFileSync(tmp, JSON.stringify(botLatencySamples));
+      fs.renameSync(tmp, LATENCY_PERSIST_PATH); // atomic on POSIX
+    } catch (err) {
+      console.warn(`[Monitor] Could not persist latency samples: ${err.message}`);
+      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  }, LATENCY_PERSIST_THROTTLE_MS).unref();
+}
+
 function recordBotLatency(durationMs) {
   if (!Number.isFinite(durationMs) || durationMs <= 0) return;
   botLatencySamples.push(durationMs);
   if (botLatencySamples.length > MAX_LATENCY_SAMPLES) botLatencySamples.shift();
+  schedulePersistBotLatency();
 }
+
+// Eagerly load on module import so the first poll already has data.
+loadBotLatencyFromDisk();
 
 /**
  * Returns the bot execution estimate (ms) used by the drift forecast.
@@ -657,6 +712,7 @@ async function fetchPage(url) {
 //   { action: 'skip_already_seen'   , reason, logLine, metrics }
 //   { action: 'fire'                , reason, logLine, fireOpts, ... } // sets positionFiredToday
 //   { action: 'wait'                , reason, logLine, metrics, secondsUntilFire }
+//   { action: 'missed_impossible'   , reason, logLine, metrics }       // queue already past max
 function evaluatePositionScheduler(state, ctx) {
   const {
     waitingCount,
@@ -667,6 +723,7 @@ function evaluatePositionScheduler(state, ctx) {
     botExecMs,
     todayDayKey,
     botSamplesCount,
+    queueShrinkageDetected = false,
   } = ctx;
 
   // Resolve today's effective position — skip drivers with no target today
@@ -711,11 +768,41 @@ function evaluatePositionScheduler(state, ctx) {
     };
   }
 
+  // ─── Already past max — abort, the train has left the station ────────────
+  // If the queue is ALREADY beyond maxAcceptable at fire-decision time, there
+  // is no possible bot completion time where the driver lands at-or-better
+  // than max. Firing anyway just wastes a bot slot and produces a record like
+  // "target 350, actual 481" which is meaningless data. Mark the row as
+  // missed_impossible so the admin UI shows what happened.
+  if (waitingCount > maxAcceptable) {
+    return {
+      action:  'missed_impossible',
+      reason:  'queue_already_past_max',
+      logLine: `[Pos] ${veh} — ✗ queue ${waitingCount} > max ${maxAcceptable} (target ${effectivePosition}) — too late, skipping`,
+      metrics: { ...baseMetrics, queueSize: waitingCount },
+    };
+  }
+
+  // ─── Dispatch-purge guard ────────────────────────────────────────────────
+  // If the queue is actively shrinking (a dispatch batch just opened — common
+  // at the 5 AM operating-hour boundary), pause for a poll cycle. Otherwise
+  // the projection will fire bots that land 50-80 positions BELOW target
+  // because between the fire decision and bot completion, 50+ drivers move
+  // out of waiting → dispatched.
+  if (queueShrinkageDetected) {
+    return {
+      action:  'wait',
+      reason:  'queue_shrinking',
+      secondsUntilFire: 30, // re-poll soon
+      logLine: `[Pos] ${veh} — ⏸ queue shrinking (target ${effectivePosition}, queue ${waitingCount}) — waiting for purge to settle`,
+      metrics: { ...baseMetrics, queueSize: waitingCount },
+    };
+  }
+
   // ─── Projection and fire decision ─────────────────────────────────────────
-  // Simple rule: fire as soon as projection reaches target. We do NOT cap on
-  // maxAcceptable — the user wants every driver queued so we can record actual
-  // landing positions and learn from the data. maxAcceptable is still recorded
-  // in the tracking row for later analysis.
+  // Fire as soon as projection reaches target — bounded above by maxAcceptable
+  // (early-out above). Bias correction is layered in to compensate for
+  // systematic landing errors observed in recent history.
   const projectedLanding = waitingCount + estimatedDrift + biasCorrection;
   const shouldFire       = projectedLanding >= effectivePosition;
 
@@ -862,10 +949,18 @@ async function poll() {
   let lastPollRate        = null;
   let shortWindowRate     = null;
   let effectiveGrowthRate = EMERGENCY_SURGE_RATE; // floor — never starts at zero
+  let queueShrinkageDetected = false;
   if (prevWaitingCount !== null && prevObservationAt !== null) {
     const secondsElapsed = Math.max(1, (lastObservationAt - prevObservationAt) / 1000);
-    const rawGrowth      = Math.max(0, waitingCount - prevWaitingCount);
+    const rawDelta       = waitingCount - prevWaitingCount; // signed
+    const rawGrowth      = Math.max(0, rawDelta);
     lastPollRate         = rawGrowth / secondsElapsed;
+
+    // Detect queue purges: a big drop within a single poll window indicates
+    // SAN just promoted a batch from waiting → dispatched (common at 5 AM
+    // dispatch open). The 10-driver threshold is intentionally well above
+    // normal noise so we don't pause on individual departures.
+    if (rawDelta <= -10) queueShrinkageDetected = true;
 
     smoothedGrowthRate = smoothedGrowthRate * 0.3 + lastPollRate * 0.7; // EMA α=0.7
 
@@ -1148,7 +1243,9 @@ async function poll() {
   // estimatedDrift = rate(drivers/sec) × horizonSeconds → positions added during that window.
   // biasCorrection  — median of recent (actual - target) landing errors from position_tracking.
   //   If positive (we keep landing too far back), the prediction is bumped up so the bot fires earlier.
-  // Floor of 20 ensures the bot fires early enough on slow-growth mornings.
+  // POS_DRIFT_FLOOR (5) provides a small cushion on near-zero-growth mornings without fabricating
+  //   growth that isn't there. Burst-aware effectiveBotExecMs handles the concurrency-contention case
+  //   (a bot waiting behind N others in the JobQueue has a longer effective horizon).
   if (isWithinPositionHours()) {
   const todayDayStr = new Date().toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/Los_Angeles' });
   const DAY_KEY_MAP = { Sun: '0', Mon: '1', Tue: '2', Wed: '3', Thu: '4', Fri: '5', Sat: '6' };
@@ -1156,8 +1253,18 @@ async function poll() {
 
   const pollAgeSeconds = lastObservationAt ? (Date.now() - lastObservationAt) / 1000 : POLL_INTERVAL_MS / 1000;
   const botExecMs      = botExecutionEstimateMs();
-  const horizonSeconds = pollAgeSeconds + (botExecMs / 1000) + SAFETY_BUFFER_SECS;
-  const estimatedDrift = Math.max(20, Math.ceil(effectiveGrowthRate * horizonSeconds));
+
+  // Burst-aware effective bot latency: when multiple bots are already running
+  // or pending in the JobQueue, this bot will wait behind them before its own
+  // ~botExecMs of work starts. Inflate the per-driver projection accordingly.
+  // Formula matches actual queueing: ceil((alreadyInFlight + 1) / concurrency)
+  // batches of botExecMs each, e.g. 5 bots already in flight, concurrency 3
+  // → this bot is in the 2nd batch → effective wait = 2 × botExecMs.
+  const inflightBots         = jobQueue.activeCount + jobQueue.pendingCount;
+  const burstBatchPosition   = Math.ceil((inflightBots + 1) / Math.max(1, jobQueue.concurrency));
+  const effectiveBotExecMs   = botExecMs * burstBatchPosition;
+  const horizonSeconds       = pollAgeSeconds + (effectiveBotExecMs / 1000) + SAFETY_BUFFER_SECS;
+  const estimatedDrift       = Math.max(POS_DRIFT_FLOOR, Math.ceil(effectiveGrowthRate * horizonSeconds));
 
   // Context shared by every per-driver decision. Pure data — no module state.
   const decisionCtx = {
@@ -1168,7 +1275,8 @@ async function poll() {
     horizonSeconds,
     botExecMs,
     todayDayKey,
-    botSamplesCount: botLatencySamples.length,
+    botSamplesCount:         botLatencySamples.length,
+    queueShrinkageDetected,
   };
 
   // Track the soonest fire across all armed drivers — drives adaptive polling.
@@ -1215,6 +1323,16 @@ async function poll() {
         state.positionFiredToday = true; // mark before enqueuing — prevents double-trigger
         triggerPositionSchedule(driverId, state, decision.effectivePosition, decision.fireOpts)
           .catch(console.error);
+        break;
+
+      case 'missed_impossible':
+        // Queue is already past max — firing now would land far above max.
+        // Record the row for visibility and mark fired so the monitor's
+        // defer-to-position-scheduler condition releases (otherwise we'd be
+        // stuck waiting forever on this driver).
+        console.log(decision.logLine);
+        recordPositionDecision(state, decision.action, decision.reason, decision.metrics);
+        state.positionFiredToday = true;
         break;
 
       default:

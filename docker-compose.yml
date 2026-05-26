@@ -94,6 +94,7 @@ services:
 
     volumes:
       - ./logs:/app/logs   # daily log files persist across container restarts
+      - ./data:/app/data   # runtime state (bot latency samples, etc.) persists across restarts
 
     # Shared memory for Chromium (prevents crashes on small droplets)
     shm_size: '256mb'

@@ -189,11 +189,30 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
       await page.fill('input[placeholder="Enter Username"]', sanUsername);
       await page.fill('input[placeholder="Enter Password"]', sanPassword);
 
-      // Click Log In — wait for OIDC callback to redirect back to the app
-      await Promise.all([
-        page.waitForURL(`**/${APP_HOST}/**`, { timeout: NAV_TIMEOUT }),
-        page.click('button:has-text("Log In")'),
-      ]);
+      // Click Log In, then race the OIDC redirect against the "Invalid
+      // username or password" error appearing on the same page. Without this
+      // race, a credentials failure makes us wait the full NAV_TIMEOUT (60 s)
+      // for a redirect that will never happen — and the resulting Playwright
+      // timeout gets reported to the driver as "SAN took too long," sending
+      // them to the wrong fix. Detecting the error text early lets us throw
+      // with the correct message and lets the scheduler trip a day-scoped
+      // breaker instead of retrying for hours.
+      await page.click('button:has-text("Log In")');
+
+      const winner = await Promise.race([
+        page.waitForURL(`**/${APP_HOST}/**`, { timeout: NAV_TIMEOUT }).then(() => 'redirected'),
+        page.locator('text=/Invalid username or password/i').first()
+          .waitFor({ state: 'visible', timeout: NAV_TIMEOUT })
+          .then(() => 'invalid_credentials'),
+      ]).catch((err) => { throw err; });
+
+      if (winner === 'invalid_credentials') {
+        // Capture so admin can audit what SAN actually showed
+        await debugCapture(page, vehicleNumber, 'invalid_credentials').catch(() => {});
+        // The literal substring "Invalid SAN" is what sanitizeError matches
+        // and what schedulerService.isTransientError keys off — keep it.
+        throw new Error('Invalid SAN username or password — check your credentials');
+      }
 
       console.log(`[Bot] ${vehicleNumber} → OIDC callback complete — back on eDispatch.`);
     } else {

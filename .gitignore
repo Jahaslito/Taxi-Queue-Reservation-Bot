@@ -11,3 +11,4 @@ README.md
 .DS_Store
 flyers/
 jest.config.js
+logs/

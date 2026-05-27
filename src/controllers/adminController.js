@@ -296,6 +296,26 @@ async function updateDriver(req, res, next) {
       throw err;
     }
 
+    // If SAN credentials changed, clear any active credential lockout AND the
+    // cached Playwright session — both could re-fail with the old password
+    // even after the admin saved the new one. Without this the day-scoped
+    // breaker keeps short-circuiting the bot until midnight PT.
+    const credsChanged = (sanUsername && sanUsername !== driver.san_username)
+                      || !!sanPassword;
+    if (credsChanged) {
+      const credentialLockout = require('../services/credentialLockoutService');
+      credentialLockout.clearLockout(Number(req.params.id));
+      // Drop stale cached cookies for the OLD username (and the new one too —
+      // harmless if it doesn't exist yet).
+      try {
+        const { sessionStore } = require('../services/botService');
+        if (sessionStore?.delete) {
+          if (driver.san_username) sessionStore.delete(driver.san_username);
+          if (sanUsername)         sessionStore.delete(sanUsername);
+        }
+      } catch { /* session store not exported — non-fatal */ }
+    }
+
     // If the admin added or changed the driver's email, send a fresh verification
     // email and clear the verified timestamp so the new address gets confirmed.
     const emailChanged = normalisedEmail && normalisedEmail !== driver.email;

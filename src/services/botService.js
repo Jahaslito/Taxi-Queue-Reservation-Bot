@@ -553,4 +553,4 @@ async function removeFromQueue(sanUsername, sanPassword, vehicleNumber) {
   }
 }
 
-module.exports = { addToQueue, removeFromQueue, sanitizeError };
+module.exports = { addToQueue, removeFromQueue, sanitizeError, sessionStore };

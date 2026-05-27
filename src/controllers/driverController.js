@@ -123,6 +123,23 @@ async function updateProfile(req, res, next) {
       throw err;
     }
 
+    // Clear any active credential lockout + stale Playwright session if the
+    // driver updated their SAN credentials. See the equivalent block in
+    // adminController.updateDriver for the why.
+    const credsChanged = (sanUsername && sanUsername !== driver.san_username)
+                      || !!sanPassword;
+    if (credsChanged) {
+      const credentialLockout = require('../services/credentialLockoutService');
+      credentialLockout.clearLockout(Number(req.driverId));
+      try {
+        const { sessionStore } = require('../services/botService');
+        if (sessionStore?.delete) {
+          if (driver.san_username) sessionStore.delete(driver.san_username);
+          if (sanUsername)         sessionStore.delete(sanUsername);
+        }
+      } catch { /* session store not exported — non-fatal */ }
+    }
+
     res.json(updated);
   } catch (err) {
     next(err);

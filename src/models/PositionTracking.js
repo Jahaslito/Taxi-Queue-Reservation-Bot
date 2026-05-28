@@ -223,25 +223,54 @@ class PositionTracking {
 
   /**
    * Median landing error from recent completed fires.
-   * Returns null if fewer than 5 completed records exist (not enough data to
-   * calibrate). A positive value means drivers are landing too far back →
-   * bot should fire earlier.
+   * Returns null if fewer than MIN_SAMPLES post-filter records exist (not
+   * enough data to calibrate). A positive value means drivers are landing too
+   * far back → bot should fire earlier.
+   *
+   * Outliers with |error| > outlierMax are discarded before the median.
+   * Justification: on 2026-05-27 the bot's "Already in queue" path produced
+   * fires recorded as actual=33 with target=150 — a −117 outlier. One bad
+   * sample like that pulled the median ~10 positions in the wrong direction
+   * and pushed legitimate fires past maxAcceptable later that morning. The
+   * threshold defaults to 30 because real fires consistently land within
+   * ±15-20 of target — anything past that is almost certainly a stale-position
+   * race, not a prediction error worth calibrating against.
    */
-  static async medianRecentError(limit = 30) {
+  static async medianRecentError(limit = 30, options = {}) {
     const rows = await db(TABLE)
       .select(db.raw('actual_position - target_position AS error'))
       .whereNotNull('actual_position')
       .orderBy('fired_at', 'desc')
       .limit(limit);
 
-    if (rows.length < 5) return null;
-
-    const errors = rows.map(r => Number(r.error)).sort((a, b) => a - b);
-    const mid    = Math.floor(errors.length / 2);
-    return errors.length % 2 === 0
-      ? (errors[mid - 1] + errors[mid]) / 2
-      : errors[mid];
+    return computeFilteredMedian(rows.map(r => Number(r.error)), options);
   }
 }
+
+const MIN_BIAS_SAMPLES = 5;
+
+/**
+ * Pure: median of `errors` after discarding |value| > outlierMax. Exported on
+ * the class for unit-testability without a DB connection.
+ *
+ * Returns null when fewer than MIN_BIAS_SAMPLES post-filter samples remain —
+ * the prediction code should leave bias at 0 in that case rather than
+ * over-correcting on a tiny sample.
+ */
+function computeFilteredMedian(errors, { outlierMax = 30 } = {}) {
+  const filtered = errors
+    .filter(e => Number.isFinite(e) && Math.abs(e) <= outlierMax)
+    .sort((a, b) => a - b);
+
+  if (filtered.length < MIN_BIAS_SAMPLES) return null;
+
+  const mid = Math.floor(filtered.length / 2);
+  return filtered.length % 2 === 0
+    ? (filtered[mid - 1] + filtered[mid]) / 2
+    : filtered[mid];
+}
+
+PositionTracking._computeFilteredMedian = computeFilteredMedian;
+PositionTracking.MIN_BIAS_SAMPLES       = MIN_BIAS_SAMPLES;
 
 module.exports = PositionTracking;

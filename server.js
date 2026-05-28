@@ -132,6 +132,9 @@ async function bootstrap() {
 
     const { startMonitor } = require('./src/services/monitorService');
     startMonitor().catch((err) => console.error('[Monitor] Failed to start:', err.message));
+
+    const { startSessionWarmer } = require('./src/services/sessionWarmerService');
+    startSessionWarmer();
   });
 }
 

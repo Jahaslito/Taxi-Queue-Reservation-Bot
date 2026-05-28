@@ -51,10 +51,10 @@ async function loadDashboard() {
     });
     if (driverProfile.day_positions || driverProfile.scheduled_position) {
       const todayPos = getTodayPosition(driverProfile);
-      document.getElementById('stat-time').textContent     = todayPos ? `~${todayPos}` : '—';
+      document.getElementById('stat-time').textContent     = todayPos ? `~${todayPos}` : 'Not set';
       document.getElementById('stat-time-lbl').textContent = 'Target Position';
     } else {
-      document.getElementById('stat-time').textContent     = driverProfile.scheduled_time || '--:--';
+      document.getElementById('stat-time').textContent     = driverProfile.scheduled_time || 'Not set';
       document.getElementById('stat-time-lbl').textContent = 'Scheduled Time';
     }
     document.getElementById('stat-vehicle').textContent = driverProfile.vehicle_number;
@@ -105,48 +105,66 @@ function updateRemoveQueueButtonVisibility(statusData) {
 }
 
 // ─── Today status card ────────────────────────────────────────────────────────
-// `statusData` is the full /api/driver/status/today payload (todayLog + liveQueueState).
-// Accepting the whole payload — not just `todayLog` — lets us key the
-// Remove-from-Queue button off the monitor's live state instead of stale log rows.
+// `statusData` is the full /api/driver/status/today payload
+// (todayLog + liveQueueState + positionTracking).
+//
+// Render policy: live location and target/scheduled comparison are ALWAYS
+// shown when their data is available — driver shouldn't have to wait for the
+// first bot fire of the day to see their target. Only log-specific bits
+// (status badge, raw queue-position triplet, error message) gate on `log`.
 function renderTodayStatus(statusData) {
   // Show or hide the "Remove from Queue" button based on current state
   updateRemoveQueueButtonVisibility(statusData);
-  const log = statusData && statusData.todayLog;
+  const log              = statusData && statusData.todayLog;
+  const live             = statusData && statusData.liveQueueState;
+  const positionTracking = statusData && statusData.positionTracking;
 
   const el = document.getElementById('today-status-content');
 
-  if (!log) {
+  // Always-visible strips. Each helper short-circuits to '' when its data
+  // isn't available, so the only output is the parts that are actually known.
+  const liveStrip       = renderLiveLocation(live);
+  const comparisonStrip = renderScheduleComparison(driverProfile, log, positionTracking);
+
+  // Header: log-status badge if we have a log today, otherwise the
+  // "scheduled by …" preamble.
+  let headerHtml;
+  if (log) {
+    const statusMap = {
+      success:        { label: 'Success',        cls: 'badge-success' },
+      already_queued: { label: 'Already Queued', cls: 'badge-success' },
+      failed:         { label: 'Failed',         cls: 'badge-failed'  },
+      pending:        { label: 'Running…',       cls: 'badge-pending' },
+    };
+    const s = statusMap[log.status] || statusMap.pending;
+    headerHtml = `
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+        <span class="status-badge ${s.cls}"><span class="badge-dot"></span>${s.label}</span>
+        <span style="font-size:12px;color:var(--muted);">${formatTime(log.triggered_at)}</span>
+      </div>`;
+  } else {
     const todayPos  = driverProfile ? getTodayPosition(driverProfile) : null;
     const schedInfo = todayPos
       ? `📍 position <strong style="color:var(--white);">~${todayPos}</strong>`
       : (driverProfile?.day_positions || driverProfile?.scheduled_position)
         ? '📍 position-based schedule (no target for today)'
         : `<strong style="color:var(--white);">${driverProfile?.scheduled_time || '--:--'}</strong> PT`;
-    el.innerHTML = `
-      <div style="display:flex;align-items:center;gap:12px;">
+    headerHtml = `
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
         <div style="font-size:28px;">⏳</div>
         <div>
           <div style="font-weight:600;">Not yet queued today</div>
           <div style="font-size:13px;color:var(--muted);">Scheduled by ${schedInfo}</div>
         </div>
       </div>`;
-    return;
   }
 
-  const statusMap = {
-    success:        { label: 'Success',        cls: 'badge-success' },
-    already_queued: { label: 'Already Queued', cls: 'badge-success' },
-    failed:         { label: 'Failed',         cls: 'badge-failed'  },
-    pending:        { label: 'Running…',       cls: 'badge-pending' },
-  };
-  const s = statusMap[log.status] || statusMap.pending;
-
-  el.innerHTML = `
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
-      <span class="status-badge ${s.cls}"><span class="badge-dot"></span>${s.label}</span>
-      <span style="font-size:12px;color:var(--muted);">${formatTime(log.triggered_at)}</span>
-    </div>
-    ${log.queue_position ? `
+  // Footer: log detail rows + error. Only rendered when log exists.
+  // The raw position/location/queueTime triplet is suppressed when liveStrip
+  // is already showing position info — avoids duplicating the same number.
+  let footerHtml = '';
+  if (log && log.queue_position && !live) {
+    footerHtml += `
       <div style="display:flex;gap:20px;">
         <div>
           <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;">Position</div>
@@ -160,8 +178,134 @@ function renderTodayStatus(statusData) {
           <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;">Queue Time</div>
           <div style="font-size:16px;font-weight:600;margin-top:4px;">${esc(log.queue_time) || 'N/A'}</div>
         </div>
-      </div>` : ''}
-    ${log.error_message ? `<div style="font-size:13px;color:var(--red);margin-top:8px;">${esc(log.error_message)}</div>` : ''}`;
+      </div>`;
+  }
+  if (log && log.error_message) {
+    footerHtml += `<div style="font-size:13px;color:var(--red);margin-top:8px;">${esc(log.error_message)}</div>`;
+  }
+
+  el.innerHTML = headerHtml + liveStrip + comparisonStrip + footerHtml;
+}
+
+// ─── Live location strip ──────────────────────────────────────────────────────
+// Reads the monitor's current view of the driver: in V Holding, dispatched out
+// of V Holding (waiting to be assigned a gate), or physically at T1/T2. The
+// monitor updates currentPosition / terminalName on every poll, so this strip
+// reflects what the driver would see if they refreshed the SAN page right now.
+function renderLiveLocation(live) {
+  if (!live) return '';
+
+  const tile = (label, value, color) => `
+    <div style="flex:1;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:12px;padding:14px;">
+      <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;">${label}</div>
+      <div style="font-family:'Syne',sans-serif;font-size:24px;font-weight:700;color:${color};margin-top:4px;">${value}</div>
+    </div>`;
+
+  let label, value, color;
+  switch (live.state) {
+    case 'in_queue':
+      label = 'In V Holding';
+      value = Number.isFinite(live.currentPosition) ? `#${live.currentPosition}` : '—';
+      color = 'var(--teal)';
+      break;
+    case 'dispatched':
+      label = 'Dispatched';
+      value = Number.isFinite(live.currentPosition) ? `#${live.currentPosition}` : '—';
+      color = 'var(--amber, #f5a623)';
+      break;
+    case 'at_terminal':
+      label = live.terminalName === 'T1' ? 'At Terminal 1'
+            : live.terminalName === 'T2' ? 'At Terminal 2'
+            : 'At Terminal';
+      value = Number.isFinite(live.terminalPosition) ? `#${live.terminalPosition}` : 'waiting…';
+      color = 'var(--green, #22c55e)';
+      break;
+    case 'requeuing':
+      label = 'Bot Running';
+      value = '⏳';
+      color = 'var(--teal)';
+      break;
+    case 'watching':
+      // Monitor knows about this driver but hasn't observed them in V Holding
+      // since this session started. Show the reassurance that we're watching
+      // rather than hiding the strip — drivers want to see the system is on.
+      label = 'Monitoring';
+      value = 'Not in queue';
+      color = 'var(--muted)';
+      break;
+    default:
+      return ''; // unknown state — nothing useful to show
+  }
+  return `<div style="display:flex;gap:10px;margin-bottom:12px;">${tile(label, value, color)}</div>`;
+}
+
+// ─── Target vs Actual / Scheduled vs Queued comparison ────────────────────────
+// Position-scheduled drivers see Target vs Actual (with delta).
+// Time-scheduled drivers see Scheduled time vs the time the bot actually
+// queued them.
+//
+// `log` may be null when called before the first bot fire of the day —
+// target/scheduled are still rendered (sourced from the driver profile or
+// positionTracking row), and actual/queued show "pending…" until the log
+// row appears.
+function renderScheduleComparison(profile, log, posTracking) {
+  if (!profile) return '';
+
+  // Position-scheduled: show target column even on no-target days — "Not set
+  // for today" is more informative than hiding the row entirely. Actual stays
+  // 'pending…' until landed.
+  if (profile.day_positions || profile.scheduled_position) {
+    const target    = posTracking?.targetPosition ?? getTodayPosition(profile);
+    const actualNum = Number.isFinite(posTracking?.actualPosition)
+      ? posTracking.actualPosition
+      : (Number.isFinite(log?.queue_position) ? log.queue_position : null);
+    const delta = (actualNum !== null && target !== null) ? actualNum - target : null;
+    return comparisonRow(
+      { label: 'Target', value: target !== null ? `~${target}` : 'Not set today' },
+      { label: 'Actual', value: actualNum !== null ? `#${actualNum}` : 'pending…', delta, deltaSuffix: 'positions' },
+    );
+  }
+
+  // Time-scheduled: same treatment — show 'Not set today' when there's no
+  // scheduled time for today rather than hiding the row.
+  const scheduled = getTodayScheduledTime(profile);
+  const queuedAt  = log ? (log.queue_time || formatTime(log.triggered_at)) : null;
+  return comparisonRow(
+    { label: 'Scheduled', value: scheduled || 'Not set today' },
+    { label: 'Queued',    value: queuedAt  || 'pending…'      },
+  );
+}
+
+function getTodayScheduledTime(profile) {
+  if (profile.day_schedules) {
+    try {
+      const ds   = JSON.parse(profile.day_schedules);
+      const abbr = new Date().toLocaleDateString('en-US', { weekday: 'short', timeZone: PT });
+      const map  = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+      return ds[String(map[abbr])] || null;
+    } catch { /* fall through */ }
+  }
+  return profile.scheduled_time || null;
+}
+
+function comparisonRow(left, right) {
+  const deltaTag = Number.isFinite(right.delta)
+    ? `<span style="font-size:12px;font-weight:700;color:${right.delta > 0 ? '#f87171' : (right.delta < 0 ? '#86efac' : 'var(--muted)')};margin-left:6px;">
+         ${right.delta > 0 ? '+' : ''}${right.delta}${right.deltaSuffix ? ` ${right.deltaSuffix}` : ''}
+       </span>`
+    : '';
+  const cell = (label, value) => `
+    <div style="flex:1;">
+      <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;">${esc(label)}</div>
+      <div style="font-size:18px;font-weight:700;margin-top:4px;">${esc(value)}</div>
+    </div>`;
+  return `
+    <div style="display:flex;align-items:center;gap:16px;background:rgba(255,255,255,0.025);border:1px solid var(--border);border-radius:12px;padding:12px 14px;margin-bottom:12px;">
+      ${cell(left.label, left.value)}
+      <div style="font-size:18px;color:var(--muted);">→</div>
+      ${cell(right.label, right.value)}
+      ${deltaTag}
+    </div>`;
 }
 
 // ─── Requeue button visual state ──────────────────────────────────────────────

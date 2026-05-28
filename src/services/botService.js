@@ -75,18 +75,69 @@ const NAV_TIMEOUT = 60000;   // Extra time for full page-navigation round-trips
 //   • Populated on every successful login — overwritten on every successful run.
 //   • Evicted automatically after SESSION_TTL_MS (proactive expiry).
 //   • Cleared immediately if SAN rejects the restored session (reactive expiry).
-//   • Lost on server restart — first run re-authenticates and repopulates.
+//   • Persisted to disk (atomic write) so a restart doesn't trigger the morning
+//     login storm — see SESSION_PERSIST_PATH below.
 //
 // IdentityServer (the OIDC provider used by SAN) does not bind sessions to IP,
 // so sessions remain valid across rotating residential proxy IPs.
 const SESSION_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const sessionStore   = new Map();            // sanUsername → { storageState, savedAt }
 
+// ─── Disk persistence ─────────────────────────────────────────────────────────
+// Mirrors the bot-latency-samples persistence pattern in monitorService:
+// atomic write-to-temp + rename, throttled to one disk write per ~5 s so a
+// burst of bot completions doesn't hammer the disk. Survives restarts so the
+// 5 AM cold-start doesn't pay the OIDC login tax for every active driver.
+const SESSION_PERSIST_PATH = process.env.BOT_SESSION_PERSIST_PATH
+  ?? path.join(process.cwd(), 'data', 'bot-sessions.json');
+const SESSION_PERSIST_THROTTLE_MS = 5000;
+let sessionPersistTimer = null;
+
+function loadSessionsFromDisk() {
+  try {
+    if (!fs.existsSync(SESSION_PERSIST_PATH)) return;
+    const raw = JSON.parse(fs.readFileSync(SESSION_PERSIST_PATH, 'utf8'));
+    if (!raw || typeof raw !== 'object') return;
+    let restored = 0;
+    let skipped  = 0;
+    for (const [username, entry] of Object.entries(raw)) {
+      if (!entry?.storageState || !Number.isFinite(entry.savedAt)) continue;
+      if (Date.now() - entry.savedAt > SESSION_TTL_MS) { skipped++; continue; }
+      sessionStore.set(username, entry);
+      restored++;
+    }
+    if (restored || skipped) {
+      console.log(`[Bot:session] Restored ${restored} session(s) from disk` +
+                  (skipped ? ` (${skipped} expired, skipped)` : ''));
+    }
+  } catch (err) {
+    console.warn(`[Bot:session] Could not load sessions from disk (${err.message}) — starting fresh`);
+  }
+}
+
+function schedulePersistSessions() {
+  if (sessionPersistTimer) return; // already pending
+  sessionPersistTimer = setTimeout(() => {
+    sessionPersistTimer = null;
+    const tmp = `${SESSION_PERSIST_PATH}.tmp`;
+    try {
+      fs.mkdirSync(path.dirname(SESSION_PERSIST_PATH), { recursive: true });
+      const payload = Object.fromEntries(sessionStore);
+      fs.writeFileSync(tmp, JSON.stringify(payload));
+      fs.renameSync(tmp, SESSION_PERSIST_PATH); // atomic on POSIX
+    } catch (err) {
+      console.warn(`[Bot:session] Could not persist sessions: ${err.message}`);
+      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  }, SESSION_PERSIST_THROTTLE_MS).unref();
+}
+
 function getStoredSession(username) {
   const entry = sessionStore.get(username);
   if (!entry) return undefined;
   if (Date.now() - entry.savedAt > SESSION_TTL_MS) {
     sessionStore.delete(username);
+    schedulePersistSessions();
     console.log(`[Bot:session] Evicted stale session for ${username}`);
     return undefined;
   }
@@ -95,7 +146,15 @@ function getStoredSession(username) {
 
 function saveSession(username, storageState) {
   sessionStore.set(username, { storageState, savedAt: Date.now() });
+  schedulePersistSessions();
 }
+
+function forgetSession(username) {
+  if (sessionStore.delete(username)) schedulePersistSessions();
+}
+
+// Eagerly load on module import so the first bot run already has data.
+loadSessionsFromDisk();
 
 /**
  * Automates the full SAN eDispatch queue process for one driver.
@@ -178,7 +237,7 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
       if (savedSession) {
         // SAN rejected the restored cookies — clear the bad entry so the next
         // run doesn't waste time trying the same stale session again.
-        sessionStore.delete(sanUsername);
+        forgetSession(sanUsername);
         console.log(`[Bot] ${vehicleNumber} → Saved session rejected by SAN — falling back to full login`);
       } else {
         console.log(`[Bot] ${vehicleNumber} → Redirected to OIDC login: ${page.url()}`);
@@ -343,8 +402,32 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
 
   } catch (err) {
     console.error(`[Bot] ${vehicleNumber} → ERROR: ${err.message}`);
-    // Capture page state at the moment of failure so we can see what the bot was looking at
     if (page) await debugCapture(page, vehicleNumber, 'error');
+
+    // Verify-on-timeout: SAN can be slow enough that our Playwright waitFor*
+    // exceeds its 60 s limit AFTER the add-to-queue request actually went
+    // through. Before reporting "took too long" to the driver, do a single
+    // V Holding fetch and check whether the vehicle is in fact in the queue.
+    // If it is, downgrade the failure to a success — same outcome the driver
+    // would see in SAN's own UI, just observed via a different page.
+    const looksLikeTimeout = /timeout|timed out|aborted due to timeout/i.test(err.message || '');
+    if (looksLikeTimeout) {
+      const verified = await verifyDriverInQueue(vehicleNumber).catch(() => null);
+      if (verified && Number.isFinite(verified.position)) {
+        console.log(`[Bot] ${vehicleNumber} → Timeout but driver IS in queue at #${verified.position} — treating as success`);
+        return {
+          success:       true,
+          alreadyQueued: true,    // we didn't observe the add directly
+          position:      verified.position,
+          location:      verified.location ?? 'V Holding',
+          queueTime:     null,    // not available from V Holding parse
+          durationMs:    Date.now() - startTime,
+          message:       `Added to queue — Position: ${verified.position}`,
+          recoveredFromTimeout: true,
+        };
+      }
+    }
+
     const friendly = sanitizeError(err.message);
     return {
       success: false,
@@ -356,6 +439,28 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
   } finally {
     if (browser) await browser.close();
   }
+}
+
+// ─── Lightweight V Holding verifier ──────────────────────────────────────────
+// Used by the catch handler above. We import lazily to avoid a circular
+// dependency (botService ← monitorService for the parseQueue helper).
+async function verifyDriverInQueue(vehicleNumber) {
+  const { fetch: ufetch } = require('undici');
+  const { _parseQueue, _norm } = require('./monitorService');
+  const QUEUE_URL = process.env.MONITOR_QUEUE_URL
+    ?? 'https://san.gtcvms.com/GSIDispatchmobile/spacezone/10-17';
+  const res  = await ufetch(QUEUE_URL, {
+    method: 'GET',
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) return null;
+  const html = await res.text();
+  const { waiting, dispatched } = _parseQueue(html);
+  const vn = _norm(vehicleNumber);
+  if (waiting.has(vn))    return { position: waiting.get(vn),    location: 'V Holding' };
+  if (dispatched.has(vn)) return { position: dispatched.get(vn), location: 'Dispatched' };
+  return null;
 }
 
 /** Returns true if the WAIT confirmation screen is currently visible. */
@@ -450,7 +555,7 @@ async function removeFromQueue(sanUsername, sanPassword, vehicleNumber) {
     // ─── STEP 2: login if redirected to OIDC ─────────────────────────────────
     if (page.url().includes(OIDC_HOST)) {
       if (savedSession) {
-        sessionStore.delete(sanUsername);
+        forgetSession(sanUsername);
         console.log(`[Bot] ${vehicleNumber} (remove) → saved session rejected — full login`);
       }
       await page.waitForSelector('input[placeholder="Enter Username"]', { timeout: TIMEOUT });
@@ -553,4 +658,139 @@ async function removeFromQueue(sanUsername, sanPassword, vehicleNumber) {
   }
 }
 
-module.exports = { addToQueue, removeFromQueue, sanitizeError, sessionStore };
+/**
+ * Logs into SAN eDispatch and persists the resulting storageState — without
+ * adding the vehicle to the queue. Used by sessionWarmerService to pre-warm
+ * sessions BEFORE the morning surge so the real fire bypasses the ~15-25 s
+ * OIDC login and runs in ~5 s.
+ *
+ * The login flow is intentionally a structural subset of addToQueue() — same
+ * navigation, same race against the "Invalid credentials" error, same session
+ * caching. The only thing missing is the vehicle search + Add-to-Queue click.
+ *
+ *   Result shape: { success, durationMs, error?, message?, rawError?, reused? }
+ *     reused: true  → existing cached session was still valid; no login performed.
+ *     reused: false → full OIDC login succeeded; new storageState saved.
+ *
+ * vehicleNumber is only used for log tagging — it's not sent to SAN here.
+ */
+async function warmSession({ sanUsername, sanPassword, vehicleNumber }) {
+  const startTime = Date.now();
+  let browser = null;
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--single-process',
+      ],
+    });
+
+    const proxyConfig  = getProxyConfig();
+    const savedSession = getStoredSession(sanUsername);
+
+    if (proxyConfig) {
+      console.log(`[Warm] ${vehicleNumber} → proxy session ${proxyConfig.username.split('-session-')[1] ?? '?'}`);
+    }
+    if (savedSession) {
+      console.log(`[Warm] ${vehicleNumber} → trying restored session for ${sanUsername}`);
+    }
+
+    const context = await browser.newContext({
+      userAgent:    'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+      viewport:     { width: 390, height: 844 },
+      permissions:     [],
+      acceptDownloads: false,
+      storageState:    savedSession,
+      ...(proxyConfig ? { proxy: proxyConfig } : {}),
+    });
+
+    const page = await context.newPage();
+
+    // Same bandwidth-saver as addToQueue — we don't render anything.
+    await page.route('**/*', route => {
+      const type = route.request().resourceType();
+      if (['image', 'font', 'stylesheet', 'media'].includes(type)) return route.abort();
+      return route.continue();
+    });
+
+    console.log(`[Warm] ${vehicleNumber} → Navigating to SAN eDispatch…`);
+    await page.goto(SAN_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+
+    await page.waitForURL(
+      url => url.href.includes(OIDC_HOST) || url.href.includes(APP_HOST),
+      { timeout: TIMEOUT },
+    );
+
+    let reused = false;
+    if (page.url().includes(OIDC_HOST)) {
+      if (savedSession) {
+        forgetSession(sanUsername);
+        console.log(`[Warm] ${vehicleNumber} → restored session rejected by SAN — full login`);
+      }
+
+      await page.waitForSelector('input[placeholder="Enter Username"]', { timeout: TIMEOUT });
+      console.log(`[Warm] ${vehicleNumber} → Filling credentials for ${sanUsername}…`);
+      await page.fill('input[placeholder="Enter Username"]', sanUsername);
+      await page.fill('input[placeholder="Enter Password"]', sanPassword);
+      await page.click('button:has-text("Log In")');
+
+      // Same race as addToQueue: detect bad-credentials promptly instead of
+      // waiting for the full NAV_TIMEOUT.
+      const winner = await Promise.race([
+        page.waitForURL(`**/${APP_HOST}/**`, { timeout: NAV_TIMEOUT }).then(() => 'redirected'),
+        page.locator('text=/Invalid username or password/i').first()
+          .waitFor({ state: 'visible', timeout: NAV_TIMEOUT })
+          .then(() => 'invalid_credentials'),
+      ]);
+
+      if (winner === 'invalid_credentials') {
+        // Same wording as addToQueue — credentialLockoutService matches on it.
+        throw new Error('Invalid SAN eDispatch username or password — check your credentials');
+      }
+      console.log(`[Warm] ${vehicleNumber} → OIDC callback complete — session warmed.`);
+    } else {
+      reused = true;
+      console.log(`[Warm] ${vehicleNumber} → restored session accepted by SAN — no login needed.`);
+    }
+
+    const storageState = await context.storageState();
+    saveSession(sanUsername, storageState);
+
+    return {
+      success:    true,
+      reused,
+      durationMs: Date.now() - startTime,
+      message:    reused ? 'session_reused' : 'session_warmed',
+    };
+  } catch (err) {
+    const friendly = sanitizeError(err.message);
+    console.error(`[Warm] ${vehicleNumber} → ERROR: ${err.message}`);
+    return {
+      success:    false,
+      durationMs: Date.now() - startTime,
+      error:      friendly,
+      message:    friendly,
+      rawError:   err.message,
+    };
+  } finally {
+    if (browser) await browser.close();
+  }
+}
+
+module.exports = {
+  addToQueue,
+  removeFromQueue,
+  warmSession,
+  sanitizeError,
+  sessionStore,
+  // Exposed for the warmer service and tests.
+  saveSession,
+  getStoredSession,
+  forgetSession,
+  SESSION_TTL_MS,
+};

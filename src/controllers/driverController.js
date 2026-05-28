@@ -167,16 +167,35 @@ async function getTodayStatus(req, res, next) {
     // Evaluate "today" in Pacific Time — consistent with the scheduler
     const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
 
+    // PositionTracking is required lazily so the controller still works if the
+    // table migration hasn't run (e.g. fresh dev DB) — we just return null.
+    let positionTracking = null;
+    try {
+      const PositionTracking = require('../models/PositionTracking');
+      const rows = await PositionTracking.byDate(today);
+      const row  = rows.find((r) => r.driver_id === req.driverId);
+      if (row) {
+        positionTracking = {
+          targetPosition:        row.target_position,
+          maxAcceptablePosition: row.max_acceptable_position,
+          actualPosition:        row.actual_position,
+          error:                 row.error,        // actual - target (null if not landed yet)
+          decision:              row.decision,
+          firedAt:               row.fired_at,
+          landedAt:              row.landed_at,
+        };
+      }
+    } catch { /* table missing / migration not run — surface no tracking */ }
+
     const [todayLog, driver] = await Promise.all([
       Log.findTodayLatest(req.driverId, today),
       Driver.findById(req.driverId),
     ]);
 
-    // Pull the monitor's live view of this driver. The monitor is the source of
-    // truth for "is this driver currently in the queue right now" — the log
-    // table only reflects what the bot did, not the current SAN state. The
-    // "Remove from Queue" button uses this so it shows whenever the driver is
-    // observably in the queue, regardless of which log row is most recent.
+    // Pull the monitor's live view of this driver. Source of truth for "where
+    // is this driver right now in SAN" — the log table only reflects what the
+    // bot did, not the current SAN state. The UI surfaces this as: in queue
+    // (#position), dispatched (#position), or at Terminal 1/2 (#position).
     let liveQueueState = null;
     try {
       // Lazy-require avoids the circular import chain
@@ -186,14 +205,21 @@ async function getTodayStatus(req, res, next) {
       const watch = state.watches.find((w) => w.driverId === req.driverId);
       if (watch) {
         liveQueueState = {
-          state:           watch.state,           // watching|in_queue|dispatched|at_terminal|requeuing
-          inQueue:         watch.state === 'in_queue',
-          currentPosition: watch.currentPosition ?? null,
+          state:            watch.state,           // watching|in_queue|dispatched|at_terminal|requeuing
+          inQueue:          watch.state === 'in_queue',
+          currentPosition:  watch.currentPosition ?? null,
+          terminalName:     watch.terminalName     ?? null, // 'T1' | 'T2' | null
+          terminalPosition: watch.terminalPosition ?? null,
         };
       }
     } catch { /* monitor unavailable — fall back to log-based UI */ }
 
-    res.json({ todayLog: todayLog || null, driver, liveQueueState });
+    res.json({
+      todayLog: todayLog || null,
+      driver,
+      liveQueueState,
+      positionTracking,
+    });
   } catch (err) {
     next(err);
   }

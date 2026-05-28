@@ -270,6 +270,12 @@ let prevObservationAt  = null;    // ms timestamp of previous observation
 let biasCorrection     = 0;       // positions — loaded from position_tracking history
 let biasPollCount      = 0;
 const BIAS_REFRESH_EVERY = 20;    // recalculate bias every N poll ticks
+// Maximum |bias| we'll apply. Belt to medianRecentError's outlier filter (the
+// braces) — bounds the worst-case prediction damage if a contamination path
+// we haven't found yet pulls the median to an unhelpful value. 10 positions is
+// enough for genuine calibration (real fires consistently land within ±15);
+// anything larger is almost certainly bad input data, not real drift.
+const BIAS_CAP_POSITIONS = parseInt(process.env.MONITOR_BIAS_CAP ?? '10', 10);
 // Circular buffer of recent {count, observedAt} snapshots for short-window rate.
 // Oldest entry first; capped at SHORT_WINDOW_POLLS + 1 entries.
 const recentObservations = [];
@@ -509,7 +515,8 @@ function snap(state) {
     requeueCountToday:  state.requeueCountToday,
     scheduledPosition:  state.scheduledPosition,
     dayPositions:       state.dayPositions,
-    positionFiredToday: state.positionFiredToday,
+    positionFiredToday:    state.positionFiredToday,
+    inQueueFromCarryover:  state.inQueueFromCarryover,
     currentPosition:    state.currentPosition,   // live position from last poll
     lastPosition:       state.lastPosition,       // position bot placed them at
     atTerminalSince:    state.atTerminalSince,
@@ -554,6 +561,42 @@ async function _runBot(driverId, state, triggerType = 'monitor_requeue') {
     state.requeueCountToday++;
   }
   if (result?.position) state.lastPosition = result.position;
+
+  // Record actual_position straight from the bot result rather than waiting
+  // for the next poll to see the driver in V Holding. On a busy morning SAN
+  // can dispatch a driver out of waiting in under 2 s — faster than the next
+  // poll tick — leaving the position_tracking row stuck at decision='fired'
+  // forever (the "pending" state in the admin UI). The bot's result.position
+  // is SAN-authoritative for the position assigned right after add-to-queue.
+  //
+  // Critical: a result with alreadyQueued=true means the bot landed on SAN's
+  // WAIT screen without adding anyone — the position is whoever else queued
+  // the driver (carryover, monitor auto-requeue, driver self-add). Writing
+  // that as the position-schedule actual feeds garbage into medianRecentError,
+  // which is how bias correction reached −14 on 2026-05-27 and pushed
+  // legitimate fires past maxAcceptable. We still write on the
+  // recoveredFromTimeout path: there the bot DID attempt the add — only the
+  // response timed out — and the position came from a fresh V Holding fetch,
+  // not a stale WAIT screen.
+  const safeToRecord =
+    result?.success
+    && Number.isFinite(result.position)
+    && (!result.alreadyQueued || result.recoveredFromTimeout);
+
+  if (state.pendingTrackingId && safeToRecord) {
+    const trackingId = state.pendingTrackingId;
+    state.pendingTrackingId = null;
+    PositionTracking.updateActualPosition(trackingId, result.position)
+      .then(() => console.log(`[PosTracking] #${state.vehicleNumber} landed at ${result.position} (from bot result)`))
+      .catch((err) => console.error('[PosTracking] Failed to update actual position from bot result:', err.message));
+  } else if (state.pendingTrackingId && result?.alreadyQueued && !result.recoveredFromTimeout) {
+    // Drop pendingTrackingId so the next poll's V-Holding observation doesn't
+    // attach a (potentially also stale) actual_position to this row. The 'fired'
+    // row stays for visibility but won't get an actual_position — preferable to
+    // a wrong one that poisons bias.
+    state.pendingTrackingId = null;
+    console.log(`[PosTracking] #${state.vehicleNumber} → bot found already in queue (pos ${result.position}) — NOT recording as actual (avoids bias contamination)`);
+  }
 
   broadcast('requeue_result', {
     driverId,
@@ -653,9 +696,14 @@ async function triggerPositionSchedule(driverId, state, effectivePosition, {
       state.hasBeenSeen = false;
       state.lastResult  = { success: false, error: err.message };
 
-      // Persist the failure so the report shows it.
+      // Persist the failure so the report shows it. Clearing pendingTrackingId
+      // is critical: without it, the next poll's V Holding observation would
+      // overwrite this failed row's actual_position (the driver may still be
+      // in queue from an earlier event), masking the failure in the report.
       if (state.pendingTrackingId) {
-        PositionTracking.markFailed(state.pendingTrackingId, err.message)
+        const failedTrackingId = state.pendingTrackingId;
+        state.pendingTrackingId = null;
+        PositionTracking.markFailed(failedTrackingId, err.message)
           .catch((e) => console.error('[PosTracking] markFailed error:', e.message));
         state.lastPosDecision = 'failed';
       }
@@ -759,6 +807,21 @@ function evaluatePositionScheduler(state, ctx) {
       metrics: baseMetrics,
     };
   }
+  // Carryover from yesterday: still in V Holding at midnight rollover. SAN
+  // empties V Holding overnight (logs show queue=0 by ~02:00 PT), so we wait
+  // for the purge rather than firing now — which would land on SAN's "Already
+  // in queue" WAIT screen and record yesterday's position as today's actual.
+  // The state machine clears inQueueFromCarryover the first poll the driver
+  // is no longer in V Holding, after which this branch stops matching.
+  if (state.inQueueFromCarryover) {
+    return {
+      action:           'wait',
+      reason:           'awaiting_overnight_purge',
+      secondsUntilFire: Infinity, // SAN's purge time isn't predictable
+      logLine:          `[Pos] ${veh} — ⏸ carryover from yesterday (waiting for SAN to drop, queue: ${waitingCount})`,
+      metrics:          baseMetrics,
+    };
+  }
   if (state.hasBeenSeen) {
     return {
       action:  'skip_already_seen',
@@ -800,11 +863,38 @@ function evaluatePositionScheduler(state, ctx) {
   }
 
   // ─── Projection and fire decision ─────────────────────────────────────────
-  // Fire as soon as projection reaches target — bounded above by maxAcceptable
-  // (early-out above). Bias correction is layered in to compensate for
-  // systematic landing errors observed in recent history.
+  // Fire as soon as projection reaches target — bounded above by maxAcceptable.
+  // Bias correction is layered in to compensate for systematic landing errors
+  // observed in recent history.
   const projectedLanding = waitingCount + estimatedDrift + biasCorrection;
-  const shouldFire       = projectedLanding >= effectivePosition;
+
+  // If the projection says we'd land ABOVE maxAcceptable, the train has left
+  // the station: every second we wait, the queue grows further past max. The
+  // 2026-05-27 #695 incident (target 105, max 125, fired anyway, landed at
+  // 167) was exactly this — projection was 167 but the code only checked
+  // projection ≥ target. Record the miss instead of producing a +62 landing.
+  // The earlier `waitingCount > maxAcceptable` rail still catches the case
+  // where the queue is already past max; this one covers "still below max
+  // right now, but the projected landing is past max."
+  if (projectedLanding > maxAcceptable) {
+    return {
+      action:  'missed_impossible',
+      reason:  'projection_exceeds_max',
+      logLine: `[Pos] ${veh} — ✗ projection ${projectedLanding.toFixed(1)} > max ${maxAcceptable} ` +
+               `(queue ${waitingCount} + drift ${estimatedDrift}` +
+               `${biasCorrection !== 0 ? ` + bias ${biasCorrection.toFixed(1)}` : ''}, ` +
+               `target ${effectivePosition}) — too late, skipping`,
+      metrics: {
+        ...baseMetrics,
+        queueSize:        waitingCount,
+        growthRate:       effectiveGrowthRate,
+        estimatedDrift,
+        predictedLanding: Math.round(projectedLanding),
+      },
+    };
+  }
+
+  const shouldFire = projectedLanding >= effectivePosition;
 
   // secondsUntilFire drives adaptive polling — how soon do we expect to fire?
   // Negative projection (already past target) → 0; no growth → Infinity.
@@ -868,19 +958,17 @@ async function poll() {
       s.lastPosDecision    = null; // new day → next decision will write a fresh row
       s.pendingTrackingId  = null;
 
-      // Reset visibility/terminal state so drivers carried over from yesterday's
-      // at_terminal limbo don't block the position scheduler with stale
-      // hasBeenSeen=true. The state machine in the next poll re-derives state
-      // from current queue presence: drivers actually in V Holding get
-      // hasBeenSeen=true again before the position scheduler evaluates them.
-      //
-      // Without this, drivers who were dispatched late yesterday and cleared
-      // the terminal overnight get requeued by the monitor the instant
-      // operating hours open at 5 AM — landing at whatever low position
-      // exists then, robbing the position scheduler of the morning to hit
-      // their actual target.
+      // Carryover: V Holding clears overnight (SAN dispatches the leftovers and
+      // empties the list before ~3 AM PT), so a driver still in queue at midnight
+      // will be dropped before morning. Tag them so the state machine doesn't
+      // immediately flip hasBeenSeen back to true on the next poll — that path
+      // makes the position scheduler skip the driver for the day even though
+      // SAN is about to clear them. The flag is cleared automatically when the
+      // driver leaves V Holding (see poll loop below).
+      s.inQueueFromCarryover = !!s.hasBeenSeen;
+
       s.hasBeenSeen        = false;
-      s.state              = 'watching';
+      s.state              = s.inQueueFromCarryover ? 'in_queue' : 'watching';
       s.terminalSeen       = false;
       s.terminalCheckCount = 0;
       s.terminalName       = null;
@@ -1003,13 +1091,23 @@ async function poll() {
   // ─── Periodic bias correction refresh ─────────────────────────────────────
   // Recomputes median(actual - target) from recent position_tracking records.
   // Only runs every BIAS_REFRESH_EVERY ticks and only when we have enough data.
+  //
+  // The median is computed with outliers (|err|>30) already filtered out — see
+  // PositionTracking.medianRecentError. The clamp below is the second line of
+  // defense: if some new contamination path slips past the filter, the bias
+  // still can't pull the predictor more than BIAS_CAP_POSITIONS off its raw
+  // drift estimate. The clamp is logged when it actually trims so we can spot
+  // regressions in the data quality.
   biasPollCount++;
   if (biasPollCount % BIAS_REFRESH_EVERY === 0) {
     PositionTracking.medianRecentError(30).then((med) => {
-      if (med !== null) {
-        biasCorrection = med;
-        console.log(`[PosTracking] Bias correction updated: ${biasCorrection > 0 ? '+' : ''}${biasCorrection.toFixed(1)} positions`);
-      }
+      if (med === null) return;
+      const clamped = Math.max(-BIAS_CAP_POSITIONS, Math.min(BIAS_CAP_POSITIONS, med));
+      const wasClamped = clamped !== med;
+      biasCorrection = clamped;
+      const sign = biasCorrection > 0 ? '+' : '';
+      const note = wasClamped ? ` (clamped from ${med > 0 ? '+' : ''}${med.toFixed(1)})` : '';
+      console.log(`[PosTracking] Bias correction updated: ${sign}${biasCorrection.toFixed(1)} positions${note}`);
     }).catch(() => {}); // non-blocking — ignore DB errors here
   }
 
@@ -1032,15 +1130,23 @@ async function poll() {
     const livePosition = waiting.get(vn) ?? dispatched.get(vn) ?? null;
     if (livePosition !== null) state.currentPosition = livePosition;
 
+    // Carryover handling: drivers still in V Holding at midnight will be cleared
+    // by SAN before morning. While inQueueFromCarryover is true we observe them
+    // but DON'T flip hasBeenSeen — the position scheduler treats them as armed
+    // for today so it can fire properly once SAN drops them. The flag is
+    // cleared automatically the first poll the driver is no longer in V Holding.
+    const isCarryover = state.inQueueFromCarryover;
+    const markSeen    = () => { if (!isCarryover && !state.hasBeenSeen) state.hasBeenSeen = true; };
+
     if (inNotAuthorized) {
       // Driver is in the red "not authorized" zone — visible but blocked by SAN.
       // Do NOT set hasBeenSeen (they haven't earned a queue spot) and do NOT requeue.
       next = 'not_authorized';
     } else if (inDispatched) {
-      if (!state.hasBeenSeen) state.hasBeenSeen = true;
+      markSeen();
       state.lastSeenAt = new Date();
       if (prev !== 'dispatched') state.lastDispatchAt = new Date();
-      next = 'dispatched';
+      next = isCarryover ? 'in_queue' : 'dispatched';
     } else if (inWaiting) {
       // Record actual landing position whenever we see a fired driver in the
       // queue with a pending tracking row — independent of hasBeenSeen, which
@@ -1057,7 +1163,7 @@ async function poll() {
           .then(() => console.log(`[PosTracking] #${state.vehicleNumber} landed at ${livePosition} (target was recorded)`))
           .catch((err) => console.error('[PosTracking] Failed to update actual position:', err.message));
       }
-      if (!state.hasBeenSeen) state.hasBeenSeen = true;
+      markSeen();
       state.lastSeenAt = new Date();
       // If transitioning from at_terminal → in_queue, SAN auto-returned the driver
       // to V Holding before the terminal poll could detect they'd left. Collect for
@@ -1066,6 +1172,14 @@ async function poll() {
         returnedFromTerminal.push({ driverId, state });
       }
       next = 'in_queue';
+    } else if (isCarryover) {
+      // Driver was carryover and is no longer in V Holding — SAN's overnight
+      // purge has cleared them. Drop the flag and reset to 'watching' so the
+      // position scheduler can fire at the right time today. NO at_terminal
+      // transition (we never claimed they were ours today, no requeue owed).
+      state.inQueueFromCarryover = false;
+      console.log(`[Monitor] #${state.vehicleNumber} — SAN cleared overnight carryover, armed for fresh schedule`);
+      next = 'watching';
     } else if (state.hasBeenSeen) {
       // Driver was seen in V Holding but is no longer there — they've been
       // dispatched to a terminal. Enter at_terminal and let the terminal poll
@@ -1428,6 +1542,7 @@ async function addWatch(driverId, { isAuto = false, _ctx = null } = {}) {
     maxAcceptablePosition:   driver.max_acceptable_position ?? null, // null → default to target + 20
     manuallyRemovedAt:       driver.manually_removed_at ?? null,
     positionFiredToday,
+    inQueueFromCarryover: false, // set at midnight reset for drivers still in V Holding
     currentPosition:    null,  // live position updated every poll tick
     lastPosition:       null,  // position bot placed them at (from bot result)
     atTerminalSince:    null,

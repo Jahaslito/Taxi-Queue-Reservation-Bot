@@ -264,4 +264,80 @@ describe('evaluatePositionScheduler — safety rails', () => {
     );
     expect(decision.action).toBe('fire');
   });
+
+  // Carryover: SAN doesn't clear V Holding at midnight — drivers from
+  // yesterday linger until SAN's overnight purge (~02 AM PT). The position
+  // scheduler must wait for that drop instead of either firing (which lands on
+  // the "Already in queue" WAIT screen with a stale position) or skipping for
+  // the day.
+  test('carryover from yesterday → wait (no fire while still in queue)', () => {
+    const decision = _evaluatePositionScheduler(
+      makeState({ inQueueFromCarryover: true }),
+      { ...baseCtx, waitingCount: 80, estimatedDrift: 30 }, // would otherwise fire
+    );
+    expect(decision.action).toBe('wait');
+    expect(decision.reason).toBe('awaiting_overnight_purge');
+  });
+
+  test('carryover takes precedence over projection — never fires', () => {
+    const decision = _evaluatePositionScheduler(
+      makeState({ inQueueFromCarryover: true }),
+      { ...baseCtx, waitingCount: 200, estimatedDrift: 0 }, // queue past max
+    );
+    // Even when queue is past max, we wait — carryover means the driver is
+    // about to be dropped, the past-max signal is stale.
+    expect(decision.action).toBe('wait');
+    expect(decision.reason).toBe('awaiting_overnight_purge');
+  });
+
+  test('carryover cleared → normal fire path resumes', () => {
+    const decision = _evaluatePositionScheduler(
+      makeState({ inQueueFromCarryover: false }),
+      { ...baseCtx, waitingCount: 80, estimatedDrift: 30 },
+    );
+    expect(decision.action).toBe('fire');
+  });
+
+  // Projection-exceeds-max guard: covers the 2026-05-27 #695 case where the
+  // queue is still below max RIGHT NOW (so the waitingCount>maxAcceptable rail
+  // doesn't trip) but projected landing is well past max. Firing in that
+  // window produces the +62 type overshoots that motivated this work.
+  describe('projection exceeds max → missed_impossible (does NOT fire)', () => {
+    test('drift would push landing past max', () => {
+      const decision = _evaluatePositionScheduler(
+        makeState({ scheduledPosition: 100, maxAcceptablePosition: 120 }),
+        { ...baseCtx, waitingCount: 90, estimatedDrift: 50 }, // 90+50=140 > 120
+      );
+      expect(decision.action).toBe('missed_impossible');
+      expect(decision.reason).toBe('projection_exceeds_max');
+    });
+
+    test('bias correction alone can push projection past max', () => {
+      const decision = _evaluatePositionScheduler(
+        makeState({ scheduledPosition: 100, maxAcceptablePosition: 120 }),
+        { ...baseCtx, waitingCount: 100, estimatedDrift: 15, biasCorrection: 10 }, // 100+15+10=125>120
+      );
+      expect(decision.action).toBe('missed_impossible');
+      expect(decision.reason).toBe('projection_exceeds_max');
+    });
+
+    test('projection exactly at max → fires (boundary)', () => {
+      const decision = _evaluatePositionScheduler(
+        makeState({ scheduledPosition: 100, maxAcceptablePosition: 120 }),
+        { ...baseCtx, waitingCount: 90, estimatedDrift: 30 }, // 90+30=120 == max
+      );
+      expect(decision.action).toBe('fire');
+    });
+
+    test('past_max (current queue) takes precedence over projection guard', () => {
+      const decision = _evaluatePositionScheduler(
+        makeState({ scheduledPosition: 100, maxAcceptablePosition: 120 }),
+        { ...baseCtx, waitingCount: 130, estimatedDrift: 50 },
+      );
+      // queue already past max — reason should be queue_already_past_max,
+      // not projection_exceeds_max
+      expect(decision.action).toBe('missed_impossible');
+      expect(decision.reason).toBe('queue_already_past_max');
+    });
+  });
 });

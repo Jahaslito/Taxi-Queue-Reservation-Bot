@@ -45,6 +45,7 @@ const Driver              = require('../models/Driver');
 const Log                 = require('../models/Log');
 const PositionTracking    = require('../models/PositionTracking');
 const QueueSnapshot       = require('../models/QueueSnapshot');
+const proxyHealth         = require('./proxyHealthService');
 
 // ─── Constants (overridable via env for testing / tuning) ────────────────────
 // POLL_INTERVAL_MS is the maximum (idle) cadence. Adaptive polling tightens to
@@ -131,13 +132,14 @@ const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) ' +
            'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
 // ─── Proxy dispatcher for polling fetches ─────────────────────────────────────
-// Shares the same PROXY_SERVER / PROXY_USERNAME / PROXY_PASSWORD env vars as the
-// Playwright bot so all three SAN interactions go through the same proxy.
-// Uses a single sticky session for polling (we want a consistent IP, not rotation).
-// If PROXY_SERVER is not set, falls back to the server's own IP (no proxy).
+// Built once at module load (constructing a ProxyAgent is expensive — has a
+// connection pool, TLS context, etc.) but consulted via shouldUseProxy() per
+// fetch so the circuit breaker can transparently flip everything to direct
+// when the proxy goes bad. Uses a single sticky session — polling wants a
+// consistent IP, not rotation.
 function buildPollDispatcher() {
   const server = process.env.PROXY_SERVER;
-  if (!server) return undefined; // no proxy configured — use direct connection
+  if (!server) return undefined;
 
   const user = (process.env.PROXY_USERNAME || '').replace('{session}', 'monitor-poll');
   const pass = process.env.PROXY_PASSWORD || '';
@@ -155,11 +157,42 @@ function buildPollDispatcher() {
     proxyUrl = normalised;
   }
 
-  console.log('[Monitor] Proxy enabled for polling →', new URL(proxyUrl).host);
+  console.log('[Monitor] Proxy configured for polling →', new URL(proxyUrl).host);
   return new ProxyAgent(proxyUrl);
 }
 
 const pollDispatcher = buildPollDispatcher();
+
+/**
+ * Returns the dispatcher undici should use for this call: the cached
+ * ProxyAgent when the circuit breaker says proxy is OK, undefined when it
+ * isn't (kill switch, unconfigured, or breaker open). Called per-fetch so
+ * the breaker can transparently flip mid-session.
+ */
+function currentPollDispatcher() {
+  return proxyHealth.shouldUseProxy() ? pollDispatcher : undefined;
+}
+
+/**
+ * Pattern-match an error to decide whether it's plausibly the PROXY's fault
+ * (and so should count against the circuit breaker) vs. something downstream
+ * (SAN returning 503, vehicle search returning "not found", etc., which says
+ * nothing about proxy health).
+ *
+ * False positives just trip the breaker slightly more eagerly than ideal —
+ * the consequence is we fall back to direct, which is exactly the safe move.
+ */
+function looksLikeProxyFailure(err) {
+  const msg = String(err?.message || err || '').toLowerCase();
+  return msg.includes('fetch failed')
+      || msg.includes('econnrefused')
+      || msg.includes('econnreset')
+      || msg.includes('etimedout')
+      || msg.includes('enotfound')
+      || msg.includes('proxy_connection_failed')
+      || msg.includes('tunneling socket')
+      || msg.includes('http 407'); // proxy auth required
+}
 
 // ─── Concurrency-limited job queue ───────────────────────────────────────────
 // Caps simultaneous Playwright bot sessions so a wave of departures (e.g.
@@ -727,20 +760,37 @@ async function triggerPositionSchedule(driverId, state, effectivePosition, {
 async function fetchPage(url) {
   let lastErr;
   for (let attempt = 0; attempt < RETRY_COUNT; attempt++) {
+    // Re-checked per attempt so the breaker can trip mid-retry and the very
+    // next attempt goes direct. The dispatcher is undefined when proxy is
+    // disabled / unconfigured / breaker open.
+    const dispatcher    = currentPollDispatcher();
+    const proxyAttempt  = dispatcher !== undefined;
+
     try {
       const res = await ufetch(url, {
         headers:    { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml' },
         signal:     AbortSignal.timeout(FETCH_TIMEOUT),
-        dispatcher: pollDispatcher, // undefined = direct (no proxy); ProxyAgent = routed
+        dispatcher,
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        // Treat 407 Proxy Auth Required as a proxy failure; everything else
+        // (SAN 5xx, etc.) is a SAN-side problem and shouldn't trip the breaker.
+        const httpErr = new Error(`HTTP ${res.status}`);
+        if (proxyAttempt && res.status === 407) proxyHealth.reportFailure('http 407');
+        throw httpErr;
+      }
+      if (proxyAttempt) proxyHealth.reportSuccess();
       if (attempt > 0) console.log(`[Monitor] Fetch succeeded on attempt ${attempt + 1} (${url})`);
       return res;
     } catch (err) {
       lastErr = err;
+      if (proxyAttempt && looksLikeProxyFailure(err)) {
+        proxyHealth.reportFailure(err.message || 'fetch failed');
+      }
       const delay = RETRY_DELAYS[attempt] ?? RETRY_DELAYS[RETRY_DELAYS.length - 1];
       if (attempt < RETRY_COUNT - 1) {
-        console.warn(`[Monitor] Fetch attempt ${attempt + 1}/${RETRY_COUNT} failed (${url}): ${err.message} — retrying in ${delay / 1000}s`);
+        const via = proxyAttempt ? 'via proxy' : 'direct';
+        console.warn(`[Monitor] Fetch attempt ${attempt + 1}/${RETRY_COUNT} (${via}) failed (${url}): ${err.message} — retrying in ${delay / 1000}s`);
         await new Promise((r) => setTimeout(r, delay));
       }
     }
@@ -1741,6 +1791,7 @@ function getState() {
       startHour:  OP_START_HOUR,
       endHour:    OP_END_HOUR,
     },
+    proxy: proxyHealth.getState(),
   };
 }
 

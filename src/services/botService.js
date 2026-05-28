@@ -2,6 +2,7 @@ const { chromium } = require('playwright');
 const crypto       = require('crypto');
 const fs           = require('fs');
 const path         = require('path');
+const proxyHealth  = require('./proxyHealthService');
 
 // ─── Friendly error messages ──────────────────────────────────────────────────
 // Converts raw technical errors into driver-readable messages.
@@ -24,9 +25,10 @@ function sanitizeError(msg = '') {
 
 // ─── Proxy rotation ───────────────────────────────────────────────────────────
 // Returns a Playwright-compatible proxy config with a fresh session ID, or null
-// if PROXY_SERVER is not set (proxy disabled — all traffic goes via server IP).
+// when proxy use is disabled (env kill switch, PROXY_SERVER unset, or the
+// circuit breaker tripped). Callers treat null as "use direct connection."
 //
-// Supported providers and their username formats:
+// Supported provider username formats:
 //   Bright Data:  brd-customer-XXXX-zone-residential-session-{session}
 //   Oxylabs:      customer-XXXX-sessid-{session}
 //   Smartproxy:   user-XXXX-sessionid-{session}
@@ -34,11 +36,10 @@ function sanitizeError(msg = '') {
 // Set PROXY_USERNAME with {session} where the random ID should be inserted.
 // Each addToQueue() call gets a unique session → a different residential IP.
 function getProxyConfig() {
-  const server = process.env.PROXY_SERVER;
-  if (!server) return null;
+  if (!proxyHealth.shouldUseProxy()) return null;
   const sessionId = crypto.randomBytes(8).toString('hex');
   const username  = (process.env.PROXY_USERNAME || '').replace('{session}', sessionId);
-  return { server, username, password: process.env.PROXY_PASSWORD || '' };
+  return { server: process.env.PROXY_SERVER, username, password: process.env.PROXY_PASSWORD || '' };
 }
 
 const DEBUG_DIR = process.env.BOT_DEBUG_DIR ?? '/tmp/san-bot-debug';

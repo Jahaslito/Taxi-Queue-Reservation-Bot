@@ -68,6 +68,180 @@ const APP_HOST    = 'san.gtcvms.com/gsidispatch.edispatch';
 const TIMEOUT     = 60000;   // 60s — OIDC handshake + SPA hydration can be slow
 const NAV_TIMEOUT = 60000;   // Extra time for full page-navigation round-trips
 
+// ─── SAN response text constants ─────────────────────────────────────────────
+// Every literal string we look for in SAN's HTML lives here so updates (when
+// SAN tweaks their UI) are a single-file edit instead of a grep-through-bot-code
+// hunt. Add new strings here when debug captures reveal a state we don't
+// currently recognize. Each entry includes the date and context of discovery
+// so future maintainers know why we care about it.
+const SAN_TEXT = {
+  ADD_TO_QUEUE_BUTTON:    'Add To Queue',
+  REMOVE_FROM_QUEUE:      'Remove From Queue',
+  VEHICLE_NOT_FOUND:      'not found',
+  NO_VEHICLE:             'No vehicle',
+  NO_RESULTS:             'No results',
+  INVALID_CREDENTIALS:    'Invalid username or password',
+  // Discovered 2026-05-29 from debug captures for #142 and #700 morning
+  // failures. SAN renders this within ~1s as a business-rule rejection. Until
+  // it was added to the search-result matcher the bot waited 60s for a
+  // string that would never appear, surfacing as "SAN took too long".
+  VEHICLE_NOT_AVAILABLE:  'Vehicle not available for registration',
+};
+
+// Driver-facing copy for each non-success bot outcome. Kept here so the
+// product/support team can edit messaging without touching control flow.
+const DRIVER_ERROR_COPY = {
+  VEHICLE_NOT_AVAILABLE: 'SAN says this vehicle is not currently eligible to join the queue — try again in a few minutes.',
+  VEHICLE_NOT_FOUND:     'Vehicle number not found in SAN eDispatch',
+};
+
+// Strings that signal "the search step completed" — any of them appearing
+// terminates the post-search waitForFunction. Order doesn't matter; we just
+// need to stop waiting as soon as SAN tells us anything actionable.
+const SEARCH_RESULT_STRINGS = [
+  SAN_TEXT.ADD_TO_QUEUE_BUTTON,
+  SAN_TEXT.REMOVE_FROM_QUEUE,
+  SAN_TEXT.VEHICLE_NOT_FOUND,
+  SAN_TEXT.NO_VEHICLE,
+  SAN_TEXT.NO_RESULTS,
+  SAN_TEXT.VEHICLE_NOT_AVAILABLE,
+];
+
+// ─── SAN error surfacing ─────────────────────────────────────────────────────
+// Whenever the bot fails OR times out, we attempt to read whatever error
+// message SAN actually rendered on the page rather than reporting a generic
+// "SAN took too long". Three layers:
+//
+//   1. DOM selectors targeting common SAN error containers — fastest, most
+//      reliable when SAN uses these conventions.
+//   2. Substring/regex match against visible body text — catches free-form
+//      error copy SAN renders inline.
+//   3. Fallback: return null and let the caller's sanitizeError() take over.
+//
+// New patterns can be added without touching call sites — just append to
+// KNOWN_SAN_ERROR_PATTERNS and they'll be picked up everywhere.
+
+// Common containers Microsoft/Bootstrap-style ASP.NET sites use for errors.
+// Empty matches are skipped silently.
+const SAN_ERROR_SELECTORS = [
+  '.validation-summary-errors',
+  '.field-validation-error',
+  '.alert-danger',
+  '.alert-error',
+  '.error-message',
+  '[role="alert"]',
+];
+
+// Free-form text patterns we've observed SAN render at the body level (i.e.
+// not inside one of the above containers). Strings match case-sensitively as
+// SAN renders them; RegExp instances support broader matching. Anything we
+// see in debug captures should land here so the next encounter surfaces a
+// clean message.
+const KNOWN_SAN_ERROR_PATTERNS = [
+  SAN_TEXT.VEHICLE_NOT_AVAILABLE,
+  SAN_TEXT.INVALID_CREDENTIALS,
+  /Vehicle [\w\s]+? is not (?:eligible|authorized|available)/i,
+  /Permit (?:expired|invalid|not found)/i,
+  /Insurance (?:expired|invalid|not found)/i,
+  /(?:Account|Driver) (?:locked|suspended|deactivated)/i,
+  /You are not authorized/i,
+];
+
+// ─── Generic error catch-all ─────────────────────────────────────────────────
+// When KNOWN_SAN_ERROR_PATTERNS doesn't match anything, we fall back to a
+// keyword sniff so an unknown error still surfaces the actual text rather
+// than disappearing into "SAN took too long". False positives are rare
+// because (a) we skip lines that look like JS/CSS source and (b) we require
+// at least one error-suggestive keyword.
+const GENERIC_ERROR_KEYWORDS = /\b(error|invalid|denied|unauthorized|expired|locked|suspended|deactivated|disabled|blocked|forbidden|unable to|cannot|could not|failed|missing required|please contact|try again later|not eligible|not available|not allowed|not permitted)\b/i;
+
+// Heuristic for "this line is page source, not human-readable text" — keeps
+// us from surfacing inline JavaScript / CSS / template variables as errors.
+const LOOKS_LIKE_CODE = /[{};=<>]|function\s|var\s|const\s|let\s|if\s*\(/;
+
+const MIN_ERROR_LINE_LEN = 3;
+const MAX_ERROR_LINE_LEN = 250;
+
+/**
+ * Pure: scan body text for any known SAN error pattern. Returns the matched
+ * string (verbatim from the page so users see what SAN actually said) or null.
+ * Exported via `_extractKnownErrorFromText` for unit testing without Playwright.
+ */
+function extractKnownErrorFromText(bodyText) {
+  if (typeof bodyText !== 'string' || !bodyText) return null;
+  for (const pattern of KNOWN_SAN_ERROR_PATTERNS) {
+    if (typeof pattern === 'string') {
+      if (bodyText.includes(pattern)) return pattern;
+    } else {
+      const m = bodyText.match(pattern);
+      if (m && m[0]) return m[0].trim();
+    }
+  }
+  return null;
+}
+
+/**
+ * Pure: generic catch-all — when we have no specific pattern for the error,
+ * scan body lines and surface the first one that LOOKS like a human-readable
+ * error message. The result lets admins see *something* from SAN rather than
+ * a generic "took too long", even for error states we haven't catalogued.
+ *
+ * Heuristic:
+ *   • Skip empty / very long / very short lines (likely script noise).
+ *   • Skip lines matching LOOKS_LIKE_CODE (inline JS/CSS/templates).
+ *   • Accept the first line containing a GENERIC_ERROR_KEYWORDS hit.
+ *
+ * Exported via `_extractGenericErrorFromText` for unit testing.
+ */
+function extractGenericErrorFromText(bodyText) {
+  if (typeof bodyText !== 'string' || !bodyText) return null;
+
+  const lines = bodyText.split(/[\r\n]+/);
+  for (const raw of lines) {
+    const line = raw.replace(/\s+/g, ' ').trim();
+    if (line.length < MIN_ERROR_LINE_LEN || line.length > MAX_ERROR_LINE_LEN) continue;
+    if (LOOKS_LIKE_CODE.test(line)) continue;
+    if (GENERIC_ERROR_KEYWORDS.test(line)) return line;
+  }
+  return null;
+}
+
+/**
+ * Async: read whatever error SAN rendered on the page. Three layers, in
+ * priority order:
+ *
+ *   1. Structured DOM containers (.validation-summary-errors, [role="alert"],
+ *      etc.) — fastest, most precise when SAN uses these conventions.
+ *   2. Known body-text patterns (the curated KNOWN_SAN_ERROR_PATTERNS list)
+ *      — handles SAN's free-form errors we've already catalogued.
+ *   3. Generic keyword sniff — catches NEW / uncatalogued errors so the
+ *      driver never sees "SAN took too long" when SAN actually said something.
+ *
+ * Returns the first useful match, or null when even the generic sniff finds
+ * nothing — at which point sanitizeError(err.message) is the last resort.
+ *
+ * Each selector lookup is bounded at 300ms so a degraded page doesn't add
+ * seconds to the failure path; missing a slow-rendering error is preferable
+ * to delaying the response further.
+ */
+async function extractSanErrorMessage(page) {
+  if (!page) return null;
+
+  // Layer 1: Structured error containers
+  for (const sel of SAN_ERROR_SELECTORS) {
+    try {
+      const loc  = page.locator(sel).first();
+      const text = await loc.innerText({ timeout: 300 });
+      const cleaned = (text || '').trim();
+      if (cleaned) return cleaned;
+    } catch { /* selector missing / not visible — try the next one */ }
+  }
+
+  // Layers 2 & 3: read the body once, then run both extractors
+  const body = await page.textContent('body').catch(() => '');
+  return extractKnownErrorFromText(body) || extractGenericErrorFromText(body);
+}
+
 // ─── Failure classifier ──────────────────────────────────────────────────────
 // debugCapture uses this label as the filename suffix so admins can grep the
 // debug dir for specific failure modes without opening every PNG:
@@ -377,16 +551,31 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
     await page.fill('input[placeholder="Vehicle Dispatch Name"]', String(vehicleNumber));
     await page.click('button:has-text("Search")');
 
-    // Wait for one of: Add To Queue button, WAIT screen, or not-found message
+    // Wait for any of the known search-result strings (see SEARCH_RESULT_STRINGS
+    // at the top of this file). Adding a new SAN response state means adding
+    // one entry there — no change to this call.
     await page.waitForFunction(
-      () => document.body.innerText.includes('Add To Queue')      ||
-            document.body.innerText.includes('Remove From Queue') ||
-            document.body.innerText.includes('not found')         ||
-            document.body.innerText.includes('No vehicle')        ||
-            document.body.innerText.includes('No results'),
-      null,
-      { timeout: TIMEOUT }
+      (needles) => needles.some((s) => document.body.innerText.includes(s)),
+      SEARCH_RESULT_STRINGS,
+      { timeout: TIMEOUT },
     );
+
+    // ─── STEP 6.5: Detect SAN business-rule rejections ────────────────────────
+    // Read the body once and dispatch on what SAN said. Cheaper than three
+    // separate isVisible calls and surfaces a clear driver-facing error
+    // instead of a misleading "vehicle not found" or "SAN took too long".
+    const bodyText = await page.textContent('body').catch(() => '');
+
+    if (bodyText.includes(SAN_TEXT.VEHICLE_NOT_AVAILABLE)) {
+      console.log(`[Bot] ${vehicleNumber} → ${SAN_TEXT.VEHICLE_NOT_AVAILABLE} (SAN business-rule rejection)`);
+      return {
+        success:               false,
+        vehicleNotAvailable:   true, // signal for callers — short cooldown, not a creds problem
+        durationMs:            Date.now() - startTime,
+        error:                 DRIVER_ERROR_COPY.VEHICLE_NOT_AVAILABLE,
+        message:               DRIVER_ERROR_COPY.VEHICLE_NOT_AVAILABLE,
+      };
+    }
 
     // ─── STEP 7: Already queued after search? ────────────────────────────────
     if (await isWaitScreen(page)) {
@@ -396,13 +585,13 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
     }
 
     // ─── STEP 8: Confirm vehicle was found ───────────────────────────────────
-    const addToQueueVisible = await page.isVisible('button:has-text("Add To Queue")').catch(() => false);
+    const addToQueueVisible = await page.isVisible(`button:has-text("${SAN_TEXT.ADD_TO_QUEUE_BUTTON}")`).catch(() => false);
     if (!addToQueueVisible) {
       return {
-        success: false,
+        success:    false,
         durationMs: Date.now() - startTime,
-        error: `Vehicle "${vehicleNumber}" not found — check vehicle number`,
-        message: `Vehicle ${vehicleNumber} not found in SAN eDispatch`
+        error:      `Vehicle "${vehicleNumber}" not found — check vehicle number`,
+        message:    DRIVER_ERROR_COPY.VEHICLE_NOT_FOUND,
       };
     }
 
@@ -463,13 +652,23 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
       }
     }
 
-    const friendly = sanitizeError(err.message);
+    // Try to surface whatever SAN actually showed on the page. If we find a
+    // visible error message we prefer it over the generic sanitizeError
+    // copy — drivers (and admins reading logs) get to see exactly what SAN
+    // said instead of a hand-wavy "took too long".
+    const sanErrorText = await extractSanErrorMessage(page).catch(() => null);
+    if (sanErrorText) {
+      console.warn(`[Bot] ${vehicleNumber} → SAN said: "${sanErrorText}"`);
+    }
+    const friendly  = sanitizeError(err.message);
+    const userError = sanErrorText ? `SAN: ${sanErrorText}` : friendly;
     return {
-      success: false,
-      durationMs: Date.now() - startTime,
-      error: friendly,
-      message: friendly,
-      rawError: err.message,   // kept for server logs only, never shown to drivers
+      success:      false,
+      durationMs:   Date.now() - startTime,
+      error:        userError,
+      message:      userError,
+      rawError:     err.message,    // Playwright/native error, server logs only
+      sanErrorText: sanErrorText,   // raw page-visible text; null if none found
     };
   } finally {
     if (browser) await browser.close();
@@ -685,13 +884,20 @@ async function removeFromQueue(sanUsername, sanPassword, vehicleNumber) {
     try { urlAtError = page ? page.url() : ''; } catch { /* page closed */ }
     const failureLabel = `remove_${classifyFailure({ urlAtError, errorMessage: err.message })}`;
     if (page) await debugCapture(page, vehicleNumber, failureLabel);
-    const friendly = sanitizeError(err.message);
+
+    const sanErrorText = await extractSanErrorMessage(page).catch(() => null);
+    if (sanErrorText) {
+      console.warn(`[Bot] ${vehicleNumber} (remove) → SAN said: "${sanErrorText}"`);
+    }
+    const friendly  = sanitizeError(err.message);
+    const userError = sanErrorText ? `SAN: ${sanErrorText}` : friendly;
     return {
-      success: false,
-      durationMs: Date.now() - startTime,
-      error: friendly,
-      message: friendly,
-      rawError: err.message,
+      success:      false,
+      durationMs:   Date.now() - startTime,
+      error:        userError,
+      message:      userError,
+      rawError:     err.message,
+      sanErrorText: sanErrorText,
     };
   } finally {
     if (browser) await browser.close();
@@ -809,7 +1015,6 @@ async function warmSession({ sanUsername, sanPassword, vehicleNumber }) {
       message:    reused ? 'session_reused' : 'session_warmed',
     };
   } catch (err) {
-    const friendly = sanitizeError(err.message);
     console.error(`[Warm] ${vehicleNumber} → ERROR: ${err.message}`);
     // Same classifier as addToQueue, "warm_" prefix to keep flows separate
     // in the debug dir listings.
@@ -817,12 +1022,20 @@ async function warmSession({ sanUsername, sanPassword, vehicleNumber }) {
     try { urlAtError = page ? page.url() : ''; } catch { /* page closed */ }
     const failureLabel = `warm_${classifyFailure({ urlAtError, errorMessage: err.message })}`;
     if (page) await debugCapture(page, vehicleNumber, failureLabel).catch(() => {});
+
+    const sanErrorText = await extractSanErrorMessage(page).catch(() => null);
+    if (sanErrorText) {
+      console.warn(`[Warm] ${vehicleNumber} → SAN said: "${sanErrorText}"`);
+    }
+    const friendly  = sanitizeError(err.message);
+    const userError = sanErrorText ? `SAN: ${sanErrorText}` : friendly;
     return {
-      success:    false,
-      durationMs: Date.now() - startTime,
-      error:      friendly,
-      message:    friendly,
-      rawError:   err.message,
+      success:      false,
+      durationMs:   Date.now() - startTime,
+      error:        userError,
+      message:      userError,
+      rawError:     err.message,
+      sanErrorText: sanErrorText,
     };
   } finally {
     if (browser) await browser.close();
@@ -841,5 +1054,7 @@ module.exports = {
   forgetSession,
   SESSION_TTL_MS,
   // Exposed for unit tests — pure failure classifier.
-  _classifyFailure: classifyFailure,
+  _classifyFailure:               classifyFailure,
+  _extractKnownErrorFromText:     extractKnownErrorFromText,
+  _extractGenericErrorFromText:   extractGenericErrorFromText,
 };

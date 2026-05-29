@@ -508,4 +508,120 @@ describe('evaluatePositionScheduler — safety rails', () => {
       expect(decision.reason).toBe('queue_already_past_max');
     });
   });
+
+  // Scheduler-level credential lockout — added 2026-05-29 after #631 fired
+  // despite the warmer having confirmed bad credentials at 03:00.
+  describe('credential lockout — skip_locked_out', () => {
+    test('isLockedOut returning true → skip_locked_out (does NOT fire)', () => {
+      const decision = _evaluatePositionScheduler(
+        makeState(),
+        { ...baseCtx, waitingCount: 80, estimatedDrift: 30, isLockedOut: () => true },
+      );
+      expect(decision.action).toBe('skip_locked_out');
+      expect(decision.reason).toBe('credentials_locked_out');
+    });
+
+    test('isLockedOut returning false → normal evaluation', () => {
+      const decision = _evaluatePositionScheduler(
+        makeState(),
+        { ...baseCtx, waitingCount: 80, estimatedDrift: 30, isLockedOut: () => false },
+      );
+      expect(decision.action).toBe('fire');
+    });
+
+    test('isLockedOut omitted from ctx → defaults to never-locked', () => {
+      // Back-compat: existing callers (and older tests) that don't pass the
+      // predicate must continue to work exactly as before.
+      const decision = _evaluatePositionScheduler(
+        makeState(),
+        { ...baseCtx, waitingCount: 80, estimatedDrift: 30 },
+      );
+      expect(decision.action).toBe('fire');
+    });
+
+    test('locked out + already fired → already_fired wins (short-circuit order)', () => {
+      const decision = _evaluatePositionScheduler(
+        makeState({ positionFiredToday: true }),
+        { ...baseCtx, isLockedOut: () => true },
+      );
+      expect(decision.action).toBe('skip_already_fired');
+    });
+  });
+});
+
+// ─── botExecutionEstimateMs — median + freshness ──────────────────────────────
+// Critical for accuracy: with the warmer reliable, bot times cluster around
+// 7-8 s. P95 over a mixed bag of stale 25 s cold-login samples dragged the
+// horizon up by 50%+, causing over-predicted drift and below-target landings
+// (see 2026-05-29 #263 / #4372 misses).
+
+describe('botExecutionEstimateMs — median + freshness', () => {
+  beforeEach(() => {
+    monitor._resetLatencySamples();
+  });
+
+  const NOW = 2_000_000_000_000; // arbitrary fixed clock for these tests
+  const HOUR_MS = 60 * 60 * 1000;
+
+  // Capture the env-driven default once so each test asserts against it
+  // instead of a hard-coded number — keeps the tests valid regardless of
+  // the deployment's MONITOR_POS_BOT_EXEC_MS setting.
+  const FALLBACK = monitor._botExecutionEstimateMs({ now: NOW });
+
+  test('< 5 fresh samples → falls back to POS_BOT_EXEC_MS default', () => {
+    monitor._recordBotLatency(8000, { now: NOW });
+    monitor._recordBotLatency(7500, { now: NOW });
+    monitor._recordBotLatency(8200, { now: NOW });
+    expect(monitor._botExecutionEstimateMs({ now: NOW })).toBe(FALLBACK);
+  });
+
+  test('5+ fresh samples → returns median (not P95)', () => {
+    [7000, 7500, 8000, 8500, 9000].forEach((ms) =>
+      monitor._recordBotLatency(ms, { now: NOW }),
+    );
+    expect(monitor._botExecutionEstimateMs({ now: NOW })).toBe(8000);
+    // Sanity: this is the median, not the P95 (which would be 8800-9000).
+    expect(monitor._botExecutionEstimateMs({ now: NOW })).toBeLessThan(8500);
+  });
+
+  test('stale samples are filtered out — fresh dominate', () => {
+    // 5 stale 25s samples + 5 fresh 7s samples. Without freshness filter the
+    // median over all 10 would land between 7s and 25s. With filter, only
+    // fresh count and the median is 7s.
+    const stale = NOW - 24 * HOUR_MS;
+    [25000, 26000, 24000, 25500, 25500].forEach((ms) =>
+      monitor._recordBotLatency(ms, { now: stale }),
+    );
+    [7000, 7000, 7500, 7000, 6500].forEach((ms) =>
+      monitor._recordBotLatency(ms, { now: NOW }),
+    );
+    expect(monitor._botExecutionEstimateMs({ now: NOW })).toBe(7000);
+  });
+
+  test('all samples stale → falls back to default', () => {
+    const stale = NOW - 24 * HOUR_MS;
+    [7000, 7500, 8000, 8500, 9000].forEach((ms) =>
+      monitor._recordBotLatency(ms, { now: stale }),
+    );
+    expect(monitor._botExecutionEstimateMs({ now: NOW })).toBe(FALLBACK);
+  });
+
+  test('legacy plain-number disk format normalises to recordedAt=0 (stale)', () => {
+    expect(monitor._normaliseLatencySample(8000)).toEqual({ ms: 8000, recordedAt: 0 });
+    expect(monitor._normaliseLatencySample({ ms: 8000, recordedAt: 1234 }))
+      .toEqual({ ms: 8000, recordedAt: 1234 });
+    expect(monitor._normaliseLatencySample(null)).toBeNull();
+    expect(monitor._normaliseLatencySample(0)).toBeNull();
+    expect(monitor._normaliseLatencySample({ ms: -1 })).toBeNull();
+  });
+
+  test('_computeMedian — odd and even lengths', () => {
+    expect(monitor._computeMedian([5])).toBe(5);
+    expect(monitor._computeMedian([1, 2, 3, 4, 5])).toBe(3);
+    expect(monitor._computeMedian([1, 2, 3, 4])).toBe(2.5);
+    // Does not mutate the caller's array.
+    const xs = [3, 1, 2];
+    monitor._computeMedian(xs);
+    expect(xs).toEqual([3, 1, 2]);
+  });
 });

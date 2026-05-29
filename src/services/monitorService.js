@@ -46,6 +46,7 @@ const Log                 = require('../models/Log');
 const PositionTracking    = require('../models/PositionTracking');
 const QueueSnapshot       = require('../models/QueueSnapshot');
 const proxyHealth         = require('./proxyHealthService');
+const credentialLockout   = require('./credentialLockoutService');
 
 // ─── Constants (overridable via env for testing / tuning) ────────────────────
 // POLL_INTERVAL_MS is the maximum (idle) cadence. Adaptive polling tightens to
@@ -339,22 +340,32 @@ function expectedNextPollMs(secondsUntilFire) {
   return POLL_AT_FIRE_MS;
 }
 
-// ─── Bot latency tracking (P95) ──────────────────────────────────────────────
-// Ring buffer of recent bot execution times in milliseconds. Used to compute the
-// dynamic horizon for drift prediction — replaces the stale 45 s constant from
-// before the proxy/session-cache speedups. Lost on restart but converges within
-// the first 5+ bot runs of the morning. In-memory only — zero DB cost.
+// ─── Bot latency tracking (median + freshness window) ────────────────────────
+// Each sample is { ms, recordedAt } — recordedAt lets us discard data older
+// than LATENCY_FRESHNESS_MS so a one-time architectural change (e.g. the 5/29
+// warmer rollout) doesn't keep dragging the prediction toward stale numbers.
 //
-// Push is O(1); P95 is O(n log n) for n=30 (~0.01 ms — negligible vs. a 30 s poll).
+// We use the MEDIAN, not P95: with the warmer running, real bot times cluster
+// tightly around 7-8 s. P95 was useful when the distribution had a long tail
+// of 25 s cold logins; that tail is gone. P95 over current samples drags the
+// horizon up by 50%+, which causes the over-predicted drift we saw on 5/29.
+//
+// In-memory ring buffer. Push is O(1); median is O(n log n) for n=30 (~0.01 ms).
+// Persisted to disk so a restart doesn't reset us to cold-start fallback on a
+// busy morning. Loader is backwards-compatible with the prior plain-number
+// format.
 const MAX_LATENCY_SAMPLES  = 30;
-const MIN_SAMPLES_FOR_P95  = 5;
-const botLatencySamples    = []; // ms; newest pushed to end, oldest shifted off
+const MIN_SAMPLES_FOR_EST  = 5;
+// Samples older than this are filtered out before the median is taken.
+// 12 h is short enough to discard pre-deploy data after a single morning,
+// long enough that an idle midday doesn't leave us with too few samples.
+const LATENCY_FRESHNESS_MS = parseInt(
+  process.env.MONITOR_BOT_LATENCY_FRESHNESS_MS ?? String(12 * 60 * 60 * 1000), 10,
+);
+const botLatencySamples    = []; // [{ ms, recordedAt }]; newest pushed to end
 
 // ─── Persistence — survives restarts so cold-start doesn't fall back to the
-// 15 s POS_BOT_EXEC_MS default on a busy morning ──────────────────────────────
-// Tiny JSON file. Reads once on boot; writes atomically (write-to-temp +
-// rename) so a crash mid-write can't corrupt the file. Throttled to one write
-// per ~5 s so a burst of bot completions doesn't hammer the disk.
+// POS_BOT_EXEC_MS default on a busy morning ──────────────────────────────────
 const LATENCY_PERSIST_PATH = process.env.BOT_LATENCY_PERSIST_PATH
   ?? path.join(process.cwd(), 'data', 'bot-latency-samples.json');
 const LATENCY_PERSIST_THROTTLE_MS = 5000;
@@ -365,10 +376,14 @@ function loadBotLatencyFromDisk() {
     if (!fs.existsSync(LATENCY_PERSIST_PATH)) return;
     const raw = JSON.parse(fs.readFileSync(LATENCY_PERSIST_PATH, 'utf8'));
     if (!Array.isArray(raw)) return;
-    for (const ms of raw) {
-      if (Number.isFinite(ms) && ms > 0 && botLatencySamples.length < MAX_LATENCY_SAMPLES) {
-        botLatencySamples.push(ms);
-      }
+    // Backwards compat: prior versions stored plain numbers. Treat those as
+    // ancient samples (recordedAt=0) so the freshness filter discards them
+    // automatically — old pre-warmer cold-login data shouldn't influence
+    // post-warmer predictions.
+    for (const entry of raw) {
+      if (botLatencySamples.length >= MAX_LATENCY_SAMPLES) break;
+      const sample = normaliseLatencySample(entry);
+      if (sample) botLatencySamples.push(sample);
     }
     if (botLatencySamples.length) {
       console.log(`[Monitor] Restored ${botLatencySamples.length} bot-latency samples from disk`);
@@ -376,6 +391,21 @@ function loadBotLatencyFromDisk() {
   } catch (err) {
     console.warn(`[Monitor] Could not load latency samples (${err.message}) — starting fresh`);
   }
+}
+
+/**
+ * Normalise a disk entry into the current { ms, recordedAt } shape.
+ * Returns null for malformed input. Exported via `_normaliseLatencySample`
+ * so tests can verify the back-compat behaviour without touching disk.
+ */
+function normaliseLatencySample(entry) {
+  if (Number.isFinite(entry) && entry > 0) {
+    return { ms: entry, recordedAt: 0 }; // legacy plain-number format
+  }
+  if (entry && Number.isFinite(entry.ms) && entry.ms > 0) {
+    return { ms: entry.ms, recordedAt: Number.isFinite(entry.recordedAt) ? entry.recordedAt : 0 };
+  }
+  return null;
 }
 
 function schedulePersistBotLatency() {
@@ -394,9 +424,9 @@ function schedulePersistBotLatency() {
   }, LATENCY_PERSIST_THROTTLE_MS).unref();
 }
 
-function recordBotLatency(durationMs) {
+function recordBotLatency(durationMs, { now = Date.now() } = {}) {
   if (!Number.isFinite(durationMs) || durationMs <= 0) return;
-  botLatencySamples.push(durationMs);
+  botLatencySamples.push({ ms: durationMs, recordedAt: now });
   if (botLatencySamples.length > MAX_LATENCY_SAMPLES) botLatencySamples.shift();
   schedulePersistBotLatency();
 }
@@ -406,14 +436,37 @@ loadBotLatencyFromDisk();
 
 /**
  * Returns the bot execution estimate (ms) used by the drift forecast.
- *   • Fewer than MIN_SAMPLES_FOR_P95 samples → POS_BOT_EXEC_MS env fallback
- *   • Otherwise → P95 of the rolling window (resilient to outliers)
+ *   • Fewer than MIN_SAMPLES_FOR_EST FRESH samples → POS_BOT_EXEC_MS fallback
+ *   • Otherwise → median of FRESH samples (newer than LATENCY_FRESHNESS_MS old)
+ *
+ * Median rather than P95 because the post-warmer distribution is tight and
+ * symmetric — P95 systematically over-estimates by tracking outliers we no
+ * longer have. Freshness window discards pre-warmer cold-login samples that
+ * would otherwise hold the estimate artificially high for ~30 bot runs.
+ *
+ * Pure function in spirit; reads the module-scope sample array but no other
+ * state. `now` is injectable so tests can exercise the freshness cutoff
+ * without touching the system clock.
  */
-function botExecutionEstimateMs() {
-  if (botLatencySamples.length < MIN_SAMPLES_FOR_P95) return POS_BOT_EXEC_MS;
-  const sorted = [...botLatencySamples].sort((a, b) => a - b);
-  const idx    = Math.max(0, Math.ceil(0.95 * sorted.length) - 1);
-  return sorted[Math.min(sorted.length - 1, idx)];
+function botExecutionEstimateMs({ now = Date.now() } = {}) {
+  const cutoff = now - LATENCY_FRESHNESS_MS;
+  const fresh  = botLatencySamples
+    .filter((s) => s.recordedAt >= cutoff)
+    .map((s) => s.ms);
+  if (fresh.length < MIN_SAMPLES_FOR_EST) return POS_BOT_EXEC_MS;
+  return computeMedian(fresh);
+}
+
+/**
+ * Median of a non-empty array of numbers. Sorts a copy so caller's array is
+ * not mutated. Exported via `_computeMedian` for unit tests.
+ */
+function computeMedian(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid    = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[mid - 1] + sorted[mid]) / 2
+    : sorted[mid];
 }
 
 // EventEmitter — decouples SSE clients from service logic
@@ -637,6 +690,25 @@ async function _runBot(driverId, state, triggerType = 'monitor_requeue') {
     // a wrong one that poisons bias.
     state.pendingTrackingId = null;
     console.log(`[PosTracking] #${state.vehicleNumber} → bot found already in queue (pos ${result.position}) — NOT recording as actual (avoids bias contamination)`);
+  } else if (state.pendingTrackingId && !result?.success) {
+    // Bot returned a non-success result without throwing. This is the path for
+    // fast-fail outcomes: credential lockout, "Vehicle not available for
+    // registration", "vehicle not found", etc. Without clearing the handle
+    // here, the next poll observes the driver in V Holding (possibly from a
+    // completely unrelated channel — manual fire, auto-requeue, self-add) and
+    // writes that position as the actual. That's the +116 #631 contamination
+    // we observed on 2026-05-29.
+    //
+    // We also mark the row as failed so the Position Accuracy table shows the
+    // outcome clearly rather than leaving it in 'pending' forever. The 'fired'
+    // decision stays in place for analytics; markFailed just appends the
+    // failure context.
+    const failedTrackingId = state.pendingTrackingId;
+    state.pendingTrackingId = null;
+    const reason = result?.error || result?.message || 'unknown bot failure';
+    PositionTracking.markFailed(failedTrackingId, reason)
+      .catch((err) => console.error('[PosTracking] markFailed (non-success) error:', err.message));
+    console.log(`[PosTracking] #${state.vehicleNumber} → bot returned failure (${reason}) — row marked failed, NOT recording actual_position`);
   }
 
   broadcast('requeue_result', {
@@ -814,11 +886,15 @@ async function fetchPage(url) {
 // Decision shape:
 //   { action: 'skip_no_target'      }                                  // no DB write
 //   { action: 'skip_already_fired'  , logLine }                        // no DB write
+//   { action: 'skip_locked_out'     , reason, logLine, metrics }       // creds bad
 //   { action: 'skip_bot_inflight'   , reason, logLine, metrics }
 //   { action: 'skip_already_seen'   , reason, logLine, metrics }
 //   { action: 'fire'                , reason, logLine, fireOpts, ... } // sets positionFiredToday
 //   { action: 'wait'                , reason, logLine, metrics, secondsUntilFire }
 //   { action: 'missed_impossible'   , reason, logLine, metrics }       // queue already past max
+//
+// `isLockedOut` is injected via ctx so this function stays pure and unit-testable
+// without depending on the credentialLockoutService singleton.
 function evaluatePositionScheduler(state, ctx) {
   const {
     waitingCount,
@@ -830,6 +906,7 @@ function evaluatePositionScheduler(state, ctx) {
     todayDayKey,
     botSamplesCount,
     queueShrinkageDetected = false,
+    isLockedOut             = () => false,
   } = ctx;
 
   // Resolve today's effective position — skip drivers with no target today
@@ -855,6 +932,20 @@ function evaluatePositionScheduler(state, ctx) {
     return {
       action:  'skip_already_fired',
       logLine: `[Pos] ${veh} — already fired today (target: ${effectivePosition}), skipping`,
+    };
+  }
+  // Credentials confirmed bad earlier (warmer or a prior bot run). Skip the
+  // fire so we don't burn a slot on a guaranteed failure — and so we don't
+  // create a "fired" position_tracking row that the next V Holding observation
+  // could contaminate (the +116 #631 path from 2026-05-29). NOT marking
+  // positionFiredToday so that if the admin updates the SAN password mid-day
+  // and clears the lockout, the scheduler picks them up again automatically.
+  if (isLockedOut(state.driverId)) {
+    return {
+      action:  'skip_locked_out',
+      reason:  'credentials_locked_out',
+      logLine: `[Pos] ${veh} — credentials locked out, skipping (driver must update SAN password)`,
+      metrics: baseMetrics,
     };
   }
   if (state.state === 'requeuing') {
@@ -972,7 +1063,7 @@ function evaluatePositionScheduler(state, ctx) {
                `${biasCorrection !== 0 ? ` + bias ${biasCorrection.toFixed(1)}` : ''} ` +
                `= ${projectedLanding.toFixed(1)} ≥ target ${effectivePosition} ` +
                `(max ${maxAcceptable}, rate ${effectiveGrowthRate.toFixed(2)}/s, ` +
-               `horizon ${horizonSeconds.toFixed(0)}s, botP95 ${(botExecMs/1000).toFixed(1)}s, ` +
+               `horizon ${horizonSeconds.toFixed(0)}s, botEst ${(botExecMs/1000).toFixed(1)}s, ` +
                `samples ${botSamplesCount}) — firing bot`,
       fireOpts: {
         growthRate:            effectiveGrowthRate,
@@ -1156,6 +1247,9 @@ async function poll() {
     shortWindowRate,
     smoothedGrowthRate,
     effectiveGrowthRate,
+    // Field name preserved for the existing bot_p95_ms column. The value is
+    // now the median of fresh samples, not P95 — see botExecutionEstimateMs.
+    // Future migration can rename the column to bot_est_ms when convenient.
     botP95Ms:            botExecutionEstimateMs(),
     botLatencySamples:   botLatencySamples.length,
     biasCorrection,
@@ -1455,6 +1549,8 @@ async function poll() {
   const estimatedDrift       = Math.max(POS_DRIFT_FLOOR, Math.ceil(effectiveGrowthRate * horizonSeconds));
 
   // Context shared by every per-driver decision. Pure data — no module state.
+  // isLockedOut is injected so evaluatePositionScheduler stays a pure function
+  // (no singleton coupling) — tests can pass their own predicate.
   const decisionCtx = {
     waitingCount,
     effectiveGrowthRate,
@@ -1465,6 +1561,7 @@ async function poll() {
     todayDayKey,
     botSamplesCount:         botLatencySamples.length,
     queueShrinkageDetected,
+    isLockedOut:             credentialLockout.isLockedOut,
   };
 
   // Track the soonest fire across all armed drivers — drives adaptive polling.
@@ -1489,6 +1586,16 @@ async function poll() {
 
       case 'skip_already_fired':
         console.log(decision.logLine);
+        break;
+
+      case 'skip_locked_out':
+        // Same handling as a 'wait' decision — log + record decision row so the
+        // admin can see why the scheduler isn't firing. We deliberately do NOT
+        // set positionFiredToday: if the admin updates the SAN password and
+        // clears the lockout mid-day, the next poll evaluates this driver
+        // normally and may fire at the target later.
+        console.log(decision.logLine);
+        recordPositionDecision(state, decision.action, decision.reason, decision.metrics);
         break;
 
       case 'skip_bot_inflight':
@@ -2050,4 +2157,7 @@ module.exports = {
   _expectedNextPollMs:        expectedNextPollMs,
   _botExecutionEstimateMs:    botExecutionEstimateMs,
   _recordBotLatency:          recordBotLatency,
+  _computeMedian:             computeMedian,
+  _normaliseLatencySample:    normaliseLatencySample,
+  _resetLatencySamples:       () => { botLatencySamples.length = 0; },
 };

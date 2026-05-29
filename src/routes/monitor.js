@@ -41,4 +41,15 @@ router.delete(
   ctrl.removeWatch,
 );
 
+// Re-arm the position scheduler so it can fire again today for this driver.
+// Used after a manual run / early auto-requeue placed the driver at a non-
+// target position and the admin wants the scheduler to retry at the real
+// target later in the day.
+router.post(
+  '/watch/:driverId/allow-refire',
+  [param('driverId').isInt({ min: 1 }).withMessage('Invalid driver ID')],
+  validate,
+  ctrl.allowRefire,
+);
+
 module.exports = router;

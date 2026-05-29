@@ -273,6 +273,14 @@ const manualWatchIds = new Set();
 /** Today's date in PT — used to detect day rollover for counter reset */
 let todayPT = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
 
+/**
+ * Last calendar day (PT, YYYY-MM-DD) on which we re-armed the position
+ * scheduler at the start of position hours. Null until the first 3 AM
+ * transition observed since boot. Lets us run the auto-arm exactly once per
+ * day, regardless of how many polls fire during the window.
+ */
+let positionWindowArmedForDate = null;
+
 /** Stats from the most recent successful poll */
 let lastPollStats = {
   pollAt:       null,
@@ -1030,6 +1038,22 @@ async function poll() {
     broadcast('daily_reset', { date: currentDayPT });
   }
 
+  // ─── Position-window arming (3 AM PT) ─────────────────────────────────────────
+  // SAN's V Holding clears overnight, so any manual bot run a driver makes
+  // before ~3 AM lands them at a position far below their actual target. The
+  // midnight reset only clears requeueCountToday and (for carryover drivers)
+  // tags them as such — it does NOT reset the flags set by a SUCCESSFUL
+  // manual or auto-fire that happened between 00:00 and the start of the
+  // position window. That left drivers like #4007 stuck at #28 from a 12:30 AM
+  // manual run, blocked from re-firing at their real target later.
+  //
+  // Fires once per day at the open of the position window — see armPosition
+  // WindowForToday() below for what gets reset and why.
+  if (isWithinPositionHours() && positionWindowArmedForDate !== currentDayPT) {
+    positionWindowArmedForDate = currentDayPT;
+    armPositionWindowForToday(currentDayPT);
+  }
+
   const t0 = Date.now();
   let html;
 
@@ -1672,6 +1696,116 @@ function markManuallyRemoved(driverId) {
 }
 
 /**
+ * Re-arms EVERY watched driver for today's position schedule. Called once
+ * per day from the poll loop when the position window opens (3 AM PT) and
+ * also exposed for unit tests + the rare ops case where an admin wants to
+ * force a re-arm across the fleet.
+ *
+ * Why this matters: the midnight reset clears `requeueCountToday` and tags
+ * carryover drivers, but it does NOT undo `hasBeenSeen` / `positionFiredToday`
+ * that get set during 00:00-03:00 if a driver runs the bot manually. Without
+ * this 3 AM re-arm, that early run silently blocks the position scheduler
+ * from firing at the real target later in the morning.
+ *
+ * For each driver:
+ *   • Drivers observably in V Holding / dispatched / at terminal are tagged
+ *     inQueueFromCarryover so the scheduler waits for them to be dropped
+ *     before re-firing (same machinery as the midnight-carryover handling).
+ *   • Drivers not in queue get a fully clean slate.
+ *   • Drivers in 'requeuing' state aren't touched — the bot they're running
+ *     will finish on its own.
+ *
+ * Returns the number of drivers re-armed.
+ */
+function armPositionWindowForToday(dayKey = todayPT) {
+  let armed = 0;
+  for (const s of watches.values()) {
+    // "Observably queued" means SAN is currently tracking them in some form,
+    // OR we've previously observed them in V Holding this session.
+    const isObservablyQueued =
+      s.state === 'in_queue' ||
+      s.state === 'dispatched' ||
+      s.state === 'at_terminal' ||
+      s.hasBeenSeen === true;
+
+    s.inQueueFromCarryover = isObservablyQueued;
+    s.hasBeenSeen          = false;
+    s.positionFiredToday   = false;
+    s.lastPosDecision      = null;
+    s.pendingTrackingId    = null;
+    s.manuallyRemovedAt    = null;
+    s.terminalSeen         = false;
+    s.terminalCheckCount   = 0;
+    s.terminalName         = null;
+    s.terminalPosition     = null;
+    s.atTerminalSince      = null;
+
+    // Don't yank state out from under an in-flight bot.
+    if (s.state !== 'requeuing') {
+      s.state = s.inQueueFromCarryover ? 'in_queue' : 'watching';
+    }
+    armed++;
+  }
+
+  if (armed > 0) {
+    console.log(`[Monitor] Position window armed (${POS_START_HOUR}:00 PT, day ${dayKey}) — ${armed} driver(s) ready for today's schedule`);
+    broadcast('position_window_opened', { date: dayKey, armed });
+  }
+  return armed;
+}
+
+/**
+ * Re-arms the position scheduler for a driver who was already queued today
+ * (whether by a manual "Get Back in Queue" press, an early auto-requeue, or
+ * a "Remove from Queue" that flipped positionFiredToday=true). After this:
+ *
+ *   • positionFiredToday is reset to false
+ *   • hasBeenSeen is reset to false so skip_already_seen doesn't immediately
+ *     re-block the next fire decision
+ *   • manuallyRemovedAt is cleared so the auto-watch refresh re-adopts them
+ *   • carryover and pending-tracking handles are wiped so the next decision
+ *     starts from a clean slate
+ *
+ * Does NOT remove the driver from V Holding — caller is expected to do that
+ * separately (or the driver is already out of the queue). If the driver IS
+ * still in V Holding when the next poll runs, the bot will detect them as
+ * already-queued and we won't actually re-add them — making this safe to
+ * call in either state.
+ */
+function allowRefireToday(driverId) {
+  const state = watches.get(driverId);
+  if (!state) {
+    console.warn(`[Monitor] allowRefireToday: driver ${driverId} not in watches`);
+    return false;
+  }
+
+  state.positionFiredToday   = false;
+  state.hasBeenSeen          = false;
+  state.manuallyRemovedAt    = null;
+  state.lastPosDecision      = null;
+  state.pendingTrackingId    = null;
+  state.inQueueFromCarryover = false;
+  // Reset terminal-state too so a stale at_terminal carryover doesn't shadow
+  // the next observation.
+  state.terminalSeen         = false;
+  state.terminalCheckCount   = 0;
+  state.terminalName         = null;
+  state.terminalPosition     = null;
+  state.atTerminalSince      = null;
+  // Only flip state back to 'watching' if we're not currently observed in
+  // queue/dispatch/terminal — otherwise we'd lie about where they are.
+  if (state.state === 'requeuing') {
+    // Bot in-flight — don't touch state, scheduler check on requeuing handles it.
+  } else {
+    state.state = 'watching';
+  }
+
+  console.log(`[Monitor] #${state.vehicleNumber} → position scheduler re-armed for today (allowRefireToday)`);
+  broadcast('driver_state', { driverId, state: snap(state) });
+  return true;
+}
+
+/**
  * Auto-watch ALL currently active drivers.
  * Called once on startup; also re-called by refreshAutoWatches().
  */
@@ -1884,6 +2018,7 @@ function stopMonitor() {
   biasPollCount      = 0;
   recentObservations.length = 0;
   currentPollDelayMs = POLL_INTERVAL_MS;
+  positionWindowArmedForDate = null;
 }
 
 /** Seconds until next scheduled poll (uses the current adaptive interval). */
@@ -1896,6 +2031,12 @@ module.exports = {
   removeWatch,
   manualRun,
   markManuallyRemoved,
+  allowRefireToday,
+  armPositionWindowForToday,
+  // Test-only: returns the live in-memory state object for a driver so tests
+  // can mutate flags directly. Do NOT use from production code paths —
+  // mutating state outside snap() / broadcast() breaks SSE updates.
+  _getInternalState: (driverId) => watches.get(driverId),
   watchAllActive,
   refreshAutoWatches,
   getState,

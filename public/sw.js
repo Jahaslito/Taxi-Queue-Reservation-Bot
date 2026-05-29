@@ -8,7 +8,7 @@
 //   3. activate handler purges any caches not matching CACHE_NAME
 //   4. clients.claim() takes over open tabs immediately
 //   5. Next navigation (or app reopen) serves the new files
-const CACHE_VERSION = 'v10';
+const CACHE_VERSION = 'v13';
 const CACHE_NAME    = `san-queue-${CACHE_VERSION}`;
 
 const PRECACHE = [

@@ -123,4 +123,40 @@ async function getHistory(req, res, next) {
   }
 }
 
-module.exports = { getStatus, getStream, addWatch, removeWatch, getHistory };
+// ─── POST /api/admin/monitor/watch/:driverId/allow-refire ──────────────────
+// Re-arms the position scheduler for a driver who was already queued today
+// (manual fire, early auto-requeue, or a Remove-from-Queue that set
+// positionFiredToday=true). Idempotent: no-op if the driver isn't watched
+// or if their state is already clean.
+//
+// Use case: admin manually fires a driver at 02:00 AM PT, queue is small so
+// the driver lands at #28. Their actual target for today is #170. Without
+// this action, the position scheduler would skip them for the day because
+// hasBeenSeen=true. Hitting this endpoint resets the flags so the scheduler
+// fires later in the morning once the queue grows.
+async function allowRefire(req, res, next) {
+  try {
+    const driverId = parseInt(req.params.driverId, 10);
+
+    const driver = await Driver.findById(driverId);
+    if (!driver) { const e = new Error('Driver not found'); e.statusCode = 404; throw e; }
+
+    const ok = monitor.allowRefireToday(driverId);
+    if (!ok) {
+      // Not in watches — likely because they're not active, or never added.
+      // Surface a 409 so the UI can show a useful message instead of 500.
+      const e = new Error('Driver is not currently being watched — cannot reset');
+      e.statusCode = 409;
+      throw e;
+    }
+
+    res.json({
+      message: `Position scheduler re-armed for #${driver.vehicle_number}`,
+      driverId,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { getStatus, getStream, addWatch, removeWatch, getHistory, allowRefire };

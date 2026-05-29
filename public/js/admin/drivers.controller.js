@@ -95,8 +95,9 @@ async function loadDrivers(page) {
           </td>
           <td>${activeBadge}</td>
           <td>
-            <div style="display:flex;gap:6px;">
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">
               <button class="btn btn-trigger btn-sm" data-action="trigger"    data-id="${Number(d.id)}" data-name="${esc(d.name)}">▶ Run</button>
+              ${isPosSched ? `<button class="btn btn-ghost btn-sm" data-action="arm-position" data-id="${Number(d.id)}" data-name="${esc(d.name)}" title="Reset today's position-schedule fired flag so the bot can fire again at the real target">🎯 Arm</button>` : ''}
               <button class="btn btn-ghost btn-sm"   data-action="edit"       data-id="${Number(d.id)}">Edit</button>
               <button class="btn btn-ghost btn-sm"   data-action="send-reset" data-id="${Number(d.id)}" data-name="${esc(d.name)}" data-email="${esc(d.email || '')}" title="Send password reset email">Reset Password</button>
             </div>
@@ -166,6 +167,38 @@ async function triggerDriver(id, name, btn) {
     btn.disabled = false;
     btn.innerHTML = originalHTML;
     btn.style.minWidth = '';
+  }
+}
+
+// ─── Re-arm today's position schedule for a driver ───────────────────────────
+// Calls the monitor's allow-refire endpoint, which resets positionFiredToday +
+// hasBeenSeen + manuallyRemovedAt so the position scheduler can fire again at
+// the real target. Used after a manual run / early auto-requeue that placed
+// the driver at a non-target position.
+async function armPositionSchedule(id, name, btn) {
+  const ok = await showConfirm(
+    `Re-arm today's position schedule for ${esc(name)}?\n\n` +
+    `Clears the "already fired today" flag so the scheduler will fire again ` +
+    `when the queue reaches their target. If they're currently in the queue at ` +
+    `a position below target, you should remove them first.`,
+    { title: 'Arm Position Schedule', okLabel: 'Arm', icon: '🎯' },
+  );
+  if (!ok) return;
+
+  const originalHTML = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+
+  try {
+    const data = await api(`/api/admin/monitor/watch/${id}/allow-refire`, { method: 'POST' });
+    showToast(`✅ ${data.message}`, 'success', 5000);
+  } catch (err) {
+    // 409 = driver not in watches (likely inactive). Surface the server's
+    // message rather than a generic "request failed".
+    showToast(err.message || 'Failed to re-arm position schedule', 'error', 6000);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalHTML;
   }
 }
 
@@ -456,9 +489,10 @@ document.getElementById('drivers-table-body').addEventListener('click', e => {
   const btn = e.target.closest('[data-action]');
   if (!btn) return;
   const id = Number(btn.dataset.id);
-  if (btn.dataset.action === 'edit')       openEditModal(id);
-  if (btn.dataset.action === 'trigger')    triggerDriver(id, btn.dataset.name, btn);
-  if (btn.dataset.action === 'send-reset') sendPasswordReset(id, btn.dataset.name, btn.dataset.email, btn);
+  if (btn.dataset.action === 'edit')         openEditModal(id);
+  if (btn.dataset.action === 'trigger')      triggerDriver(id, btn.dataset.name, btn);
+  if (btn.dataset.action === 'send-reset')   sendPasswordReset(id, btn.dataset.name, btn.dataset.email, btn);
+  if (btn.dataset.action === 'arm-position') armPositionSchedule(id, btn.dataset.name, btn);
 });
 
 // Save driver (create or update)

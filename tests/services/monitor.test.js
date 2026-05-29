@@ -35,6 +35,8 @@ const {
   manualRun,
   getState,
   stopMonitor,
+  allowRefireToday,
+  armPositionWindowForToday,
 } = monitor;
 
 // ─── UTC timestamp for a given Pacific Standard Time hour ─────────────────────
@@ -192,6 +194,151 @@ describe('manualRun() — operating hours bypass', () => {
   test('throws if driver is already requeuing (prevents double-run)', async () => {
     await manualRun(DRIVER_ID); // state → 'requeuing' (synchronous in triggerRequeue)
     await expect(manualRun(DRIVER_ID)).rejects.toThrow('Bot is already running');
+  });
+});
+
+// ─── allowRefireToday() — re-arm the position scheduler mid-day ───────────────
+// Used after a manual run / early auto-requeue has already placed the driver,
+// when the admin wants the position scheduler to fire again later in the day
+// for the actual target. Resets every flag that would skip them.
+
+describe('allowRefireToday()', () => {
+  beforeEach(async () => {
+    setupMocks();
+    await addWatch(DRIVER_ID, { isAuto: true });
+  });
+
+  test('returns false for an unwatched driver (no throw)', () => {
+    expect(allowRefireToday(9999)).toBe(false);
+  });
+
+  test('clears positionFiredToday so the scheduler can fire again', () => {
+    // Simulate post-manual-run state: flag was set by skip_already_seen path
+    const internal = monitor._getInternalState(DRIVER_ID);
+    internal.positionFiredToday = true;
+    internal.hasBeenSeen        = true;
+    internal.manuallyRemovedAt  = new Date();
+
+    expect(allowRefireToday(DRIVER_ID)).toBe(true);
+
+    const after = monitor._getInternalState(DRIVER_ID);
+    expect(after.positionFiredToday).toBe(false);
+    expect(after.hasBeenSeen).toBe(false);
+    expect(after.manuallyRemovedAt).toBeNull();
+  });
+
+  test('does not flip state away from "requeuing" — bot in flight stays in flight', () => {
+    const internal = monitor._getInternalState(DRIVER_ID);
+    internal.state              = 'requeuing';
+    internal.positionFiredToday = true;
+
+    allowRefireToday(DRIVER_ID);
+
+    const after = monitor._getInternalState(DRIVER_ID);
+    expect(after.state).toBe('requeuing');           // not overwritten
+    expect(after.positionFiredToday).toBe(false);    // but flag still cleared
+  });
+
+  test('resets carryover / terminal flags too — clean slate', () => {
+    const internal = monitor._getInternalState(DRIVER_ID);
+    internal.inQueueFromCarryover = true;
+    internal.terminalSeen         = true;
+    internal.terminalName         = 'T2';
+    internal.terminalPosition     = 12;
+
+    allowRefireToday(DRIVER_ID);
+
+    const after = monitor._getInternalState(DRIVER_ID);
+    expect(after.inQueueFromCarryover).toBe(false);
+    expect(after.terminalName).toBeNull();
+    expect(after.terminalPosition).toBeNull();
+  });
+});
+
+// ─── armPositionWindowForToday() — the 3 AM PT auto re-arm ────────────────────
+// Critical: anyone who manually fires the bot between midnight and 3 AM should
+// NOT lose their position schedule for the day. We assert each meaningful
+// starting state lands in the right post-arm state.
+
+describe('armPositionWindowForToday() — fleet-wide 3 AM re-arm', () => {
+  beforeEach(async () => {
+    setupMocks();
+    await addWatch(DRIVER_ID, { isAuto: true });
+  });
+
+  test('driver who manually ran pre-3 AM → tagged carryover, scheduler can wait for drop', () => {
+    // Simulate: driver fired bot at 01:00 AM, ended up in queue.
+    const internal = monitor._getInternalState(DRIVER_ID);
+    internal.state              = 'in_queue';
+    internal.hasBeenSeen        = true;
+    internal.positionFiredToday = false; // position scheduler hasn't run yet (before pos hours)
+
+    armPositionWindowForToday('2026-05-28');
+
+    const after = monitor._getInternalState(DRIVER_ID);
+    expect(after.inQueueFromCarryover).toBe(true);   // tagged as carryover
+    expect(after.hasBeenSeen).toBe(false);            // re-armed
+    expect(after.positionFiredToday).toBe(false);     // still ready to fire today
+    expect(after.state).toBe('in_queue');             // currently in queue
+  });
+
+  test('driver NOT in queue → fully clean slate (will fire fresh when target reached)', () => {
+    const internal = monitor._getInternalState(DRIVER_ID);
+    internal.state             = 'watching';
+    internal.hasBeenSeen       = false;
+    internal.positionFiredToday = false;
+    internal.lastPosDecision   = 'waiting';
+
+    armPositionWindowForToday('2026-05-28');
+
+    const after = monitor._getInternalState(DRIVER_ID);
+    expect(after.inQueueFromCarryover).toBe(false);
+    expect(after.state).toBe('watching');
+    expect(after.lastPosDecision).toBeNull();
+  });
+
+  test('driver whose Remove-from-Queue had blocked the day → un-blocked', () => {
+    const internal = monitor._getInternalState(DRIVER_ID);
+    internal.manuallyRemovedAt   = new Date();
+    internal.positionFiredToday  = true;  // markManuallyRemoved set this
+    internal.hasBeenSeen         = false;
+
+    armPositionWindowForToday('2026-05-28');
+
+    const after = monitor._getInternalState(DRIVER_ID);
+    expect(after.positionFiredToday).toBe(false);
+    expect(after.manuallyRemovedAt).toBeNull();
+  });
+
+  test('driver in "requeuing" state (bot in flight) is left alone', () => {
+    const internal = monitor._getInternalState(DRIVER_ID);
+    internal.state              = 'requeuing';
+    internal.positionFiredToday = true;
+
+    armPositionWindowForToday('2026-05-28');
+
+    const after = monitor._getInternalState(DRIVER_ID);
+    expect(after.state).toBe('requeuing');         // not overwritten
+    expect(after.positionFiredToday).toBe(false);  // flag still cleared
+  });
+
+  test('driver already at_terminal pre-arm → tagged carryover (state machine handles drop)', () => {
+    const internal = monitor._getInternalState(DRIVER_ID);
+    internal.state            = 'at_terminal';
+    internal.terminalName     = 'T1';
+    internal.terminalPosition = 5;
+
+    armPositionWindowForToday('2026-05-28');
+
+    const after = monitor._getInternalState(DRIVER_ID);
+    expect(after.inQueueFromCarryover).toBe(true);
+    expect(after.terminalName).toBeNull();
+    expect(after.terminalPosition).toBeNull();
+    expect(after.state).toBe('in_queue'); // re-mapped per carryover policy
+  });
+
+  test('returns the count of armed drivers', () => {
+    expect(armPositionWindowForToday('2026-05-28')).toBe(1);
   });
 });
 

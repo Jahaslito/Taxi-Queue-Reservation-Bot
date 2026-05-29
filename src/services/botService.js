@@ -68,6 +68,33 @@ const APP_HOST    = 'san.gtcvms.com/gsidispatch.edispatch';
 const TIMEOUT     = 60000;   // 60s — OIDC handshake + SPA hydration can be slow
 const NAV_TIMEOUT = 60000;   // Extra time for full page-navigation round-trips
 
+// ─── Failure classifier ──────────────────────────────────────────────────────
+// debugCapture uses this label as the filename suffix so admins can grep the
+// debug dir for specific failure modes without opening every PNG:
+//   *_goto_timeout_*    → SAN didn't answer initial navigation (proxy/network)
+//   *_login_timeout_*   → On OIDC login page, neither redirect nor matched
+//                         error text within NAV_TIMEOUT (e.g., the
+//                         email-as-username case for #4007 on 2026-05-26)
+//   *_oidc_timeout_*    → Credentials were filled, OIDC callback never came back
+//   *_search_timeout_*  → On the app, vehicle search / add-to-queue step hung
+//   *_timeout           → Catch-all for timeouts whose URL doesn't classify
+//   *_error             → Non-timeout failures
+//
+// Pure function — exported for tests. urlAtError is whatever page.url()
+// returned at the moment of failure (or '' if the page was already closed).
+function classifyFailure({ urlAtError = '', errorMessage = '' } = {}) {
+  const isTimeout = /timeout|timed out|aborted due to timeout/i.test(errorMessage);
+  if (!isTimeout) return 'error';
+  if (!urlAtError || urlAtError === 'about:blank') return 'goto_timeout';
+  if (urlAtError.includes('/Account/Login'))       return 'login_timeout';
+  // signin-oidc is the redirect URL SAN posts the auth code back to — if we're
+  // stuck here, the OIDC callback didn't complete after a successful login.
+  if (urlAtError.includes('signin-oidc'))          return 'oidc_timeout';
+  if (urlAtError.includes(OIDC_HOST))              return 'login_timeout';
+  if (urlAtError.includes(APP_HOST))               return 'search_timeout';
+  return 'timeout';
+}
+
 // ─── Session store ────────────────────────────────────────────────────────────
 // In-memory cache of Playwright storage states (cookies + localStorage) keyed by
 // SAN username. Lets subsequent runs skip the full OIDC login (~15 s saved).
@@ -403,7 +430,14 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
 
   } catch (err) {
     console.error(`[Bot] ${vehicleNumber} → ERROR: ${err.message}`);
-    if (page) await debugCapture(page, vehicleNumber, 'error');
+    // Classify the failure so the debug screenshot's filename tells us at a
+    // glance WHERE the bot got stuck — login page, post-OIDC callback, add to
+    // queue, etc. Without this, every failure dumps as "*_error" and admins
+    // have to open each PNG to find the one they're investigating.
+    let urlAtError = '';
+    try { urlAtError = page ? page.url() : ''; } catch { /* page closed */ }
+    const failureLabel = classifyFailure({ urlAtError, errorMessage: err.message });
+    if (page) await debugCapture(page, vehicleNumber, failureLabel);
 
     // Verify-on-timeout: SAN can be slow enough that our Playwright waitFor*
     // exceeds its 60 s limit AFTER the add-to-queue request actually went
@@ -645,7 +679,12 @@ async function removeFromQueue(sanUsername, sanPassword, vehicleNumber) {
 
   } catch (err) {
     console.error(`[Bot] ${vehicleNumber} (remove) → ERROR: ${err.message}`);
-    if (page) await debugCapture(page, vehicleNumber, 'remove_error');
+    // Same classifier as addToQueue, prefixed so admins can tell remove-flow
+    // captures apart from add-flow ones in the debug dir.
+    let urlAtError = '';
+    try { urlAtError = page ? page.url() : ''; } catch { /* page closed */ }
+    const failureLabel = `remove_${classifyFailure({ urlAtError, errorMessage: err.message })}`;
+    if (page) await debugCapture(page, vehicleNumber, failureLabel);
     const friendly = sanitizeError(err.message);
     return {
       success: false,
@@ -678,6 +717,7 @@ async function removeFromQueue(sanUsername, sanPassword, vehicleNumber) {
 async function warmSession({ sanUsername, sanPassword, vehicleNumber }) {
   const startTime = Date.now();
   let browser = null;
+  let page    = null; // lifted from try-block so the catch can debugCapture
 
   try {
     browser = await chromium.launch({
@@ -710,7 +750,7 @@ async function warmSession({ sanUsername, sanPassword, vehicleNumber }) {
       ...(proxyConfig ? { proxy: proxyConfig } : {}),
     });
 
-    const page = await context.newPage();
+    page = await context.newPage();
 
     // Same bandwidth-saver as addToQueue — we don't render anything.
     await page.route('**/*', route => {
@@ -771,6 +811,12 @@ async function warmSession({ sanUsername, sanPassword, vehicleNumber }) {
   } catch (err) {
     const friendly = sanitizeError(err.message);
     console.error(`[Warm] ${vehicleNumber} → ERROR: ${err.message}`);
+    // Same classifier as addToQueue, "warm_" prefix to keep flows separate
+    // in the debug dir listings.
+    let urlAtError = '';
+    try { urlAtError = page ? page.url() : ''; } catch { /* page closed */ }
+    const failureLabel = `warm_${classifyFailure({ urlAtError, errorMessage: err.message })}`;
+    if (page) await debugCapture(page, vehicleNumber, failureLabel).catch(() => {});
     return {
       success:    false,
       durationMs: Date.now() - startTime,
@@ -794,4 +840,6 @@ module.exports = {
   getStoredSession,
   forgetSession,
   SESSION_TTL_MS,
+  // Exposed for unit tests — pure failure classifier.
+  _classifyFailure: classifyFailure,
 };

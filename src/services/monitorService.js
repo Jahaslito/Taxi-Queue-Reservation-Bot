@@ -1755,22 +1755,15 @@ function armPositionWindowForToday(dayKey = todayPT) {
 }
 
 /**
- * Re-arms the position scheduler for a driver who was already queued today
- * (whether by a manual "Get Back in Queue" press, an early auto-requeue, or
- * a "Remove from Queue" that flipped positionFiredToday=true). After this:
+ * Re-arms the position scheduler for a single driver. Used by the admin
+ * "🎯 Arm" button and the allow-refire endpoint.
  *
- *   • positionFiredToday is reset to false
- *   • hasBeenSeen is reset to false so skip_already_seen doesn't immediately
- *     re-block the next fire decision
- *   • manuallyRemovedAt is cleared so the auto-watch refresh re-adopts them
- *   • carryover and pending-tracking handles are wiped so the next decision
- *     starts from a clean slate
- *
- * Does NOT remove the driver from V Holding — caller is expected to do that
- * separately (or the driver is already out of the queue). If the driver IS
- * still in V Holding when the next poll runs, the bot will detect them as
- * already-queued and we won't actually re-add them — making this safe to
- * call in either state.
+ * This is the single-driver equivalent of armPositionWindowForToday() and
+ * applies the identical policy: drivers currently observably in the queue
+ * are tagged inQueueFromCarryover so the position scheduler waits for them
+ * to leave V Holding (via dispatch OR SAN's overnight clear-out) before
+ * re-firing at the real target. No need to remove them manually first —
+ * the carryover machinery handles it.
  */
 function allowRefireToday(driverId) {
   const state = watches.get(driverId);
@@ -1779,28 +1772,33 @@ function allowRefireToday(driverId) {
     return false;
   }
 
-  state.positionFiredToday   = false;
+  // Same observation check armPositionWindowForToday uses — keeps the two
+  // entry points behaviorally identical so an admin clicking "Arm" gets the
+  // same outcome as the 3 AM auto-arm would have produced.
+  const isObservablyQueued =
+    state.state === 'in_queue' ||
+    state.state === 'dispatched' ||
+    state.state === 'at_terminal' ||
+    state.hasBeenSeen === true;
+
+  state.inQueueFromCarryover = isObservablyQueued;
   state.hasBeenSeen          = false;
+  state.positionFiredToday   = false;
   state.manuallyRemovedAt    = null;
   state.lastPosDecision      = null;
   state.pendingTrackingId    = null;
-  state.inQueueFromCarryover = false;
-  // Reset terminal-state too so a stale at_terminal carryover doesn't shadow
-  // the next observation.
   state.terminalSeen         = false;
   state.terminalCheckCount   = 0;
   state.terminalName         = null;
   state.terminalPosition     = null;
   state.atTerminalSince      = null;
-  // Only flip state back to 'watching' if we're not currently observed in
-  // queue/dispatch/terminal — otherwise we'd lie about where they are.
-  if (state.state === 'requeuing') {
-    // Bot in-flight — don't touch state, scheduler check on requeuing handles it.
-  } else {
-    state.state = 'watching';
+
+  // Don't yank state out from under an in-flight bot.
+  if (state.state !== 'requeuing') {
+    state.state = state.inQueueFromCarryover ? 'in_queue' : 'watching';
   }
 
-  console.log(`[Monitor] #${state.vehicleNumber} → position scheduler re-armed for today (allowRefireToday)`);
+  console.log(`[Monitor] #${state.vehicleNumber} → position scheduler re-armed for today (carryover=${state.inQueueFromCarryover})`);
   broadcast('driver_state', { driverId, state: snap(state) });
   return true;
 }

@@ -245,6 +245,8 @@ describe('allowRefireToday()', () => {
     internal.terminalSeen         = true;
     internal.terminalName         = 'T2';
     internal.terminalPosition     = 12;
+    // Default state from addWatch: state='watching', hasBeenSeen=false, so
+    // isObservablyQueued is false → carryover gets cleared.
 
     allowRefireToday(DRIVER_ID);
 
@@ -252,6 +254,25 @@ describe('allowRefireToday()', () => {
     expect(after.inQueueFromCarryover).toBe(false);
     expect(after.terminalName).toBeNull();
     expect(after.terminalPosition).toBeNull();
+  });
+
+  test('driver currently in V Holding → tagged carryover (no need to remove first)', () => {
+    // Mirrors the use case the user flagged: admin clicks "Arm" while the
+    // driver is at #28 in queue. We DON'T want admins to have to manually
+    // remove them first — the carryover machinery + SAN's overnight drop
+    // handle it. Same policy as armPositionWindowForToday at 3 AM.
+    const internal = monitor._getInternalState(DRIVER_ID);
+    internal.state              = 'in_queue';
+    internal.hasBeenSeen        = true;
+    internal.positionFiredToday = true;  // skip_already_seen set this
+
+    allowRefireToday(DRIVER_ID);
+
+    const after = monitor._getInternalState(DRIVER_ID);
+    expect(after.inQueueFromCarryover).toBe(true);   // scheduler will wait
+    expect(after.positionFiredToday).toBe(false);    // not "fired" anymore
+    expect(after.hasBeenSeen).toBe(false);
+    expect(after.state).toBe('in_queue');             // still in queue right now
   });
 });
 

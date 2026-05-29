@@ -178,9 +178,10 @@ async function triggerDriver(id, name, btn) {
 async function armPositionSchedule(id, name, btn) {
   const ok = await showConfirm(
     `Re-arm today's position schedule for ${esc(name)}?\n\n` +
-    `Clears the "already fired today" flag so the scheduler will fire again ` +
-    `when the queue reaches their target. If they're currently in the queue at ` +
-    `a position below target, you should remove them first.`,
+    `The bot will fire again when the queue reaches their target. ` +
+    `If they're currently in V Holding, the scheduler waits for them to ` +
+    `leave the queue first (via dispatch, or SAN's overnight clear-out) — ` +
+    `you don't need to remove them manually.`,
     { title: 'Arm Position Schedule', okLabel: 'Arm', icon: '🎯' },
   );
   if (!ok) return;

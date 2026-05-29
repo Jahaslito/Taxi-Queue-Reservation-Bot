@@ -89,6 +89,28 @@ services:
       PROXY_USERNAME: ${PROXY_USERNAME:-}
       PROXY_PASSWORD: ${PROXY_PASSWORD:-}
 
+      # Proxy circuit breaker / kill switch (proxyHealthService)
+      # PROXY_ENABLED=false → skip proxy entirely (observation mode)
+      # PROXY_FAIL_THRESHOLD → consecutive failures before tripping the breaker
+      # PROXY_COOLDOWN_MS    → ms to stay direct after a trip (5 min default)
+      PROXY_ENABLED:         ${PROXY_ENABLED:-true}
+      PROXY_FAIL_THRESHOLD:  ${PROXY_FAIL_THRESHOLD:-3}
+      PROXY_COOLDOWN_MS:     ${PROXY_COOLDOWN_MS:-300000}
+
+      # Session warmer (sessionWarmerService)
+      WARMER_ENABLED:        ${WARMER_ENABLED:-true}
+      WARMER_MORNING_CRON:   ${WARMER_MORNING_CRON:-0 3 * * *}
+      WARMER_REFRESH_CRON:   ${WARMER_REFRESH_CRON:-0 6,9,12,15,18,21 * * *}
+      WARMER_CONCURRENCY:    ${WARMER_CONCURRENCY:-2}
+      WARMER_STAGGER_MS:     ${WARMER_STAGGER_MS:-1000}
+      WARMER_FRESH_MS:       ${WARMER_FRESH_MS:-7200000}
+
+      # Position-scheduler tuning
+      MONITOR_BIAS_CAP:      ${MONITOR_BIAS_CAP:-10}
+
+      # Bot session disk persistence path (relative to /app inside container)
+      BOT_SESSION_PERSIST_PATH: ${BOT_SESSION_PERSIST_PATH:-/app/data/bot-sessions.json}
+
       # Playwright screenshot dir (debug)
       BOT_DEBUG_DIR: /tmp/san-bot-debug
 

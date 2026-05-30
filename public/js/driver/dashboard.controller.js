@@ -71,6 +71,13 @@ async function loadDashboard() {
     const logsData = await api('/api/driver/logs?limit=5');
     renderDashLogs(logsData.logs);
   } catch (err) {
+    // Driver was active when they logged in but admin has since deactivated
+    // them — middleware now returns 403 + accountInactive. Show the same
+    // contact-admin screen they'd see if they tried to log in fresh.
+    if (err.status === 403 && err.data && err.data.accountInactive) {
+      showView('view-inactive');
+      return;
+    }
     if (err.message.includes('token')) {
       localStorage.removeItem('driverToken');
       showView('view-login');

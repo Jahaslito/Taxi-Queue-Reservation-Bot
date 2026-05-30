@@ -15,8 +15,17 @@ async function authenticateDriver(req, res, next) {
     if (decoded.role !== 'driver') return res.status(403).json({ error: 'Access denied' });
 
     const driver = await Driver.findById(decoded.id);
-    if (!driver || !driver.is_active) {
-      return res.status(401).json({ error: 'Account is inactive' });
+    if (!driver) {
+      return res.status(401).json({ error: 'Account not found' });
+    }
+    if (!driver.is_active) {
+      // 403 — they authenticated successfully but aren't permitted to use the
+      // app. accountInactive flag lets the client render the dedicated
+      // contact-admin screen instead of bouncing back to login.
+      return res.status(403).json({
+        error: 'Your account is inactive. Please contact the admin to reactivate it.',
+        accountInactive: true,
+      });
     }
 
     req.driverId = decoded.id;

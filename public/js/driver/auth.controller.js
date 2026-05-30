@@ -59,15 +59,24 @@ document.getElementById('btn-reset-submit').addEventListener('click', async () =
   btn.innerHTML = '<span class="spinner"></span> Updating…'; btn.disabled = true;
 
   try {
-    await api('/api/auth/driver/reset-password', {
+    const data = await api('/api/auth/driver/reset-password', {
       method: 'POST', body: JSON.stringify({ token, newPassword }),
     });
     document.getElementById('reset-new-password').value    = '';
     document.getElementById('reset-confirm-password').value = '';
-    document.getElementById('reset-success-box').style.display = 'block';
-    btn.style.display = 'none';
-    // After 2.5 s take them to login
-    setTimeout(() => { btn.style.display = ''; showView('view-login'); }, 2500);
+
+    // Server flags accountInactive=true when the reset succeeded but the
+    // account is still deactivated. Skip the success box (which says
+    // "you can log in now" — they can't) and route to the inactive page.
+    if (data && data.accountInactive) {
+      showView('view-inactive');
+      showToast('Password updated, but your account is inactive. Please contact the admin.', 'info', 8000);
+    } else {
+      document.getElementById('reset-success-box').style.display = 'block';
+      btn.style.display = 'none';
+      // After 2.5 s take them to login
+      setTimeout(() => { btn.style.display = ''; showView('view-login'); }, 2500);
+    }
   } catch (err) {
     errEl.textContent = err.message;
   } finally {
@@ -94,10 +103,21 @@ document.getElementById('btn-login').addEventListener('click', async () => {
     const data = await api('/api/auth/driver/login', { method: 'POST', body: JSON.stringify(body) });
     routeDriver(data.driver);
   } catch (err) {
-    errEl.textContent = err.message;
+    // 403 + accountInactive → dedicated dead-end screen explaining the
+    // situation. Anything else (401 bad creds, 5xx network) shows inline.
+    if (err.status === 403 && err.data && err.data.accountInactive) {
+      showView('view-inactive');
+    } else {
+      errEl.textContent = err.message;
+    }
   } finally {
     btn.innerHTML = 'Log In'; btn.disabled = false;
   }
+});
+
+// Inactive screen — Back to Login link
+document.getElementById('btn-inactive-back').addEventListener('click', () => {
+  showView('view-login');
 });
 
 // ─── Register ────────────────────────────────────────────────────────────────

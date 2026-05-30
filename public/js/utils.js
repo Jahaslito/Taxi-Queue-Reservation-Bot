@@ -61,7 +61,16 @@ async function api(path, options = {}) {
     throw new Error(friendlyNetworkError());
   }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(friendlyHttpError(res.status, data.error));
+  if (!res.ok) {
+    // Preserve status + response data on the thrown error so callers can
+    // branch on specific failure modes (e.g. 403 accountInactive → show a
+    // dedicated screen instead of inline error). Plain consumers that only
+    // read .message continue to work — friendlyHttpError stays the message.
+    const err = new Error(friendlyHttpError(res.status, data.error));
+    err.status = res.status;
+    err.data   = data;
+    throw err;
+  }
   return data;
 }
 

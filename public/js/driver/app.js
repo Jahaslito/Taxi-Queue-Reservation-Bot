@@ -203,6 +203,11 @@ window.__APP_CONFIG__ = { billingEnabled: true }; // safe default until fetched
     } else if (verified === 'expired') {
       showView('view-login');
       showToast('Verification link expired. Log in and request a new one.', 'error');
+    } else if (verified === 'inactive') {
+      // Email was verified but the account is deactivated — skip the login
+      // step entirely and route straight to the contact-admin page.
+      showView('view-inactive');
+      showToast('Email verified. Your account is currently inactive — please contact the admin.', 'info', 8000);
     } else {
       showView('view-login');
     }

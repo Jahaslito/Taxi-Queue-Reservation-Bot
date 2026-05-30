@@ -117,6 +117,18 @@ async function loginDriver(req, res, next) {
       throw err;
     }
 
+    // Refuse to issue a token for an inactive account. The credentials WERE
+    // valid (so 401 would be misleading), but the account is not authorized
+    // to use the app. 403 + accountInactive flag lets the client render a
+    // dedicated "contact admin" screen instead of looping back to login.
+    if (!driver.is_active) {
+      console.log(`[Auth] Login blocked — driver ${driver.id} (#${driver.vehicle_number}) is inactive`);
+      return res.status(403).json({
+        error: 'Your account is inactive. Please contact the admin to reactivate it.',
+        accountInactive: true,
+      });
+    }
+
     const token = generateToken(driver.id, 'driver');
     const { app_password, san_password, ...safeDriver } = driver;
     res.cookie('token', token, { ...COOKIE_OPTS, maxAge: 30 * 24 * 60 * 60 * 1000 });
@@ -153,10 +165,20 @@ async function forgotPassword(req, res, next) {
     const email = req.body.email ? req.body.email.toLowerCase().trim() : '';
     const driver = await Driver.findByEmail(email);
 
-    // Always return the same response to prevent email enumeration
+    // Always return the same response — protects against email enumeration
+    // by attackers and avoids hinting that a deactivated account exists.
     const genericOk = { message: 'If that email is registered, you will receive a reset link shortly.' };
 
     if (!driver) return res.json(genericOk);
+
+    // Skip the reset email for inactive drivers — the reset path can't help
+    // them, and sending a "click to reset" link gives them false hope that
+    // they'll be able to log in afterwards. Admin sees it in logs so they
+    // can reach out if the deactivation was a mistake.
+    if (!driver.is_active) {
+      console.log(`[Auth] forgotPassword: skipped reset email for inactive driver ${driver.id} (#${driver.vehicle_number})`);
+      return res.json(genericOk);
+    }
 
     const resetToken   = makeToken();
     const resetExpires = hoursFromNow(1);
@@ -195,6 +217,16 @@ async function resetDriverPassword(req, res, next) {
       password_reset_expires_at: null,
     });
 
+    // Honest post-reset message: if the account is still inactive (e.g., admin
+    // pre-staged a deactivation and the reset link was generated before),
+    // tell the driver they need to contact the admin instead of luring them
+    // back to a login screen that will only show the inactive page again.
+    if (!driver.is_active) {
+      return res.json({
+        message: 'Password updated. Please contact the admin to reactivate your account before logging in.',
+        accountInactive: true,
+      });
+    }
     res.json({ message: 'Password updated successfully. You can now log in.' });
   } catch (err) {
     next(err);
@@ -216,7 +248,11 @@ async function verifyEmail(req, res) {
     email_verification_expires_at:  null,
   });
 
-  res.redirect(`${APP_URL}/?verified=success`);
+  // Different post-verify state for inactive drivers — the client renders a
+  // "verified, but account is inactive" message instead of the celebratory
+  // success state that implies they can now use the app.
+  const verifiedState = driver.is_active ? 'success' : 'inactive';
+  res.redirect(`${APP_URL}/?verified=${verifiedState}`);
 }
 
 // ─── Resend verification email (requires driver to be logged in) ──────────────

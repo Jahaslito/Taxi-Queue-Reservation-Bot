@@ -389,6 +389,45 @@
   </div>
 </div>
 
+<!-- ══════════════════════════════════════════ INACTIVE ACCOUNT VIEW ════
+   Shown when loginDriver returns 403 / accountInactive=true. Dead-end on
+   purpose — the only way out is to contact admin (we surface admin contact
+   info if configured via window.ADMIN_CONTACT) or back-button to login. -->
+<div class="view" id="view-inactive">
+  <header class="app-header">
+    <div class="logo">
+      <div class="logo-dot"></div>
+      <div class="logo-text">SAN <span>Queue</span></div>
+    </div>
+  </header>
+
+  <div class="hero">
+    <div style="font-size:64px;line-height:1;margin-bottom:16px;">⏸</div>
+    <h1>Account Inactive</h1>
+    <p>
+      Your account has been deactivated. The SAN Queue scheduler will not run
+      for you until an administrator reactivates it.
+    </p>
+  </div>
+
+  <div class="form-section">
+    <div style="background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:14px;padding:18px;text-align:left;">
+      <div style="font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px;">
+        What to do next
+      </div>
+      <div style="font-size:15px;line-height:1.5;">
+        Please contact your SAN Queue administrator to have your account reactivated.
+        Once reactivated, log back in and your schedule will resume automatically.
+      </div>
+      <div id="inactive-contact" style="margin-top:14px;font-size:14px;color:var(--muted);"></div>
+    </div>
+
+    <div class="mt-4">
+      <button class="btn btn-ghost" id="btn-inactive-back">Back to Login</button>
+    </div>
+  </div>
+</div>
+
 <!-- ══════════════════════════════════════════ FORGOT PASSWORD VIEW ════ -->
 <div class="view" id="view-forgot">
   <header class="app-header">

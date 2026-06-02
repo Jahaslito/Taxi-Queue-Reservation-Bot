@@ -346,13 +346,21 @@ describe('POST /api/driver/trigger', () => {
     expect(res.body).toHaveProperty('message');
   });
 
-  test('inactive driver returns 401', async () => {
+  test('inactive driver returns 403 with accountInactive flag', async () => {
+    // Middleware contract (updated 2026-05-30): credentials WERE valid (so
+    // 401 would be misleading), but the account is deactivated. 403 + the
+    // accountInactive flag is what the client uses to route to the
+    // contact-admin screen instead of bouncing back to login.
     await db('drivers').where({ id: driver.id }).update({ is_active: false });
 
     const res = await request(app)
       .post('/api/driver/trigger')
       .set('Cookie', dCookie);
 
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual(expect.objectContaining({
+      accountInactive: true,
+      error: expect.stringMatching(/inactive/i),
+    }));
   });
 });

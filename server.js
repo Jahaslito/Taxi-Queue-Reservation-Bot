@@ -139,7 +139,7 @@ async function bootstrap() {
 }
 
 bootstrap().catch((err) => {
-  console.error('[Fatal] Failed to start server:', err.message);
+  console.error('[Fatal] Failed to start server:', err);
   process.exit(1);
 });
 

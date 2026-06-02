@@ -148,6 +148,40 @@ describe('POST /api/auth/driver/login', () => {
 
     expect(res.status).toBe(401);
   });
+
+  // Inactive-account login (added 2026-05-30): credentials VALID but the
+  // account is deactivated → 403 + accountInactive flag so the client routes
+  // to the contact-admin screen instead of bouncing back to login.
+  test('inactive driver with valid credentials returns 403 + accountInactive', async () => {
+    await db('drivers').where({ id: driver.id }).update({ is_active: false });
+
+    const res = await request(app)
+      .post('/api/auth/driver/login')
+      .send({ email: driver.email, appPassword: driver.plainPassword });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual(expect.objectContaining({
+      accountInactive: true,
+      error: expect.stringMatching(/inactive/i),
+    }));
+    // No token should be issued — they're not allowed in.
+    const cookies = res.headers['set-cookie'] ?? [];
+    expect(cookies.some(c => c.startsWith('token='))).toBe(false);
+  });
+
+  test('inactive driver with wrong password still returns 401 (no info leak)', async () => {
+    // Security property: wrong password should not reveal whether the
+    // account exists or is inactive. Pre-credential-check failure must still
+    // return 401, not 403.
+    await db('drivers').where({ id: driver.id }).update({ is_active: false });
+
+    const res = await request(app)
+      .post('/api/auth/driver/login')
+      .send({ email: driver.email, appPassword: 'wrongpassword' });
+
+    expect(res.status).toBe(401);
+    expect(res.body.accountInactive).toBeUndefined();
+  });
 });
 
 // ─── POST /api/auth/admin/login ───────────────────────────────────────────

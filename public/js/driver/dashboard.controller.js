@@ -246,35 +246,25 @@ function renderLiveLocation(live) {
   return `<div style="display:flex;gap:10px;margin-bottom:12px;">${tile(label, value, color)}</div>`;
 }
 
-// ─── Target vs Actual / Scheduled vs Queued comparison ────────────────────────
-// Position-scheduled drivers see Target vs Actual (with delta).
+// ─── Scheduled vs Queued comparison ───────────────────────────────────────────
 // Time-scheduled drivers see Scheduled time vs the time the bot actually
-// queued them.
+// queued them. Position-scheduled drivers used to see Target vs Actual
+// position here, but the +/- delta was confusing drivers, so that card was
+// removed — position-scheduled drivers now only see live status and live
+// queue position from the rest of the dashboard.
 //
 // `log` may be null when called before the first bot fire of the day —
-// target/scheduled are still rendered (sourced from the driver profile or
-// positionTracking row), and actual/queued show "pending…" until the log
-// row appears.
-function renderScheduleComparison(profile, log, posTracking) {
+// scheduled is still rendered (sourced from the driver profile), and
+// queued shows "pending…" until the log row appears.
+function renderScheduleComparison(profile, log, _posTracking) {
   if (!profile) return '';
 
-  // Position-scheduled: show target column even on no-target days — "Not set
-  // for today" is more informative than hiding the row entirely. Actual stays
-  // 'pending…' until landed.
-  if (profile.day_positions || profile.scheduled_position) {
-    const target    = posTracking?.targetPosition ?? getTodayPosition(profile);
-    const actualNum = Number.isFinite(posTracking?.actualPosition)
-      ? posTracking.actualPosition
-      : (Number.isFinite(log?.queue_position) ? log.queue_position : null);
-    const delta = (actualNum !== null && target !== null) ? actualNum - target : null;
-    return comparisonRow(
-      { label: 'Target', value: target !== null ? `~${target}` : 'Not set today' },
-      { label: 'Actual', value: actualNum !== null ? `#${actualNum}` : 'pending…', delta, deltaSuffix: 'positions' },
-    );
-  }
+  // Position-scheduled drivers: no comparison card — Target/Actual was
+  // intentionally removed because the +/- delta confused drivers.
+  if (profile.day_positions || profile.scheduled_position) return '';
 
-  // Time-scheduled: same treatment — show 'Not set today' when there's no
-  // scheduled time for today rather than hiding the row.
+  // Time-scheduled: show 'Not set today' when there's no scheduled time for
+  // today rather than hiding the row.
   const scheduled = getTodayScheduledTime(profile);
   const queuedAt  = log ? (log.queue_time || formatTime(log.triggered_at)) : null;
   return comparisonRow(

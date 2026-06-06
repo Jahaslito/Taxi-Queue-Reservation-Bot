@@ -296,6 +296,25 @@ async function updateDriver(req, res, next) {
       throw err;
     }
 
+    // Immediately propagate schedule changes to the monitor's in-memory state
+    // so that position-scheduler decisions reflect the new dayPositions without
+    // waiting for the next auto-refresh tick (up to 5 minutes). Mirrors the
+    // same pattern used by markManuallyRemoved.
+    if (isScheduleUpdate) {
+      try {
+        const monitorService = require('../services/monitorService');
+        if (typeof monitorService.syncDriverSchedule === 'function') {
+          monitorService.syncDriverSchedule(req.params.id, {
+            scheduledPosition:     null, // retired — always null
+            dayPositions:          derivedDayPositions,
+            maxAcceptablePosition: updateData.max_acceptable_position,
+          });
+        }
+      } catch (e) {
+        console.warn('[Admin] Could not sync schedule to monitor:', e.message);
+      }
+    }
+
     // If SAN credentials changed, clear any active credential lockout AND the
     // cached Playwright session — both could re-fail with the old password
     // even after the admin saved the new one. Without this the day-scoped

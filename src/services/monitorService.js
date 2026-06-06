@@ -94,6 +94,13 @@ const POS_BOT_EXEC_MS  = parseInt(process.env.MONITOR_POS_BOT_EXEC_MS  ?? '15000
 const EMERGENCY_SURGE_RATE = parseFloat(process.env.MONITOR_EMERGENCY_SURGE_RATE ?? '0.5');
 // Extra seconds added to the forecast horizon as a safety cushion.
 const SAFETY_BUFFER_SECS   = parseInt(process.env.MONITOR_SAFETY_BUFFER_MS ?? '10000', 10) / 1000;
+// Burst window: the SAN morning rush consistently hits between 4:25–4:45 AM PT.
+// During this window the poll is locked at POLL_AT_FIRE_MS (5 s) regardless of
+// secsToFire, preventing the cadence relaxation that caused the Jun 05 blind
+// spot (poll dropped to 30 s right after #20 fired, missing a 67-driver surge).
+// Configurable via env so it can be shifted if SAN changes operating hours.
+const BURST_WINDOW_START_MIN = parseInt(process.env.MONITOR_BURST_START_MIN ?? '25', 10); // minutes past 4 AM
+const BURST_WINDOW_END_MIN   = parseInt(process.env.MONITOR_BURST_END_MIN   ?? '45', 10); // minutes past 4 AM
 // How many recent queue observations to keep for the short-window rate calculation.
 const SHORT_WINDOW_POLLS   = 3;
 
@@ -116,6 +123,18 @@ function isWithinOperatingHours() {
 function isWithinPositionHours() {
   const h = currentHourPT();
   return h >= POS_START_HOUR && h < POS_END_HOUR;
+}
+
+// Returns true during the morning burst window (4:25–4:45 AM PT by default).
+// During this window the scheduler holds the poll at 5 s regardless of how far
+// away the next projected fire is — the burst can add 50–70 drivers in a single
+// 30 s interval, so every second of lax polling is a missed window.
+function isWithinBurstWindow() {
+  const now = new Date();
+  const h   = parseInt(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', hour12: false }), 10);
+  const m   = now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles', minute: 'numeric' });
+  const min = parseInt(m, 10);
+  return h === 4 && min >= BURST_WINDOW_START_MIN && min < BURST_WINDOW_END_MIN;
 }
 
 const QUEUE_URL = process.env.MONITOR_QUEUE_URL
@@ -907,6 +926,7 @@ function evaluatePositionScheduler(state, ctx) {
     botSamplesCount,
     queueShrinkageDetected = false,
     isLockedOut             = () => false,
+    inBurstWindow           = false,
   } = ctx;
 
   // Resolve today's effective position — skip drivers with no target today
@@ -922,7 +942,13 @@ function evaluatePositionScheduler(state, ctx) {
   // Tolerance ceiling — driver-configured or default (target + 20)
   const maxAcceptable = Number.isInteger(state.maxAcceptablePosition)
     ? state.maxAcceptablePosition
-    : effectivePosition + 20;
+    : effectivePosition + 40; // widened from +20: the corrected drift formula keeps
+                               // projections accurate for typical bursts (~1–2/s), but
+                               // extreme spikes (4–5/s) can still temporarily push drift
+                               // past the old +20 ceiling and block drivers with viable
+                               // windows (e.g. Jun 04 #354: proj=138 > max=131, landed
+                               // at +7 when fired). Drivers who want tighter control can
+                               // set maxAcceptablePosition explicitly in their profile.
 
   const baseMetrics = { targetPosition: effectivePosition, maxAcceptablePosition: maxAcceptable };
   const veh         = `#${state.vehicleNumber}`;
@@ -1545,8 +1571,28 @@ async function poll() {
   const inflightBots         = jobQueue.activeCount + jobQueue.pendingCount;
   const burstBatchPosition   = Math.ceil((inflightBots + 1) / Math.max(1, jobQueue.concurrency));
   const effectiveBotExecMs   = botExecMs * burstBatchPosition;
-  const horizonSeconds       = pollAgeSeconds + (effectiveBotExecMs / 1000) + SAFETY_BUFFER_SECS;
-  const estimatedDrift       = Math.max(POS_DRIFT_FLOOR, Math.ceil(effectiveGrowthRate * horizonSeconds));
+
+  // During burst window, drop the SAFETY_BUFFER from the horizon.
+  //
+  // The SAFETY_BUFFER (10 s) was added to protect against slow-growth mornings
+  // where the queue creeps along at 0.5/s — adding 5 extra "buffer" positions
+  // keeps us from landing right at target when variability is high.
+  //
+  // During the burst (rate ≥ 1 driver/s) the buffer has the OPPOSITE effect:
+  //   horizon = pollAge(5s) + botExec(4s) + buffer(10s) = 19 s
+  //   drift   = 2.23/s × 19s = 42  →  projection hugely over-estimated
+  //   result  = driver fires 25-40 positions too early, OR is judged as
+  //             "missed_impossible" when it still has a viable window.
+  //
+  // Without the buffer at burst rate (2.23/s):
+  //   horizon = 5 + 4 = 9 s
+  //   drift   = 2.23 × 9 = 20  →  accurate: queue grows ~20 between decision and join
+  //
+  // The ±10 target cannot be achieved while SAFETY_BUFFER inflates burst drift 3×.
+  const inBurstWindow  = isWithinBurstWindow();
+  const safetyBufferS  = inBurstWindow ? 0 : SAFETY_BUFFER_SECS;
+  const horizonSeconds = pollAgeSeconds + (effectiveBotExecMs / 1000) + safetyBufferS;
+  const estimatedDrift = Math.max(POS_DRIFT_FLOOR, Math.ceil(effectiveGrowthRate * horizonSeconds));
 
   // Context shared by every per-driver decision. Pure data — no module state.
   // isLockedOut is injected so evaluatePositionScheduler stays a pure function
@@ -1562,6 +1608,7 @@ async function poll() {
     botSamplesCount:         botLatencySamples.length,
     queueShrinkageDetected,
     isLockedOut:             credentialLockout.isLockedOut,
+    inBurstWindow,
   };
 
   // Track the soonest fire across all armed drivers — drives adaptive polling.
@@ -1635,14 +1682,20 @@ async function poll() {
     }
   }
 
-  // Set the adaptive interval for the next scheduled poll. When no drivers are
-  // armed (minSecondsUntilFire stays Infinity) this returns POLL_INTERVAL_MS.
-  const newDelayMs = expectedNextPollMs(minSecondsUntilFire);
+  // Set the adaptive interval for the next scheduled poll.
+  // During the burst window (4:25–4:45 AM PT) lock to POLL_AT_FIRE_MS (5 s)
+  // regardless of secsToFire — the growth rate estimate is unreliable right
+  // after a fire (the queue temporarily dips as the newly-added driver appears,
+  // making the rate look slower than it really is). The relaxation to 30 s that
+  // cost us 10 drivers on Jun 05 happened exactly here.
+  const newDelayMs = isWithinBurstWindow()
+    ? POLL_AT_FIRE_MS
+    : expectedNextPollMs(minSecondsUntilFire);
   if (newDelayMs !== currentPollDelayMs) {
-    console.log(
-      `[Monitor] Poll cadence ${currentPollDelayMs/1000}s → ${newDelayMs/1000}s ` +
-      `(nearest fire in ${Number.isFinite(minSecondsUntilFire) ? minSecondsUntilFire.toFixed(0) + 's' : '∞'})`,
-    );
+    const reason = isWithinBurstWindow()
+      ? 'burst window lock'
+      : `nearest fire in ${Number.isFinite(minSecondsUntilFire) ? minSecondsUntilFire.toFixed(0) + 's' : '∞'}`;
+    console.log(`[Monitor] Poll cadence ${currentPollDelayMs/1000}s → ${newDelayMs/1000}s (${reason})`);
     currentPollDelayMs = newDelayMs;
   }
   } else if (currentPollDelayMs !== POLL_INTERVAL_MS) {
@@ -2129,6 +2182,29 @@ function stopMonitor() {
 /** Seconds until next scheduled poll (uses the current adaptive interval). */
 function nextPollIn() { return Math.round(currentPollDelayMs / 1000); }
 
+/**
+ * Immediately sync a driver's schedule fields in the in-memory state so that
+ * position-scheduler decisions reflect the DB change without waiting for the
+ * next AUTO_REFRESH_MS tick (up to 5 minutes).
+ *
+ * Called by driverController.updateProfile and adminController.updateDriver
+ * after a successful schedule update — mirrors the same pattern used by
+ * markManuallyRemoved for immediate state propagation.
+ *
+ * @param {number} driverId
+ * @param {{ scheduledPosition, dayPositions, maxAcceptablePosition }} fields
+ */
+function syncDriverSchedule(driverId, { scheduledPosition, dayPositions, maxAcceptablePosition } = {}) {
+  const state = watches.get(Number(driverId));
+  if (!state) return; // driver not currently watched — no-op
+
+  state.scheduledPosition     = scheduledPosition     ?? null;
+  state.dayPositions          = dayPositions          ?? null;
+  state.maxAcceptablePosition = maxAcceptablePosition ?? null;
+
+  console.log(`[Monitor] Schedule synced for #${state.vehicleNumber} (immediate, no refresh wait)`);
+}
+
 module.exports = {
   startMonitor,
   stopMonitor,
@@ -2136,6 +2212,7 @@ module.exports = {
   removeWatch,
   manualRun,
   markManuallyRemoved,
+  syncDriverSchedule,
   allowRefireToday,
   armPositionWindowForToday,
   // Test-only: returns the live in-memory state object for a driver so tests

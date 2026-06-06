@@ -123,6 +123,26 @@ async function updateProfile(req, res, next) {
       throw err;
     }
 
+    // Immediately propagate schedule changes to the monitor's in-memory state
+    // so that position-scheduler decisions reflect the new dayPositions without
+    // waiting up to 5 minutes for the next auto-refresh tick. Without this,
+    // a driver who disables a day close to the fire window (4:30–4:36 AM PT)
+    // could still be fired using the stale in-memory schedule.
+    if (isScheduleUpdate) {
+      try {
+        const monitorService = require('../services/monitorService');
+        if (typeof monitorService.syncDriverSchedule === 'function') {
+          monitorService.syncDriverSchedule(req.driverId, {
+            scheduledPosition:     null, // retired — always null
+            dayPositions:          derivedDayPositions,
+            maxAcceptablePosition: driver.max_acceptable_position ?? null, // driver cannot change this
+          });
+        }
+      } catch (e) {
+        console.warn('[Driver] Could not sync schedule to monitor:', e.message);
+      }
+    }
+
     // Clear any active credential lockout + stale Playwright session if the
     // driver updated their SAN credentials. See the equivalent block in
     // adminController.updateDriver for the why.

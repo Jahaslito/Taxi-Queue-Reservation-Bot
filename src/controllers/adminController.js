@@ -300,7 +300,7 @@ async function updateDriver(req, res, next) {
     // so that position-scheduler decisions reflect the new dayPositions without
     // waiting for the next auto-refresh tick (up to 5 minutes). Mirrors the
     // same pattern used by markManuallyRemoved.
-    if (isScheduleUpdate) {
+    if (isScheduleUpdate || isActive !== undefined) {
       try {
         const monitorService = require('../services/monitorService');
         if (typeof monitorService.syncDriverSchedule === 'function') {
@@ -308,6 +308,10 @@ async function updateDriver(req, res, next) {
             scheduledPosition:     null, // retired — always null
             dayPositions:          derivedDayPositions,
             maxAcceptablePosition: updateData.max_acceptable_position,
+            // Propagate active-state change immediately so the monitor stops
+            // requeueing the driver the moment the admin flips the toggle,
+            // not after the next 5-minute auto-refresh.
+            isActive: isActive !== undefined ? !!isActive : undefined,
           });
         }
       } catch (e) {
@@ -369,6 +373,18 @@ async function deactivateDriver(req, res, next) {
     await Driver.deactivate(req.params.id);
     // Release position slots so other drivers can claim them immediately
     await PositionClaim.clearForDriver(req.params.id);
+
+    // Immediately mark the driver inactive in the monitor's in-memory state so
+    // auto-requeue stops right now rather than after the next 5-min refresh.
+    try {
+      const monitorService = require('../services/monitorService');
+      if (typeof monitorService.syncDriverSchedule === 'function') {
+        monitorService.syncDriverSchedule(req.params.id, { isActive: false });
+      }
+    } catch (e) {
+      console.warn('[Admin] Could not notify monitor of deactivation:', e.message);
+    }
+
     res.json({ message: 'Driver deactivated' });
   } catch (err) {
     next(err);

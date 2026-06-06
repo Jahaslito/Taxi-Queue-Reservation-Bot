@@ -929,6 +929,13 @@ function evaluatePositionScheduler(state, ctx) {
     inBurstWindow           = false,
   } = ctx;
 
+  // Inactive drivers have no business being scheduled. isActive is synced to the
+  // in-memory state immediately on deactivation and every AUTO_REFRESH_MS — but
+  // during the brief gap before refresh we still want to block the bot from
+  // running. Treat the same as skip_no_target so positionFiredToday is set and
+  // the defer guard releases (preventing an eternal hold on terminal-cleared events).
+  if (state.isActive === false) return { action: 'skip_no_target' };
+
   // Resolve today's effective position — skip drivers with no target today
   let effectivePosition = state.scheduledPosition;
   if (state.dayPositions) {
@@ -1417,6 +1424,19 @@ async function poll() {
         `[Monitor] #${state.vehicleNumber} returned from terminal — outside operating hours ` +
         `(${OP_START_HOUR}:00–${OP_END_HOUR}:00 PT), requeue paused`,
       );
+    } else if (!state.isActive) {
+      // Driver was deactivated mid-session. Don't requeue — they're no longer
+      // participating. isActive is synced immediately on deactivation and again
+      // every AUTO_REFRESH_MS so the window where a stale true value lingers is ≤ 5 min.
+      console.log(
+        `[Monitor] #${state.vehicleNumber} returned from terminal — driver inactive, skipping requeue`,
+      );
+    } else if (hasTodayPositionTarget(state) === false) {
+      // Driver has a per-day position schedule and today is disabled. Returning from
+      // terminal on an off-day should not put them back in queue — the day is off.
+      console.log(
+        `[Monitor] #${state.vehicleNumber} returned from terminal — today disabled in position schedule, skipping requeue`,
+      );
     } else if (
       // Same defer-to-position-scheduler logic as the cleared-terminal block.
       (state.scheduledPosition || state.dayPositions)
@@ -1498,6 +1518,17 @@ async function poll() {
             console.log(
               `[Monitor] #${state.vehicleNumber} cleared terminal — outside operating hours ` +
               `(${OP_START_HOUR}:00–${OP_END_HOUR}:00 PT), requeue paused`,
+            );
+          } else if (!state.isActive) {
+            // Driver deactivated — do not re-add them.
+            console.log(
+              `[Monitor] #${state.vehicleNumber} cleared terminal — driver inactive, skipping requeue`,
+            );
+          } else if (hasTodayPositionTarget(state) === false) {
+            // Per-day schedule: driver has explicitly disabled today. Clearing
+            // terminal on an off-day should not put them back in queue.
+            console.log(
+              `[Monitor] #${state.vehicleNumber} cleared terminal — today disabled in position schedule, skipping requeue`,
             );
           } else if (
             // Defer to position scheduler: if this driver has a position target
@@ -1771,9 +1802,10 @@ async function addWatch(driverId, { isAuto = false, _ctx = null } = {}) {
     lastResult:        null,
     requeueCount:       0,
     requeueCountToday,
+    isActive:                driver.is_active ?? true,   // snapshot; kept current by refreshAutoWatches
     scheduledPosition:       driver.scheduled_position ?? null,
     dayPositions:            driver.day_positions ?? null,
-    maxAcceptablePosition:   driver.max_acceptable_position ?? null, // null → default to target + 20
+    maxAcceptablePosition:   driver.max_acceptable_position ?? null, // null → default to target + 40
     manuallyRemovedAt:       driver.manually_removed_at ?? null,
     positionFiredToday,
     inQueueFromCarryover: false, // set at midnight reset for drivers still in V Holding
@@ -2017,8 +2049,9 @@ async function refreshAutoWatches() {
         );
         added++;
       } else {
-        // Sync position schedule fields so driver profile changes take effect within 5 min
+        // Sync schedule + active fields so profile changes take effect within 5 min
         const existing = watches.get(d.id);
+        existing.isActive              = d.is_active ?? true;
         existing.scheduledPosition     = d.scheduled_position ?? null;
         existing.dayPositions          = d.day_positions ?? null;
         existing.maxAcceptablePosition = d.max_acceptable_position ?? null;
@@ -2194,15 +2227,47 @@ function nextPollIn() { return Math.round(currentPollDelayMs / 1000); }
  * @param {number} driverId
  * @param {{ scheduledPosition, dayPositions, maxAcceptablePosition }} fields
  */
-function syncDriverSchedule(driverId, { scheduledPosition, dayPositions, maxAcceptablePosition } = {}) {
+function syncDriverSchedule(driverId, { scheduledPosition, dayPositions, maxAcceptablePosition, isActive } = {}) {
   const state = watches.get(Number(driverId));
   if (!state) return; // driver not currently watched — no-op
 
   state.scheduledPosition     = scheduledPosition     ?? null;
   state.dayPositions          = dayPositions          ?? null;
   state.maxAcceptablePosition = maxAcceptablePosition ?? null;
+  if (isActive !== undefined) state.isActive = isActive;
 
   console.log(`[Monitor] Schedule synced for #${state.vehicleNumber} (immediate, no refresh wait)`);
+}
+
+/**
+ * Returns true if the driver has an active position target for today.
+ *
+ * Used to gate auto-requeue after terminal clearance: drivers who have
+ * explicitly disabled today in their per-day schedule should not be
+ * re-added to the queue after a dispatch, just as they aren't added in
+ * the morning.
+ *
+ * Returns null (unconstrained) when the driver has no position schedule at
+ * all — time-scheduled drivers are always eligible for auto-requeue.
+ */
+function hasTodayPositionTarget(state) {
+  // No position schedule — driver is time-based; no day restriction applies
+  if (!state.scheduledPosition && !state.dayPositions) return null;
+
+  if (state.dayPositions) {
+    try {
+      const dayKey = { Sun:'0',Mon:'1',Tue:'2',Wed:'3',Thu:'4',Fri:'5',Sat:'6' }[
+        new Date().toLocaleDateString('en-US', { weekday:'short', timeZone:'America/Los_Angeles' })
+      ];
+      const dp = JSON.parse(state.dayPositions);
+      return !!(dp[dayKey] ?? null);
+    } catch {
+      return false; // malformed JSON → treat as disabled to be safe
+    }
+  }
+
+  // Legacy single scheduledPosition — no per-day restriction
+  return !!state.scheduledPosition;
 }
 
 module.exports = {

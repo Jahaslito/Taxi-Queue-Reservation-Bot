@@ -94,13 +94,28 @@ const POS_BOT_EXEC_MS  = parseInt(process.env.MONITOR_POS_BOT_EXEC_MS  ?? '15000
 const EMERGENCY_SURGE_RATE = parseFloat(process.env.MONITOR_EMERGENCY_SURGE_RATE ?? '0.5');
 // Extra seconds added to the forecast horizon as a safety cushion.
 const SAFETY_BUFFER_SECS   = parseInt(process.env.MONITOR_SAFETY_BUFFER_MS ?? '10000', 10) / 1000;
-// Burst window: the SAN morning rush consistently hits between 4:25–4:45 AM PT.
-// During this window the poll is locked at POLL_AT_FIRE_MS (5 s) regardless of
-// secsToFire, preventing the cadence relaxation that caused the Jun 05 blind
-// spot (poll dropped to 30 s right after #20 fired, missing a 67-driver surge).
-// Configurable via env so it can be shifted if SAN changes operating hours.
-const BURST_WINDOW_START_MIN = parseInt(process.env.MONITOR_BURST_START_MIN ?? '25', 10); // minutes past 4 AM
-const BURST_WINDOW_END_MIN   = parseInt(process.env.MONITOR_BURST_END_MIN   ?? '45', 10); // minutes past 4 AM
+// Burst window: SAN's morning rush can arrive anywhere between 4:00 and 5:30 AM PT
+// and the exact minute shifts daily. We lock the poll to POLL_BURST_MS (1 s) for
+// the full 4:00–5:30 AM window so no burst timing catches us at the slow cadence.
+//
+// Why 1 s instead of 5 s:
+//   The queue can jump 50+ positions in a single 5 s tick (observed Jun 04–06).
+//   A driver whose target window is only 40 positions wide (e.g. target 140,
+//   max 180) can be completely skipped in that one tick. At 1 s, the same burst
+//   is spread across 5 ticks — the window is visible for ~8–10 ticks instead of
+//   1–2, giving the bot a chance to fire before the queue overshoots.
+//
+// Configurable via env so the window can be shifted if SAN changes hours.
+const BURST_WINDOW_END_MIN   = parseInt(process.env.MONITOR_BURST_END_MIN   ?? '30', 10); // minutes past 5 AM
+const POLL_BURST_MS          = parseInt(process.env.MONITOR_BURST_POLL_MS   ?? '1000', 10);
+// During burst the measured growth rate can spike to 10–15/s for a single tick
+// (e.g. 75 drivers join in 5 s). If we use that raw rate for drift estimation,
+// drift = 15 × 15 s = 225 positions — instantly marking every driver with
+// max < queue+225 as missed_impossible on the very first burst tick.
+// Cap the growth rate used ONLY for drift math during the burst window.
+// The uncapped rate still drives the fire-timing decision (secsToFire).
+// 3.0/s ≈ the observed sustained plateau rate; tune via env if needed.
+const BURST_DRIFT_RATE_CAP   = parseFloat(process.env.MONITOR_BURST_DRIFT_RATE_CAP ?? '3.0');
 // How many recent queue observations to keep for the short-window rate calculation.
 const SHORT_WINDOW_POLLS   = 3;
 
@@ -125,16 +140,23 @@ function isWithinPositionHours() {
   return h >= POS_START_HOUR && h < POS_END_HOUR;
 }
 
-// Returns true during the morning burst window (4:25–4:45 AM PT by default).
-// During this window the scheduler holds the poll at 5 s regardless of how far
-// away the next projected fire is — the burst can add 50–70 drivers in a single
-// 30 s interval, so every second of lax polling is a missed window.
+// Returns true during the extended burst window: 4:00 AM–5:30 AM PT (default).
+// The SAN rush can arrive at any point in this 90-minute window, so we hold
+// the poll at POLL_BURST_MS (1 s) for the entire span rather than trying to
+// predict the exact minute. BURST_WINDOW_END_MIN controls how many minutes
+// past 5 AM the window runs (default 30 → 5:30 AM).
 function isWithinBurstWindow() {
-  const now = new Date();
-  const h   = parseInt(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', hour12: false }), 10);
-  const m   = now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles', minute: 'numeric' });
-  const min = parseInt(m, 10);
-  return h === 4 && min >= BURST_WINDOW_START_MIN && min < BURST_WINDOW_END_MIN;
+  const now   = new Date();
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    hour:     '2-digit',
+    minute:   '2-digit',
+    hour12:   false,
+  }).formatToParts(now);
+  const h = parseInt(parts.find(p => p.type === 'hour').value,   10);
+  const m = parseInt(parts.find(p => p.type === 'minute').value, 10);
+  // Full hour 4 (4:00–4:59) plus first BURST_WINDOW_END_MIN minutes of hour 5.
+  return h === 4 || (h === 5 && m < BURST_WINDOW_END_MIN);
 }
 
 const QUEUE_URL = process.env.MONITOR_QUEUE_URL
@@ -593,6 +615,7 @@ function recordPositionDecision(state, decision, reason, metrics = {}) {
     estimatedDrift:        metrics.estimatedDrift,
     predictedLanding:      metrics.predictedLanding,
     firedAt:               metrics.firedAt,
+    earlyJoinPosition:     metrics.earlyJoinPosition ?? null,
   }).catch((err) => console.error(
     `[PosTracking] upsert failed for #${state.vehicleNumber}: ${err.message}`,
   ));
@@ -637,6 +660,8 @@ function snap(state) {
     terminalCheckCount: state.terminalCheckCount,
     terminalName:       state.terminalName,
     terminalPosition:   state.terminalPosition,
+    earlyJoinDetectedAt: state.earlyJoinDetectedAt, // time of first early-join detection
+    earlyJoinAtPosition: state.earlyJoinAtPosition, // queue pos where driver joined early
   };
 }
 
@@ -1157,6 +1182,8 @@ async function poll() {
       s.terminalPosition   = null;
       s.atTerminalSince    = null;
       s.manuallyRemovedAt  = null;  // new day → driver can be auto-managed again
+      s.earlyJoinDetectedAt = null;
+      s.earlyJoinAtPosition = null;
     }
     console.log('[Monitor] Daily reset — counters and visibility state cleared');
     broadcast('daily_reset', { date: currentDayPT });
@@ -1623,7 +1650,23 @@ async function poll() {
   const inBurstWindow  = isWithinBurstWindow();
   const safetyBufferS  = inBurstWindow ? 0 : SAFETY_BUFFER_SECS;
   const horizonSeconds = pollAgeSeconds + (effectiveBotExecMs / 1000) + safetyBufferS;
-  const estimatedDrift = Math.max(POS_DRIFT_FLOOR, Math.ceil(effectiveGrowthRate * horizonSeconds));
+
+  // During burst, a single-tick spike (e.g. 75 drivers join in 1–5 s) pushes
+  // the measured growth rate to 15–75/s. Raw: drift = 75 × 15 s = 1 125 →
+  // every driver instantly gets missed_impossible before any bot can fire.
+  //
+  // Cap the rate used FOR DRIFT MATH ONLY to BURST_DRIFT_RATE_CAP (3.0/s).
+  // The uncapped effectiveGrowthRate still drives secsToFire (fire timing) so
+  // the bot still fires at the right moment — we just don't let the drift
+  // estimate explode and falsely rule out drivers that still have valid windows.
+  //
+  // 3.0/s ≈ sustained burst plateau observed across Jun 03–06 data.
+  // After a spike tick the smoothed rate returns to 1–2/s within a few ticks,
+  // so this cap only bites on the one or two ticks immediately after the jump.
+  const driftRate      = inBurstWindow
+    ? Math.min(effectiveGrowthRate, BURST_DRIFT_RATE_CAP)
+    : effectiveGrowthRate;
+  const estimatedDrift = Math.max(POS_DRIFT_FLOOR, Math.ceil(driftRate * horizonSeconds));
 
   // Context shared by every per-driver decision. Pure data — no module state.
   // isLockedOut is injected so evaluatePositionScheduler stays a pure function
@@ -1682,14 +1725,59 @@ async function poll() {
         recordPositionDecision(state, decision.action, decision.reason, decision.metrics);
         break;
 
-      case 'skip_already_seen':
+      case 'skip_already_seen': {
+        // Driver is already visible in V Holding. Check whether they joined
+        // significantly early (manual join before the burst window).
+        const livePos = state.currentPosition;
+        const target  = decision.metrics?.targetPosition ?? null;
+        // "Early join" = driver is in queue more than 30 positions ahead of
+        // their target. Threshold of 30 lets normal ±20 bias variance pass
+        // while catching the real problem: joining at pos 2 when target is 121.
+        const isEarlyJoin = (
+          target  != null &&
+          livePos != null &&
+          livePos < (target - 30)
+        );
+
         console.log(decision.logLine);
-        recordPositionDecision(state, decision.action, decision.reason, decision.metrics);
-        // Driver is already in queue today — position scheduler's job is done.
-        // Mark positionFiredToday=true so the monitor's defer condition releases
-        // and it can requeue normally after dispatches throughout the day.
-        state.positionFiredToday = true;
+        recordPositionDecision(state, decision.action, decision.reason, {
+          ...decision.metrics,
+          earlyJoinPosition: isEarlyJoin ? livePos : null,
+        });
+
+        if (isEarlyJoin) {
+          // Record first detection timestamp + position (once per early-join episode)
+          if (!state.earlyJoinDetectedAt) {
+            state.earlyJoinDetectedAt = new Date();
+            state.earlyJoinAtPosition = livePos;
+          }
+
+          // AUTO-REARM: treat the driver exactly like an overnight carryover.
+          // Setting inQueueFromCarryover=true + hasBeenSeen=false tells the
+          // existing carryover machinery to:
+          //   1. Hold the position scheduler (→ wait, awaiting_overnight_purge)
+          //      while the driver is still in V Holding at the wrong position.
+          //   2. Arm them for a fresh fire the moment they leave V Holding —
+          //      the carryover flag clears and state→watching/hasBeenSeen=false,
+          //      so the burst-window scheduler evaluates them normally and fires
+          //      the bot at the correct queue depth.
+          // Only set if carryover isn't already active from a previous cycle.
+          if (!state.inQueueFromCarryover) {
+            state.inQueueFromCarryover = true;
+            state.hasBeenSeen          = false;
+            console.warn(
+              `[Pos] ⚠️  #${state.vehicleNumber} early-join auto-rearm ` +
+              `(pos ${livePos}, target ${target}). ` +
+              `Tagged as carryover — will fire once driver leaves queue.`,
+            );
+          }
+          // positionFiredToday stays false — scheduler remains live
+        } else {
+          // Driver is in queue at or near their target. Day's work is done.
+          state.positionFiredToday = true;
+        }
         break;
+      }
 
       case 'fire':
         console.log(decision.logLine);
@@ -1714,13 +1802,16 @@ async function poll() {
   }
 
   // Set the adaptive interval for the next scheduled poll.
-  // During the burst window (4:25–4:45 AM PT) lock to POLL_AT_FIRE_MS (5 s)
+  // During the burst window (4:00–5:30 AM PT) lock to POLL_BURST_MS (1 s)
   // regardless of secsToFire — the growth rate estimate is unreliable right
   // after a fire (the queue temporarily dips as the newly-added driver appears,
   // making the rate look slower than it really is). The relaxation to 30 s that
   // cost us 10 drivers on Jun 05 happened exactly here.
+  // 1 s vs 5 s: at 5 s the queue can jump 50 positions in one tick, skipping a
+  // 40-position target window entirely. At 1 s the same jump is 5 ticks of ~10
+  // positions, giving multiple chances to fire before the window closes.
   const newDelayMs = isWithinBurstWindow()
-    ? POLL_AT_FIRE_MS
+    ? POLL_BURST_MS
     : expectedNextPollMs(minSecondsUntilFire);
   if (newDelayMs !== currentPollDelayMs) {
     const reason = isWithinBurstWindow()
@@ -1816,6 +1907,8 @@ async function addWatch(driverId, { isAuto = false, _ctx = null } = {}) {
     terminalCheckCount: 0,
     terminalName:       null,
     terminalPosition:   null,
+    earlyJoinDetectedAt: null, // first time we detected driver in queue far ahead of target
+    earlyJoinAtPosition: null, // their queue position at that first detection
     _lastBroadcastPos:  null,  // internal: avoids redundant SSE on same position
     _lastQueueSize:     null,  // internal: queue size at last poll (for logging)
   };
@@ -1931,6 +2024,8 @@ function armPositionWindowForToday(dayKey = todayPT) {
     s.terminalName         = null;
     s.terminalPosition     = null;
     s.atTerminalSince      = null;
+    s.earlyJoinDetectedAt  = null;
+    s.earlyJoinAtPosition  = null;
 
     // Don't yank state out from under an in-flight bot.
     if (s.state !== 'requeuing') {
@@ -1984,6 +2079,8 @@ function allowRefireToday(driverId) {
   state.terminalName         = null;
   state.terminalPosition     = null;
   state.atTerminalSince      = null;
+  state.earlyJoinDetectedAt  = null;
+  state.earlyJoinAtPosition  = null;
 
   // Don't yank state out from under an in-flight bot.
   if (state.state !== 'requeuing') {
@@ -2188,7 +2285,8 @@ async function startMonitor() {
 
   console.log(
     `[Monitor] Started — poll cadence ${POLL_INTERVAL_MS / 1000}s idle / ` +
-    `${POLL_NEAR_FIRE_MS / 1000}s near fire / ${POLL_AT_FIRE_MS / 1000}s at fire, ` +
+    `${POLL_NEAR_FIRE_MS / 1000}s near fire / ${POLL_AT_FIRE_MS / 1000}s at fire / ` +
+    `${POLL_BURST_MS / 1000}s burst (4:00–5:${String(BURST_WINDOW_END_MIN).padStart(2, '0')} AM PT), ` +
     `auto-refresh every ${AUTO_REFRESH_MS / 1000}s, ` +
     `bot concurrency: ${BOT_CONCURRENCY}, ` +
     `watching ${watches.size} driver(s)`,
@@ -2270,6 +2368,107 @@ function hasTodayPositionTarget(state) {
   return !!state.scheduledPosition;
 }
 
+/**
+ * Returns a diagnostic snapshot for every position-scheduled driver currently
+ * being watched. Used by the admin "Early Join Alerts" page.
+ *
+ * Includes:
+ *   - Live queue state and position
+ *   - Whether an early-join was detected (manual queue join before burst window)
+ *   - Whether the position scheduler is still armed or has been blocked
+ *
+ * Sorted: critical (blocked) first, then warnings (armed but early-join), then
+ * normal (waiting / fired / off day).
+ */
+function getPositionDiagnostics() {
+  const DAY_KEY_MAP = { Sun: '0', Mon: '1', Tue: '2', Wed: '3', Thu: '4', Fri: '5', Sat: '6' };
+  const todayDayStr = new Date().toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/Los_Angeles' });
+  const todayKey    = DAY_KEY_MAP[todayDayStr];
+
+  const rows = [];
+
+  for (const [driverId, state] of watches.entries()) {
+    // Only position-scheduled drivers
+    if (!state.scheduledPosition && !state.dayPositions) continue;
+
+    let todayTarget = null;
+    if (state.dayPositions) {
+      try {
+        const dp = JSON.parse(state.dayPositions);
+        todayTarget = dp[todayKey] ?? null;
+      } catch { todayTarget = null; }
+    } else {
+      todayTarget = state.scheduledPosition;
+    }
+
+    const maxAcceptable = Number.isInteger(state.maxAcceptablePosition)
+      ? state.maxAcceptablePosition
+      : (todayTarget != null ? todayTarget + 40 : null);
+
+    // Determine scheduler status for display
+    let schedulerStatus;
+    const earlyJoin = !!state.earlyJoinDetectedAt;
+
+    if (earlyJoin && state.inQueueFromCarryover && !state.positionFiredToday) {
+      // Auto-rearm applied: holding as carryover, will fire once driver leaves queue
+      schedulerStatus = 'rearmed_waiting';
+    } else if (earlyJoin && !state.positionFiredToday) {
+      // Early join detected, carryover already cleared, scheduler evaluating normally
+      schedulerStatus = 'armed_early_join';
+    } else if (earlyJoin && state.positionFiredToday) {
+      // Joined early AND eventually positionFiredToday got set (e.g. returned to
+      // queue past max). Scheduler done for the day.
+      schedulerStatus = 'blocked';
+    } else if (state.positionFiredToday) {
+      schedulerStatus = 'fired'; // bot ran (or day skipped) — normal completion
+    } else if (state.inQueueFromCarryover) {
+      schedulerStatus = 'awaiting_carryover';
+    } else if (todayTarget === null) {
+      schedulerStatus = 'off_day';
+    } else {
+      schedulerStatus = 'waiting'; // armed, hasn't fired yet
+    }
+
+    // Warning level: drives sort order and badge colour
+    let warningLevel = 'none';
+    if (earlyJoin && state.positionFiredToday) warningLevel = 'critical'; // blocked, nothing to do
+    else if (earlyJoin)                         warningLevel = 'warning';  // rearmed/recovering
+
+    const gap = (todayTarget != null && state.earlyJoinAtPosition != null)
+      ? todayTarget - state.earlyJoinAtPosition
+      : null;
+
+    rows.push({
+      driverId,
+      vehicleNumber:        state.vehicleNumber,
+      driverName:           state.driverName,
+      currentState:         state.state,
+      currentPosition:      state.currentPosition,
+      todayTarget,
+      maxAcceptable,
+      positionFiredToday:   state.positionFiredToday,
+      inQueueFromCarryover: state.inQueueFromCarryover,
+      hasBeenSeen:          state.hasBeenSeen,
+      schedulerStatus,
+      warningLevel,
+      earlyJoinDetectedAt:  state.earlyJoinDetectedAt,
+      earlyJoinAtPosition:  state.earlyJoinAtPosition,
+      earlyJoinGap:         gap,
+      lastPosDecision:      state.lastPosDecision,
+    });
+  }
+
+  // Sort: critical first, then warning, then everything else alphabetically
+  const priority = { critical: 0, warning: 1, none: 2 };
+  rows.sort((a, b) => {
+    const pd = (priority[a.warningLevel] ?? 2) - (priority[b.warningLevel] ?? 2);
+    if (pd !== 0) return pd;
+    return a.vehicleNumber.localeCompare(b.vehicleNumber);
+  });
+
+  return rows;
+}
+
 module.exports = {
   startMonitor,
   stopMonitor,
@@ -2284,6 +2483,7 @@ module.exports = {
   // can mutate flags directly. Do NOT use from production code paths —
   // mutating state outside snap() / broadcast() breaks SSE updates.
   _getInternalState: (driverId) => watches.get(driverId),
+  getPositionDiagnostics,
   watchAllActive,
   refreshAutoWatches,
   getState,

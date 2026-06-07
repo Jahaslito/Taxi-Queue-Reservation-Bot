@@ -51,6 +51,7 @@ class PositionTracking {
     predictedLanding  = null,
     firedAt           = null,
     botDurationMs     = null,
+    earlyJoinPosition = null,
   }) {
     const data = {
       driver_id:               driverId,
@@ -66,6 +67,7 @@ class PositionTracking {
       predicted_landing:       predictedLanding,
       fired_at:                firedAt,
       bot_duration_ms:         botDurationMs,
+      early_join_position:     earlyJoinPosition,
     };
 
     // Strip null/undefined values from the MERGE so we don't overwrite existing
@@ -129,6 +131,7 @@ class PositionTracking {
         'pt.predicted_landing', 'pt.actual_position',
         'pt.decision', 'pt.decision_reason',
         'pt.tracking_date', 'pt.fired_at', 'pt.landed_at', 'pt.bot_duration_ms',
+        'pt.early_join_position',
         'd.name as driver_name',
       )
       .join('drivers as d', 'd.id', 'pt.driver_id')
@@ -136,6 +139,41 @@ class PositionTracking {
       .orderBy('pt.fired_at',     'desc')
       .limit(limit)
       .offset(offset);
+  }
+
+  /**
+   * Recent skip_already_seen events — the historical early-join log.
+   * Shows all drivers who were detected in V Holding before the position
+   * scheduler could fire, ordered by most recent first.
+   *
+   * @param {number} days - how many days back to look (default 14)
+   */
+  static recentEarlyJoins({ days = 14, limit = 100 } = {}) {
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+    const sinceDate = since.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+
+    return db('position_tracking as pt')
+      .select(
+        'pt.id',
+        'pt.driver_id',
+        'pt.vehicle_number',
+        'pt.target_position',
+        'pt.max_acceptable_position',
+        'pt.queue_size_at_fire',
+        'pt.early_join_position',
+        'pt.decision',
+        'pt.decision_reason',
+        'pt.tracking_date',
+        'pt.fired_at',
+        'd.name as driver_name',
+      )
+      .join('drivers as d', 'd.id', 'pt.driver_id')
+      .where('pt.decision', 'skip_already_seen')
+      .where('pt.tracking_date', '>=', sinceDate)
+      .orderBy('pt.tracking_date', 'desc')
+      .orderBy('d.name', 'asc')
+      .limit(limit);
   }
 
   static recentCount() {

@@ -466,6 +466,10 @@
     <button class="nav-link" data-page="page-pos-tracking">
       <span class="icon">🎯</span><span>Position Accuracy</span>
     </button>
+    <button class="nav-link" data-page="page-pos-diagnostics" id="nav-pos-diagnostics">
+      <span class="icon">⚠️</span><span>Early Join Alerts</span>
+      <span id="early-join-badge" style="display:none;margin-left:auto;min-width:18px;height:18px;border-radius:9px;background:var(--red);color:#fff;font-size:10px;font-weight:700;display:none;align-items:center;justify-content:center;padding:0 4px;"></span>
+    </button>
   </div>
 
   <div class="sidebar-footer">
@@ -831,6 +835,100 @@
   </div>
 
 
+  <!-- ══════════════════════════ EARLY JOIN ALERTS PAGE ══════════════════════════ -->
+  <div class="page" id="page-pos-diagnostics">
+    <div class="page-header" style="display:flex;align-items:flex-start;justify-content:space-between;">
+      <div>
+        <h1>Early Join Alerts</h1>
+        <p>Drivers who joined the V Holding queue before the position scheduler could place them</p>
+      </div>
+      <button class="btn btn-ghost btn-sm" id="btn-refresh-diagnostics" style="margin-top:4px;">↺ Refresh</button>
+    </div>
+
+    <!-- Summary stats -->
+    <div class="stats-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:24px;" id="diag-stats-grid">
+      <div class="stat-card teal" data-icon="📍">
+        <div class="stat-label">Position Scheduled</div>
+        <div class="stat-value" id="diag-stat-total">—</div>
+        <div class="stat-sub">active today</div>
+      </div>
+      <div class="stat-card amber" data-icon="🔄">
+        <div class="stat-label">Auto Re-armed</div>
+        <div class="stat-value" id="diag-stat-armed">—</div>
+        <div class="stat-sub">recovering from early join</div>
+      </div>
+      <div class="stat-card red" data-icon="🚫">
+        <div class="stat-label">Blocked</div>
+        <div class="stat-value" id="diag-stat-blocked">—</div>
+        <div class="stat-sub">returned past max, needs Force Re-arm</div>
+      </div>
+      <div class="stat-card green" data-icon="✅">
+        <div class="stat-label">On Track</div>
+        <div class="stat-value" id="diag-stat-ok">—</div>
+        <div class="stat-sub">waiting or fired normally</div>
+      </div>
+    </div>
+
+    <!-- Live diagnostics table -->
+    <div class="table-wrap" style="margin-bottom:24px;">
+      <div class="table-header">
+        <div>
+          <h3>Live — Today's Position-Scheduled Drivers</h3>
+          <div style="font-size:12px;color:var(--muted2);margin-top:2px;">Refreshes every 30 s · Red = scheduler blocked · Amber = joined early but still armed · Green = all good</div>
+        </div>
+        <span id="diag-last-refresh" style="font-size:11px;color:var(--muted);"></span>
+      </div>
+      <div style="overflow-x:auto;">
+        <table style="min-width:900px;">
+          <thead><tr>
+            <th>Vehicle</th>
+            <th>Driver</th>
+            <th>Target</th>
+            <th>Max</th>
+            <th>State</th>
+            <th>Live Pos</th>
+            <th>Early Join At</th>
+            <th>Joined @ Pos</th>
+            <th>Gap</th>
+            <th>Scheduler</th>
+            <th style="text-align:center;">Action</th>
+          </tr></thead>
+          <tbody id="diag-live-tbody">
+            <tr><td colspan="11" style="text-align:center;color:var(--muted2);padding:32px;">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Historical early-join log -->
+    <div class="table-wrap">
+      <div class="table-header">
+        <div>
+          <h3>History — skip_already_seen Events (last 14 days)</h3>
+          <div style="font-size:12px;color:var(--muted2);margin-top:2px;">Every time a position-scheduled driver was found in queue before the bot fired. Early join position = where they were when detected.</div>
+        </div>
+      </div>
+      <div style="overflow-x:auto;">
+        <table style="min-width:720px;">
+          <thead><tr>
+            <th>Date</th>
+            <th>Driver</th>
+            <th>Vehicle</th>
+            <th>Target</th>
+            <th>Max</th>
+            <th>Queue Size</th>
+            <th>Early Join Pos</th>
+            <th>Gap</th>
+            <th>Reason</th>
+          </tr></thead>
+          <tbody id="diag-history-tbody">
+            <tr><td colspan="9" style="text-align:center;color:var(--muted2);padding:32px;">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
   <!-- ── Position Accuracy page ────────────────────────────────────────────── -->
   <div class="page" id="page-pos-tracking">
     <div class="page-header">
@@ -1151,6 +1249,7 @@
 <script src="/js/admin/watchlist.controller.js"></script>
 <script src="/js/admin/monitor.controller.js"></script>
 <script src="/js/admin/posTracking.controller.js"></script>
+<script src="/js/admin/posDiagnostics.controller.js"></script>
 <script src="/js/admin/auth.controller.js"></script>
 <script src="/js/admin/app.js"></script>
 <script>

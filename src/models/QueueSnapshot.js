@@ -55,7 +55,7 @@ class QueueSnapshot {
       short_window_rate:      shortWindowRate      != null ? roundTo3(shortWindowRate)      : null,
       smoothed_growth_rate:   smoothedGrowthRate   != null ? roundTo3(smoothedGrowthRate)   : null,
       effective_growth_rate:  effectiveGrowthRate  != null ? roundTo3(effectiveGrowthRate)  : null,
-      bot_p95_ms:             botP95Ms,
+      bot_p95_ms:             botP95Ms != null ? Math.round(botP95Ms) : null,
       bot_latency_samples:    botLatencySamples,
       bias_correction:        biasCorrection       != null ? Math.round(biasCorrection * 100) / 100 : null,
       poll_interval_ms:       pollIntervalMs,

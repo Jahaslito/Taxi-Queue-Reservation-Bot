@@ -516,6 +516,71 @@ async function getDailyReport(req, res, next) {
   }
 }
 
+/**
+ * GET /api/admin/position-diagnostics
+ *
+ * Returns two sections for the Early Join Alerts admin page:
+ *
+ *   live    — current in-memory state for every position-scheduled driver:
+ *             their target, scheduler status, and any early-join detection.
+ *
+ *   history — DB records of skip_already_seen events from the last 14 days,
+ *             showing which drivers historically joined the queue before the
+ *             position bot could fire.
+ */
+async function getPositionDiagnostics(req, res, next) {
+  try {
+    const monitorService = require('../services/monitorService');
+    const live = typeof monitorService.getPositionDiagnostics === 'function'
+      ? monitorService.getPositionDiagnostics()
+      : [];
+
+    const history = await PositionTracking.recentEarlyJoins({ days: 14 });
+
+    res.json({ live, history });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /api/admin/drivers/:id/rearm-position
+ *
+ * Re-arms the position scheduler for a single driver today — clears
+ * positionFiredToday, earlyJoinDetectedAt/Position, and inQueueFromCarryover
+ * so the scheduler will try again at the right burst-window moment.
+ *
+ * This is the single-driver equivalent of the 3 AM auto-arm. Safe to call at
+ * any time; if the driver is already in queue the carryover guard prevents an
+ * immediate double-fire.
+ */
+async function rearmPositionScheduler(req, res, next) {
+  try {
+    const monitorService = require('../services/monitorService');
+    const driverId = parseInt(req.params.id, 10);
+
+    if (typeof monitorService.allowRefireToday !== 'function') {
+      return res.status(503).json({ error: 'Monitor service not running' });
+    }
+
+    const ok = monitorService.allowRefireToday(driverId);
+    if (!ok) {
+      return res.status(404).json({ error: 'Driver not found in active monitor' });
+    }
+
+    // Also clear the early-join fields via the internal state reference
+    const state = monitorService._getInternalState?.(driverId);
+    if (state) {
+      state.earlyJoinDetectedAt = null;
+      state.earlyJoinAtPosition = null;
+    }
+
+    res.json({ ok: true, message: `Position scheduler re-armed for driver ${driverId}` });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // ─── Send password reset link to a driver ────────────────────────────────────
 async function sendDriverPasswordReset(req, res, next) {
   try {
@@ -553,5 +618,7 @@ module.exports = {
   getLogs,
   getPositionTracking,
   getDailyReport,
+  getPositionDiagnostics,
+  rearmPositionScheduler,
   sendDriverPasswordReset,
 };

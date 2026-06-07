@@ -123,6 +123,18 @@ router.get(
   adminController.getDailyReport,
 );
 
+// Early-join diagnostics — live state + 14-day history of skip_already_seen
+router.get('/position-diagnostics', adminController.getPositionDiagnostics);
+
+// Re-arm the position scheduler for a single driver (clears positionFiredToday +
+// early-join fields). Equivalent to the 3 AM auto-arm for one driver.
+router.post(
+  '/drivers/:id/rearm-position',
+  [idParam],
+  validate,
+  adminController.rearmPositionScheduler,
+);
+
 router.get(
   '/logs',
   [

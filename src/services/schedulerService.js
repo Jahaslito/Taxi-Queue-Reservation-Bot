@@ -51,11 +51,16 @@ const botSemaphore = new BotSemaphore(MAX_CONCURRENT);
 /**
  * Returns false for permanent failures that are not worth retrying
  * (wrong credentials, vehicle not found). Everything else is transient.
+ *
+ * Delegates the credential check to credentialLockoutService so the two
+ * stay in sync — prior to 2026-06-07 they had divergent pattern lists,
+ * which let "SAN: Invalid username or password" (page-scrape fallback)
+ * slip past this gate and trigger 3 wasteful retries per failing driver.
  */
 function isTransientError(result) {
   if (result.dispatched) return false;
   const msg = (result.error || result.message || '').toLowerCase();
-  if (msg.includes('invalid san') || msg.includes('check credentials') || msg.includes('login failed')) return false;
+  if (credentialLockout.isCredentialError(msg)) return false;
   if (msg.includes('not found')) return false;
   return true;
 }

@@ -84,10 +84,18 @@ const POS_LEAD_BUFFER  = parseInt(process.env.MONITOR_POS_LEAD_BUFFER  ?? '5', 1
 const POS_DRIFT_FLOOR  = parseInt(process.env.MONITOR_POS_DRIFT_FLOOR  ?? '5',  10);
 // Fallback estimate for Playwright bot execution time (ms) before we have real
 // data. Used to project how many positions will be added between the fire decision
-// and when SAN assigns the queue slot. The actual estimate is the rolling P95 of
-// the last MAX_LATENCY_SAMPLES bot runs (see botExecutionEstimateMs below) — this
-// constant is only the cold-start default until we collect enough samples.
-const POS_BOT_EXEC_MS  = parseInt(process.env.MONITOR_POS_BOT_EXEC_MS  ?? '15000', 10);
+// and when SAN assigns the queue slot. The actual estimate is the rolling median
+// of the last MAX_LATENCY_SAMPLES bot runs (see botExecutionEstimateMs below) —
+// this constant is only the cold-start default until we collect enough samples.
+//
+// 2026-06-07: lowered from 15000 → 7000 after #4377 over-shot target by 36
+// positions on a cold-morning fire (botEst fallback × BURST_DRIFT_RATE_CAP = 45
+// drift, actual queue grew by 4). Every real bot run observed across June so
+// far clusters around 5-9 s; 15 s was a worst-case-with-OIDC-handshake value
+// that hasn't matched reality since the session warmer rolled out. 7 s sits
+// just above the observed median so we err slightly conservative without
+// inflating cold-start drift to 3× reality.
+const POS_BOT_EXEC_MS  = parseInt(process.env.MONITOR_POS_BOT_EXEC_MS  ?? '7000', 10);
 // Minimum assumed queue growth rate (drivers/second) used as a floor before historical
 // data exists and during calm periods. Protects against cold-start on a busy morning.
 // Tune down if drivers land too early; tune up if they still land too late.
@@ -169,6 +177,13 @@ const T2_URL = process.env.MONITOR_T2_URL
 // After this many terminal polls with no sighting, requeue anyway.
 // Guards against fast dispatches the poll may have missed entirely.
 const MAX_TERMINAL_CHECKS = parseInt(process.env.MONITOR_MAX_TERMINAL_CHECKS ?? '5', 10);
+
+// Hard cap on consecutive "already in queue" bot results before we stop
+// auto-requeuing a driver for the rest of the day. Protects against the
+// case where the bot keeps confirming the driver IS in queue but our V Holding
+// parse can't see them — guarantees we don't burn 200+ SAN logins like #142 on
+// 2026-06-07. Any *real* add (success && !alreadyQueued) resets the counter.
+const MAX_CONSECUTIVE_ALREADY_QUEUED = parseInt(process.env.MONITOR_MAX_CONSECUTIVE_ALREADY_QUEUED ?? '3', 10);
 
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) ' +
            'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
@@ -516,7 +531,13 @@ emitter.setMaxListeners(500); // support many concurrent admin browser tabs
 
 // ─── HTML parser (zero dependencies) ─────────────────────────────────────────
 /** Normalise a vehicle ID: strip whitespace, uppercase. */
-const norm = (id) => String(id ?? '').replace(/\s+/g, '').toUpperCase();
+// Strip leading zeros so SAN's padded canonical form ("0142") and our possibly
+// unpadded DB value ("142") hash to the same key. Without this the V Holding
+// parser and state.vehicleNorm can disagree, leaving a driver permanently
+// invisible to polling — observed 2026-06-07 with #142, which triggered a
+// 22-minute requeue loop because the bot's WAIT screen showed "Vehicle: 0142"
+// while the DB stored "142". (?=\d) keeps a lone "0" intact.
+const norm = (id) => String(id ?? '').replace(/\s+/g, '').toUpperCase().replace(/^0+(?=\d)/, '');
 
 /**
  * Parse V Holding HTML into two Maps of normalised vehicleId → row position.
@@ -675,10 +696,27 @@ async function _runBot(driverId, state, triggerType = 'monitor_requeue') {
 
   const result = await runBotForDriver(driver, triggerType);
 
-  // Record execution time for the rolling P95 used by drift prediction.
-  // Replaces the stale POS_BOT_EXEC_MS constant — see botExecutionEstimateMs().
+  // Record execution time for the rolling estimator used by drift prediction.
+  // Only genuine *new* adds belong in this pool — fast paths and failure paths
+  // are not representative of the latency the position scheduler needs to plan
+  // for, and including them collapses the median:
+  //   • alreadyQueued      → bot lands on WAIT screen in 1-2 s without adding;
+  //                          dominated the pool on 2026-06-07 (#142 alone fed
+  //                          200+ fast samples), driving botEst from ~6 s down
+  //                          to 1.5 s and causing the burst's +15 to +26 over-
+  //                          shoots.
+  //   • !success           → timeouts pin near 60 s; credential fast-fails
+  //                          pin near 1 s. Neither represents a real add.
+  //   • recoveredFromTimeout → bot did attempt the add, but durationMs is the
+  //                          timeout cap, not real work time — also unrepresentative.
+  // Per-row PositionTracking duration is still recorded unconditionally — it's
+  // a bookkeeping field for the Position Accuracy report, not a calibration signal.
   if (Number.isFinite(result?.durationMs)) {
-    recordBotLatency(result.durationMs);
+    const representsRealAdd =
+      result.success
+      && !result.alreadyQueued
+      && !result.recoveredFromTimeout;
+    if (representsRealAdd) recordBotLatency(result.durationMs);
     // If this was a position-schedule fire, persist the duration onto the
     // same row that already has the 'fired' decision.
     if (state.pendingTrackingId) {
@@ -697,6 +735,15 @@ async function _runBot(driverId, state, triggerType = 'monitor_requeue') {
   if (result?.success && !result?.alreadyQueued) {
     state.requeueCount++;
     state.requeueCountToday++;
+    // A real add proves the driver was NOT in queue — clear any runaway guard.
+    state.consecutiveAlreadyQueued = 0;
+    state.requeueBlockedReason     = null;
+  } else if (result?.success && result?.alreadyQueued && !result?.recoveredFromTimeout) {
+    // Bot kept finding the driver already in queue while our poll never sees
+    // them — almost certainly a key mismatch (e.g. SAN canonical "0142" vs DB
+    // "142"). Bump the consecutive counter; the requeue gate below uses it to
+    // stop hammering SAN after MAX_CONSECUTIVE_ALREADY_QUEUED hits.
+    state.consecutiveAlreadyQueued = (state.consecutiveAlreadyQueued || 0) + 1;
   }
   if (result?.position) state.lastPosition = result.position;
 
@@ -1164,6 +1211,8 @@ async function poll() {
       s.positionFiredToday = false;
       s.lastPosDecision    = null; // new day → next decision will write a fresh row
       s.pendingTrackingId  = null;
+      s.consecutiveAlreadyQueued = 0;
+      s.requeueBlockedReason     = null;
 
       // Carryover: V Holding clears overnight (SAN dispatches the leftovers and
       // empties the list before ~3 AM PT), so a driver still in queue at midnight
@@ -1576,6 +1625,21 @@ async function poll() {
               `[Monitor] #${state.vehicleNumber} cleared terminal — deferring requeue ` +
               `(position scheduler hasn't decided yet today)`,
             );
+          } else if (state.consecutiveAlreadyQueued >= MAX_CONSECUTIVE_ALREADY_QUEUED) {
+            // Runaway guard. The bot has reported "already in queue" this many
+            // times in a row but our poll never sees the driver — strong signal
+            // the V Holding key doesn't match (padding/data issue). Stop the
+            // requeue cycle for the day; admin will see the warning and can fix
+            // the underlying mismatch. Cleared on any real add or midnight reset.
+            if (!state.requeueBlockedReason) {
+              state.requeueBlockedReason = 'consecutive_already_queued';
+              console.warn(
+                `[Monitor] ⚠️  #${state.vehicleNumber} — bot reported "already in queue" ` +
+                `${state.consecutiveAlreadyQueued}× in a row but poll never sees the driver. ` +
+                `Suspected V Holding key mismatch (e.g. SAN canonical "0${state.vehicleNumber}" vs DB "${state.vehicleNumber}"). ` +
+                `Auto-requeue disabled until next real add or midnight reset.`,
+              );
+            }
           } else {
             const reason = clearedAfterSeen
               ? 'left terminal list'
@@ -1893,6 +1957,8 @@ async function addWatch(driverId, { isAuto = false, _ctx = null } = {}) {
     lastResult:        null,
     requeueCount:       0,
     requeueCountToday,
+    consecutiveAlreadyQueued: 0,   // runaway-loop guard — see _handleBotResult
+    requeueBlockedReason:     null, // set when guard trips; cleared on a real add/dispatch
     isActive:                driver.is_active ?? true,   // snapshot; kept current by refreshAutoWatches
     scheduledPosition:       driver.scheduled_position ?? null,
     dayPositions:            driver.day_positions ?? null,

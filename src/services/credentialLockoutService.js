@@ -73,12 +73,24 @@ function clearLockout(driverId) {
  * Returns the message bytes a credentials error sets — useful so the same
  * detection logic lives in one place (botService raises the error with this
  * substring, sanitizeError + isTransientError + this module all key off it).
+ *
+ * Two distinct error shapes flow through here:
+ *   1. The bot's own throw: "Invalid SAN eDispatch username or password — check your credentials"
+ *      → matches via "invalid san" / "check credentials"
+ *   2. The bot's page-scrape fallback: "SAN: Invalid username or password"
+ *      → matches via "invalid username" (added 2026-06-07 after the
+ *        #12/#631/#755 cluster slipped past the original pattern list,
+ *        causing 3× retries per driver and zero lockouts armed).
  */
 function isCredentialError(message) {
   if (!message) return false;
   const m = String(message).toLowerCase();
-  return m.includes('invalid san') || m.includes('check your credentials')
-      || m.includes('check credentials') || m.includes('login failed');
+  return m.includes('invalid san')
+      || m.includes('invalid username')
+      || m.includes('invalid password')
+      || m.includes('check your credentials')
+      || m.includes('check credentials')
+      || m.includes('login failed');
 }
 
 /**

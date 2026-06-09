@@ -66,6 +66,11 @@ services:
       STRIPE_SECRET_KEY:      ${STRIPE_SECRET_KEY:-}
       STRIPE_PRICE_ID:        ${STRIPE_PRICE_ID:-}
       STRIPE_WEBHOOK_SECRET:  ${STRIPE_WEBHOOK_SECRET:-}
+      # Epoch (seconds) until which new sign-ups get an extended trial that
+      # clears the existing-subscriber pause window. Leave unset for normal
+      # billing — empty string parses to 0 and the code falls through to the
+      # default 14-day trial. Paired with scripts/pause-subscriptions.js.
+      STRIPE_PAUSE_UNTIL:     ${STRIPE_PAUSE_UNTIL:-}
       BILLING_ENABLED:        ${BILLING_ENABLED:-true}
 
       # Monitor tuning (optional — defaults apply if not set)

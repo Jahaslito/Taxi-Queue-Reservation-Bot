@@ -5,11 +5,22 @@ const { authenticateAdmin }          = require('../middleware/auth');
 const { triggerLimiter, apiLimiter } = require('../middleware/rateLimiter');
 const validate               = require('../middleware/validate');
 const adminController        = require('../controllers/adminController');
+const sosController          = require('../controllers/sosController');
 
 const router = Router();
 
 router.use(apiLimiter);
 router.use(authenticateAdmin);
+
+// ─── SOS ──────────────────────────────────────────────────────────────────────
+router.get( '/sos',                       sosController.adminList);
+router.get( '/sos/stream',                sosController.adminStream);
+router.get( '/sos/push/config',           sosController.adminPushConfig);
+router.post('/sos/push/subscribe',        sosController.adminPushSubscribe);
+router.post('/sos/push/unsubscribe',      sosController.adminPushUnsubscribe);
+router.get( '/sos/:id',                   sosController.adminGet);
+router.post('/sos/:id/acknowledge',       sosController.adminAcknowledge);
+router.post('/sos/:id/resolve',           sosController.adminResolve);
 
 const idParam = param('id').isInt({ min: 1 }).withMessage('Driver ID must be a positive integer');
 

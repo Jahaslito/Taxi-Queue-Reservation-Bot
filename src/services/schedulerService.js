@@ -2,7 +2,7 @@ const cron    = require('node-cron');
 const Driver  = require('../models/Driver');
 const Log     = require('../models/Log');
 const { decrypt }    = require('./cryptoService');
-const { addToQueue, removeFromQueue, sanitizeError } = require('./botService');
+const { addToQueue, removeFromQueue, sanitizeError, fireArmedSession } = require('./botService');
 const credentialLockout = require('./credentialLockoutService');
 
 // In-memory set prevents the same driver from running twice simultaneously
@@ -139,7 +139,20 @@ async function runBotForDriver(driver, triggerType = 'scheduled') {
         await new Promise((resolve) => setTimeout(resolve, delay));
       }
 
-      result = await addToQueue(driver.san_username, sanPassword, driver.vehicle_number);
+      result = null;
+
+      // Pre-armed fast path: position fires try the parked page first (~1 s
+      // click vs ~3.5 s cold launch — the difference between landing inside
+      // and outside ±10 during a burst). null = no armed session, or the
+      // click failed cleanly → cold path below. First attempt only: a retry
+      // means the armed shot was already consumed.
+      if (attempt === 1 && triggerType === 'position_schedule') {
+        result = await Promise.resolve(fireArmedSession(driver.id)).catch(() => null) ?? null;
+      }
+
+      if (!result) {
+        result = await addToQueue(driver.san_username, sanPassword, driver.vehicle_number);
+      }
 
       if (result.success || !isTransientError(result)) break;
 

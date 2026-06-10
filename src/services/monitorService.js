@@ -47,6 +47,8 @@ const PositionTracking    = require('../models/PositionTracking');
 const QueueSnapshot       = require('../models/QueueSnapshot');
 const proxyHealth         = require('./proxyHealthService');
 const credentialLockout   = require('./credentialLockoutService');
+const dispatchNotify      = require('./dispatchNotificationService');
+const { decrypt }         = require('./cryptoService');
 
 // ─── Constants (overridable via env for testing / tuning) ────────────────────
 // POLL_INTERVAL_MS is the maximum (idle) cadence. Adaptive polling tightens to
@@ -82,6 +84,27 @@ const POS_LEAD_BUFFER  = parseInt(process.env.MONITOR_POS_LEAD_BUFFER  ?? '5', 1
 // landing 10-20+ positions BELOW target). 5 keeps a small cushion without
 // fabricating growth that isn't there.
 const POS_DRIFT_FLOOR  = parseInt(process.env.MONITOR_POS_DRIFT_FLOOR  ?? '5',  10);
+// Hard ceiling on the total lead (drift + bias) the fire decision may apply —
+// THE ±10 accuracy contract, undershoot half. The lead is exactly the
+// worst-case undershoot: V Holding only grows during the morning window
+// (shrinkage pauses firing via the dispatch-purge guard), so if the burst
+// stalls the instant we fire, the driver lands at queue_at_fire + 1 =
+// target − lead + 1. Clamping lead at 10 makes landings below target − 9
+// impossible BY CONSTRUCTION, no matter how wrong the rate estimate is —
+// the May 30–Jun 04 incidents (−36…−68, drift 37–98 extrapolated from burst
+// spikes that stalled) cannot recur. The overshoot half of the contract is
+// handled by cutting fire latency: pre-armed sessions (botService) + the 1 s
+// burst poll. Raising this above 10 trades undershoot risk for burst
+// overshoot protection; don't, unless the ±10 contract itself changes.
+const POS_MAX_LEAD     = parseInt(process.env.MONITOR_POS_MAX_LEAD     ?? '10', 10);
+// Pre-armed fire sessions: park a logged-in page on SAN's "Add To Queue"
+// screen for every driver whose fire is near, so the fire itself is a ~1 s
+// click instead of a ~3.5 s Chromium launch (see botService "Pre-armed fire
+// sessions"). PREARM_AHEAD_SECS controls how far ahead of the projected fire
+// time we arm; inside the burst window every armed-and-waiting driver is
+// pre-armed regardless (the queue can jump 30+ positions in seconds).
+const PREARM_ENABLED    = (process.env.MONITOR_PREARM_ENABLED ?? 'true') !== 'false';
+const PREARM_AHEAD_SECS = parseInt(process.env.MONITOR_PREARM_AHEAD_SECS ?? '240', 10);
 // Fallback estimate for Playwright bot execution time (ms) before we have real
 // data. Used to project how many positions will be added between the fire decision
 // and when SAN assigns the queue slot. The actual estimate is the rolling median
@@ -546,9 +569,10 @@ const norm = (id) => String(id ?? '').replace(/\s+/g, '').toUpperCase().replace(
  * ~2ms for a 455-row page; scales linearly with page size.
  */
 function parseQueue(html) {
-  const dispatched    = new Map(); // vehicleId → position number
-  const waiting       = new Map(); // vehicleId → position number
-  const notAuthorized = new Set(); // vehicleIds in the red "not authorized" zone
+  const dispatched     = new Map(); // vehicleId → position number
+  const dispatchedDest = new Map(); // vehicleId → 'T1'|'T2'|null  (DEST column)
+  const waiting        = new Map(); // vehicleId → position number
+  const notAuthorized  = new Set(); // vehicleIds in the red "not authorized" zone
 
   const chunks = html.split('<tr ');
   for (let i = 1; i < chunks.length; i++) {
@@ -577,11 +601,18 @@ function parseQueue(html) {
     if (!vehicleId) continue;
 
     if (cls === 'notauthorized')    notAuthorized.add(vehicleId);
-    else if (cls === 'holdingdispatched') dispatched.set(vehicleId, position);
+    else if (cls === 'holdingdispatched') {
+      dispatched.set(vehicleId, position);
+      // V Holding shows DEST (T1/T2) only on dispatched rows — the last
+      // column of the table. Matching `>T<digit></td>` keeps us anchored
+      // to a real cell instead of any incidental "T1" elsewhere in markup.
+      const destMatch = chunk.match(/>T(\d+)<\/td>/i);
+      dispatchedDest.set(vehicleId, destMatch ? `T${destMatch[1]}` : null);
+    }
     else                             waiting.set(vehicleId, position);
   }
 
-  return { dispatched, waiting, notAuthorized };
+  return { dispatched, dispatchedDest, waiting, notAuthorized };
 }
 
 /**
@@ -712,10 +743,17 @@ async function _runBot(driverId, state, triggerType = 'monitor_requeue') {
   // Per-row PositionTracking duration is still recorded unconditionally — it's
   // a bookkeeping field for the Position Accuracy report, not a calibration signal.
   if (Number.isFinite(result?.durationMs)) {
+    //   • viaArmedSession    → a pre-armed fire is a ~1 s click on a parked
+    //                          page. Pooling those would drag the COLD-launch
+    //                          median (and thus the drift horizon for every
+    //                          un-armed fire) far below what a real launch
+    //                          costs — the same distortion alreadyQueued
+    //                          caused on 2026-06-07, from the other side.
     const representsRealAdd =
       result.success
       && !result.alreadyQueued
-      && !result.recoveredFromTimeout;
+      && !result.recoveredFromTimeout
+      && !result.viaArmedSession;
     if (representsRealAdd) recordBotLatency(result.durationMs);
     // If this was a position-schedule fire, persist the duration onto the
     // same row that already has the 'fired' decision.
@@ -894,7 +932,7 @@ async function triggerPositionSchedule(driverId, state, effectivePosition, {
     state.lastPosDecision   = 'fired';
   }).catch((err) => console.error('[PosTracking] Failed to upsert fired row:', err.message));
 
-  jobQueue.enqueue(() =>
+  const runFire = () =>
     _runBot(driverId, state, 'position_schedule').catch((err) => {
       state.state      = 'watching';
       state.hasBeenSeen = false;
@@ -921,8 +959,35 @@ async function triggerPositionSchedule(driverId, state, effectivePosition, {
       });
       broadcast('driver_state', { driverId, state: snap(state) });
       console.error(`[Monitor] ✗ Position trigger failed #${state.vehicleNumber}: ${err.message}`);
-    }),
-  );
+    });
+
+  // A pre-armed fire is a click on an already-open page — no Chromium launch —
+  // so routing it through the launch-capped jobQueue would only re-introduce
+  // the serialization the arming exists to remove (Jun 09: five simultaneous
+  // fires at concurrency 3 → the second batch waited ~3.5 s and landed +25
+  // past the first). Armed → run immediately; cold → queue as before.
+  if (hasArmedFireSession(driverId)) {
+    console.log(`[Pos] ⚡ #${state.vehicleNumber} — armed session ready, bypassing bot queue`);
+    runFire();
+  } else {
+    jobQueue.enqueue(runFire);
+  }
+}
+
+/**
+ * True when botService holds a parked, ready-to-click page for this driver.
+ * Lazy require: botService pulls in Playwright — tests that exercise the
+ * scheduler decision logic shouldn't pay that cost (or need that mock) unless
+ * they opt in. Failure-safe: any error means "not armed" and the cold path
+ * (jobQueue → full bot run) handles the fire exactly as before pre-arming.
+ */
+function hasArmedFireSession(driverId) {
+  if (!PREARM_ENABLED) return false;
+  try {
+    return require('./botService').hasArmedFireSession(driverId);
+  } catch {
+    return false;
+  }
 }
 
 // ─── Fetch with retry ─────────────────────────────────────────────────────────
@@ -999,6 +1064,7 @@ function evaluatePositionScheduler(state, ctx) {
     queueShrinkageDetected = false,
     isLockedOut             = () => false,
     inBurstWindow           = false,
+    maxLeadPositions        = POS_MAX_LEAD,
   } = ctx;
 
   // Inactive drivers have no business being scheduled. isActive is synced to the
@@ -1120,7 +1186,23 @@ function evaluatePositionScheduler(state, ctx) {
   // Fire as soon as projection reaches target — bounded above by maxAcceptable.
   // Bias correction is layered in to compensate for systematic landing errors
   // observed in recent history.
-  const projectedLanding = waitingCount + estimatedDrift + biasCorrection;
+  //
+  // The LEAD (how many positions early we fire) is clamped to maxLeadPositions
+  // — see POS_MAX_LEAD for the full rationale. In one line: lead is the
+  // worst-case undershoot, so the clamp hard-bounds landings at target − 9.
+  // The drift estimate still matters BELOW the clamp (calm mornings fire with
+  // lead 5–10 as before); what it can no longer do is extrapolate a burst
+  // spike into firing 40–90 positions early (Jun 03: drift 98 → landed −68).
+  // A clamped lead also keeps the projection-exceeds-max rail honest: it can
+  // only trip when the queue itself is within lead of max, not because a
+  // one-tick rate spike inflated the forecast (the Jun 04 false skips).
+  const rawLead          = estimatedDrift + biasCorrection;
+  const lead             = Math.min(rawLead, maxLeadPositions);
+  const leadClamped      = lead !== rawLead;
+  const projectedLanding = waitingCount + lead;
+  const leadNote         = leadClamped
+    ? ` (lead clamped ${rawLead.toFixed(1)} → ${lead})`
+    : '';
 
   // If the projection says we'd land ABOVE maxAcceptable, the train has left
   // the station: every second we wait, the queue grows further past max. The
@@ -1135,8 +1217,7 @@ function evaluatePositionScheduler(state, ctx) {
       action:  'missed_impossible',
       reason:  'projection_exceeds_max',
       logLine: `[Pos] ${veh} — ✗ projection ${projectedLanding.toFixed(1)} > max ${maxAcceptable} ` +
-               `(queue ${waitingCount} + drift ${estimatedDrift}` +
-               `${biasCorrection !== 0 ? ` + bias ${biasCorrection.toFixed(1)}` : ''}, ` +
+               `(queue ${waitingCount} + lead ${Number.isInteger(lead) ? lead : lead.toFixed(1)}${leadNote}, ` +
                `target ${effectivePosition}) — too late, skipping`,
       metrics: {
         ...baseMetrics,
@@ -1164,8 +1245,8 @@ function evaluatePositionScheduler(state, ctx) {
       effectivePosition,
       maxAcceptable,
       secondsUntilFire,
-      logLine: `[Pos] ${veh} — ✓ queue ${waitingCount} + drift ${estimatedDrift}` +
-               `${biasCorrection !== 0 ? ` + bias ${biasCorrection.toFixed(1)}` : ''} ` +
+      logLine: `[Pos] ${veh} — ✓ queue ${waitingCount} + lead ${Number.isInteger(lead) ? lead : lead.toFixed(1)}` +
+               `${leadNote ? leadNote : ` (drift ${estimatedDrift}${biasCorrection !== 0 ? ` + bias ${biasCorrection.toFixed(1)}` : ''})`} ` +
                `= ${projectedLanding.toFixed(1)} ≥ target ${effectivePosition} ` +
                `(max ${maxAcceptable}, rate ${effectiveGrowthRate.toFixed(2)}/s, ` +
                `horizon ${horizonSeconds.toFixed(0)}s, botEst ${(botExecMs/1000).toFixed(1)}s, ` +
@@ -1185,7 +1266,7 @@ function evaluatePositionScheduler(state, ctx) {
     reason:  'projected_below_target',
     secondsUntilFire,
     logLine: `[Pos] ${veh} — waiting (queue: ${waitingCount}, drift: ${estimatedDrift}, ` +
-             `bias: ${biasCorrection.toFixed(1)}, projected: ${projectedLanding.toFixed(1)}, ` +
+             `bias: ${biasCorrection.toFixed(1)}, projected: ${projectedLanding.toFixed(1)}${leadNote}, ` +
              `target: ${effectivePosition}, max: ${maxAcceptable}, ` +
              `secsToFire: ${Number.isFinite(secondsUntilFire) ? secondsUntilFire.toFixed(0) : '∞'})`,
     metrics: {
@@ -1233,6 +1314,7 @@ async function poll() {
       s.manuallyRemovedAt  = null;  // new day → driver can be auto-managed again
       s.earlyJoinDetectedAt = null;
       s.earlyJoinAtPosition = null;
+      s.dispatchNotifyPending = false;
     }
     console.log('[Monitor] Daily reset — counters and visibility state cleared');
     broadcast('daily_reset', { date: currentDayPT });
@@ -1270,7 +1352,7 @@ async function poll() {
   const fetchMs = Date.now() - t0;
   prevObservationAt = lastObservationAt;
   lastObservationAt = Date.now(); // record when this snapshot was taken
-  const { dispatched, waiting, notAuthorized } = parseQueue(html);
+  const { dispatched, dispatchedDest, waiting, notAuthorized } = parseQueue(html);
 
   lastPollStats = {
     pollAt:       new Date(),
@@ -1422,8 +1504,37 @@ async function poll() {
     } else if (inDispatched) {
       markSeen();
       state.lastSeenAt = new Date();
-      if (prev !== 'dispatched') state.lastDispatchAt = new Date();
+      const wasNewlyDispatched = prev !== 'dispatched' && !isCarryover;
+      if (wasNewlyDispatched) {
+        state.lastDispatchAt = new Date();
+        // Arm the notification — fire on this poll if DEST is already
+        // populated, or on the first subsequent poll once SAN fills it.
+        // Cleared the moment we actually send so a long dispatched dwell
+        // doesn't spam (and we never re-fire if state machine drops back
+        // through 'dispatched' from at_terminal mid-trip).
+        state.dispatchNotifyPending = true;
+      }
       next = isCarryover ? 'in_queue' : 'dispatched';
+
+      // Strict policy: only fire when SAN has assigned a terminal in the
+      // DEST column. A notification without a terminal isn't actionable —
+      // the driver wouldn't know where to go, defeating the 25-min window.
+      const terminal = dispatchedDest.get(vn) ?? null;
+      if (state.dispatchNotifyPending && terminal) {
+        state.dispatchNotifyPending = false;
+        Driver.findById(driverId)
+          .then((driver) => {
+            if (!driver) return;
+            return dispatchNotify.notifyDispatch({
+              driverId,
+              driverName:    driver.name,
+              vehicleNumber: state.vehicleNumber,
+              phone:         driver.phone || null,
+              terminal,
+            });
+          })
+          .catch((err) => console.warn(`[Monitor] dispatch notify for #${state.vehicleNumber} failed:`, err.message));
+      }
     } else if (inWaiting) {
       // Record actual landing position whenever we see a fired driver in the
       // queue with a pending tracking row — independent of hasBeenSeen, which
@@ -1581,7 +1692,10 @@ async function poll() {
           console.log(`[Monitor] #${state.vehicleNumber} → at ${which} terminal (pos #${termPos})`);
           broadcast('driver_state', { driverId, state: snap(state) });
         }
-        // Still at terminal — keep watching
+        // No notification here — dispatch alerts fire earlier, at the
+        // waiting → dispatched transition (line ~1431). By the time the
+        // driver shows up on a terminal page, the 25-minute window has
+        // already been ticking and the notification would be too late.
       } else {
         // Not found on either terminal this poll
         state.terminalCheckCount++;
@@ -1752,6 +1866,10 @@ async function poll() {
   // Track the soonest fire across all armed drivers — drives adaptive polling.
   let minSecondsUntilFire = Infinity;
 
+  // Drivers who should hold a pre-armed fire session (collected from 'wait'
+  // decisions below, reconciled with botService after the loop).
+  const prearmWanted = [];
+
   for (const [driverId, state] of watches) {
     const decision = evaluatePositionScheduler(state, decisionCtx);
 
@@ -1787,6 +1905,29 @@ async function poll() {
       case 'wait':
         console.log(decision.logLine);
         recordPositionDecision(state, decision.action, decision.reason, decision.metrics);
+
+        // Pre-arm candidates: drivers genuinely waiting on queue growth
+        // (NOT carryovers — they're still inside V Holding, so arming would
+        // just park on the WAIT screen). queue_shrinking waiters are included:
+        // the purge settles within a poll or two and they fire right after.
+        if (
+          decision.action === 'wait' &&
+          decision.reason !== 'awaiting_overnight_purge' &&
+          (inBurstWindow || decision.secondsUntilFire <= PREARM_AHEAD_SECS)
+        ) {
+          prearmWanted.push({
+            driverId,
+            vehicleNumber:    state.vehicleNumber,
+            secondsUntilFire: decision.secondsUntilFire,
+            // Credentials are fetched + decrypted only if an arm actually
+            // happens (botService skips already-armed / cooling-down drivers).
+            getCredentials: async () => {
+              const d = await Driver.findByIdWithCredentials(driverId);
+              if (!d?.san_username || !d?.san_password) return null;
+              return { sanUsername: d.san_username, sanPassword: decrypt(d.san_password) };
+            },
+          });
+        }
         break;
 
       case 'skip_already_seen': {
@@ -1865,6 +2006,21 @@ async function poll() {
     }
   }
 
+  // ─── Pre-arm reconciliation ────────────────────────────────────────────────
+  // Declarative: hand botService the full wanted set every tick and let it
+  // converge (arm missing, refresh stale, disarm dropped). Fire-and-forget —
+  // arming takes ~4 s and must never block the 1 s burst poll. All throttling
+  // (in-flight dedup, failure cooldowns, ARMED_MAX memory cap) lives inside
+  // botService.syncFireSessions, so calling it every tick is safe.
+  if (PREARM_ENABLED) {
+    try {
+      require('./botService').syncFireSessions(prearmWanted)
+        .catch((err) => console.error('[Arm] sync failed:', err.message));
+    } catch (err) {
+      console.error('[Arm] botService unavailable:', err.message);
+    }
+  }
+
   // Set the adaptive interval for the next scheduled poll.
   // During the burst window (4:00–5:30 AM PT) lock to POLL_BURST_MS (1 s)
   // regardless of secsToFire — the growth rate estimate is unreliable right
@@ -1884,10 +2040,21 @@ async function poll() {
     console.log(`[Monitor] Poll cadence ${currentPollDelayMs/1000}s → ${newDelayMs/1000}s (${reason})`);
     currentPollDelayMs = newDelayMs;
   }
-  } else if (currentPollDelayMs !== POLL_INTERVAL_MS) {
-    // Outside position hours (e.g. midnight–2 AM PT) → relax cadence.
-    console.log(`[Monitor] Poll cadence ${currentPollDelayMs/1000}s → ${POLL_INTERVAL_MS/1000}s (outside position hours)`);
-    currentPollDelayMs = POLL_INTERVAL_MS;
+  } else {
+    if (currentPollDelayMs !== POLL_INTERVAL_MS) {
+      // Outside position hours (e.g. midnight–2 AM PT) → relax cadence.
+      console.log(`[Monitor] Poll cadence ${currentPollDelayMs/1000}s → ${POLL_INTERVAL_MS/1000}s (outside position hours)`);
+      currentPollDelayMs = POLL_INTERVAL_MS;
+    }
+    // Defensive sweep: no fire can happen outside position hours, so no page
+    // should stay parked (each one holds a Chromium context). No-op when
+    // nothing is armed — cheap to call every tick.
+    if (PREARM_ENABLED) {
+      try {
+        require('./botService').disarmAllFireSessions('outside position hours')
+          .catch((err) => console.error('[Arm] disarm sweep failed:', err.message));
+      } catch { /* botService unavailable — nothing armed either */ }
+    }
   } // end isWithinPositionHours
 }
 
@@ -1975,6 +2142,7 @@ async function addWatch(driverId, { isAuto = false, _ctx = null } = {}) {
     terminalPosition:   null,
     earlyJoinDetectedAt: null, // first time we detected driver in queue far ahead of target
     earlyJoinAtPosition: null, // their queue position at that first detection
+    dispatchNotifyPending: false, // armed on entering 'dispatched'; fires when DEST is known
     _lastBroadcastPos:  null,  // internal: avoids redundant SSE on same position
     _lastQueueSize:     null,  // internal: queue size at last poll (for logging)
   };
@@ -2092,6 +2260,7 @@ function armPositionWindowForToday(dayKey = todayPT) {
     s.atTerminalSince      = null;
     s.earlyJoinDetectedAt  = null;
     s.earlyJoinAtPosition  = null;
+    s.dispatchNotifyPending = false;
 
     // Don't yank state out from under an in-flight bot.
     if (s.state !== 'requeuing') {
@@ -2147,6 +2316,7 @@ function allowRefireToday(driverId) {
   state.atTerminalSince      = null;
   state.earlyJoinDetectedAt  = null;
   state.earlyJoinAtPosition  = null;
+  state.dispatchNotifyPending = false;
 
   // Don't yank state out from under an in-flight bot.
   if (state.state !== 'requeuing') {
@@ -2328,6 +2498,25 @@ async function startMonitor() {
     console.log(`[Monitor] Auto-watched ${added} active driver(s)`);
   } catch (e) {
     console.warn('[Monitor] Initial auto-watch failed:', e.message);
+  }
+
+  // Mid-day restart guard: positionWindowArmedForDate is in-memory and lost on
+  // restart, so the next poll would re-run armPositionWindowForToday() — which
+  // wipes positionFiredToday/hasBeenSeen and re-tags any driver currently in
+  // queue as inQueueFromCarryover. Drivers dispatched on a trip after that get
+  // routed through the carryover-cleared path with no requeue (the 2026-06-09
+  // #0187 incident: fired at 04:37, restart at 08:29 re-tagged as carryover,
+  // dispatch at 10:34 logged "SAN cleared overnight carryover" with no
+  // triggerRequeue, driver had to manually re-add at the terminal ~1h 53m
+  // later). DB-restored positionFiredToday/hasBeenSeen on any watched driver
+  // is durable evidence the window already armed today — skip the re-arm.
+  const todayKey = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+  const dayAlreadyInProgress = [...watches.values()].some(
+    (s) => s.positionFiredToday || s.hasBeenSeen,
+  );
+  if (dayAlreadyInProgress) {
+    positionWindowArmedForDate = todayKey;
+    console.log(`[Monitor] Position window already armed today (${todayKey}) — restart detected, preserving driver state`);
   }
 
   if (pollTimer)    { clearTimeout(pollTimer);    pollTimer    = null; }
@@ -2549,6 +2738,9 @@ module.exports = {
   // can mutate flags directly. Do NOT use from production code paths —
   // mutating state outside snap() / broadcast() breaks SSE updates.
   _getInternalState: (driverId) => watches.get(driverId),
+  // Test-only: exposes the in-memory armed-for-date flag so restart-guard
+  // tests can confirm the guard prevented re-arming.
+  _getPositionWindowArmedForDate: () => positionWindowArmedForDate,
   getPositionDiagnostics,
   watchAllActive,
   refreshAutoWatches,

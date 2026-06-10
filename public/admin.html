@@ -452,6 +452,10 @@
     <button class="nav-link" data-page="page-logs">
       <span class="icon">📋</span><span>Activity Logs</span>
     </button>
+    <button class="nav-link" data-page="page-sos">
+      <span class="icon">🚨</span><span>SOS Alerts</span>
+      <span id="sos-nav-badge" style="display:none;margin-left:auto;min-width:18px;height:18px;border-radius:9px;background:var(--red);color:#fff;font-size:10px;font-weight:700;align-items:center;justify-content:center;padding:0 5px;">0</span>
+    </button>
   </div>
   <div class="nav-group">
     <div class="nav-group-label">Automation</div>
@@ -652,6 +656,59 @@
         <button class="btn btn-ghost btn-sm" id="logs-prev" disabled>← Prev</button>
         <span id="logs-page-label" style="font-size:13px;color:var(--muted2);white-space:nowrap;min-width:80px;text-align:center;"></span>
         <button class="btn btn-ghost btn-sm" id="logs-next" disabled>Next →</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════ SOS ALERTS PAGE ══════════ -->
+  <div class="page" id="page-sos">
+    <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;">
+      <div>
+        <h1>🚨 SOS Alerts</h1>
+        <p>Real-time emergency alerts from drivers</p>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <span id="sos-stream-status" style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted2);">
+          <span id="sos-stream-dot" style="width:7px;height:7px;border-radius:50%;background:var(--muted);"></span>
+          <span id="sos-stream-label">Connecting…</span>
+        </span>
+        <button class="btn btn-ghost btn-sm" id="btn-sos-test-sound" title="Play a test beep so you can confirm your speakers / volume are up">🔊 Test Sound</button>
+        <button class="btn btn-ghost btn-sm" id="btn-sos-enable-push">🔔 Enable Push</button>
+        <button class="btn btn-ghost btn-sm" id="btn-sos-refresh">↺ Refresh</button>
+      </div>
+    </div>
+
+    <!-- Active alerts (status: active or acknowledged) -->
+    <div style="margin-bottom:24px;">
+      <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:var(--muted);margin-bottom:10px;">
+        Open Alerts <span id="sos-open-count" style="color:var(--red);">(0)</span>
+      </div>
+      <div id="sos-active-list" style="display:flex;flex-direction:column;gap:12px;">
+        <div style="color:var(--muted2);font-size:14px;text-align:center;padding:24px;background:var(--bg2);border:1px dashed var(--border);border-radius:12px;">
+          No active alerts.
+        </div>
+      </div>
+    </div>
+
+    <!-- Resolved alerts (history) -->
+    <div>
+      <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:var(--muted);margin-bottom:10px;">Recent History</div>
+      <div class="table-wrap" id="sos-history-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Driver</th>
+              <th>Vehicle</th>
+              <th>Triggered</th>
+              <th>Resolved</th>
+              <th>Reason</th>
+              <th>Location</th>
+            </tr>
+          </thead>
+          <tbody id="sos-history-tbody">
+            <tr><td colspan="6" style="text-align:center;color:var(--muted2);padding:18px;">Loading…</td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
   </div>
@@ -1206,6 +1263,65 @@
 <!-- Toast -->
 <div class="toast" id="toast"></div>
 
+<!-- ── SOS Resolve confirmation modal — replaces native confirm() ── -->
+<div class="modal-overlay" id="sos-confirm-modal">
+  <div class="modal" style="max-width:400px;">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
+      <div style="font-size:26px;line-height:1;">🚨</div>
+      <h3 id="sos-confirm-title" style="margin:0;">Mark as resolved?</h3>
+    </div>
+    <p id="sos-confirm-body" style="color:var(--muted2);font-size:14px;line-height:1.5;margin:0 0 6px;">
+      The alert will move to history and the driver will be notified.
+    </p>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="sos-confirm-cancel">Cancel</button>
+      <button class="btn btn-primary" id="sos-confirm-ok">Mark Resolved</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── SOS Global Banner — appears on ANY admin page when a new SOS hits ── -->
+<div id="sos-global-banner" style="
+  display:none; position:fixed; top:16px; left:50%; transform:translateX(-50%);
+  z-index:9999; width:min(640px, calc(100% - 32px));
+  background:linear-gradient(135deg, rgba(240,90,91,0.95), rgba(220,38,38,0.95));
+  border:1px solid rgba(255,255,255,0.18); border-radius:14px;
+  padding:14px 18px; box-shadow:0 12px 36px rgba(240,90,91,0.45);
+  color:#fff; font-family:'DM Sans',sans-serif;
+  animation: sos-banner-pulse 1.6s ease-in-out infinite;">
+  <div style="display:flex;align-items:center;gap:14px;">
+    <div style="font-size:26px;line-height:1;">🚨</div>
+    <div style="flex:1;min-width:0;">
+      <div style="font-weight:800;font-size:15px;letter-spacing:0.02em;">SOS ALERT</div>
+      <div id="sos-banner-detail" style="font-size:13px;opacity:0.92;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+        Driver requesting help
+      </div>
+    </div>
+    <button id="sos-banner-open" style="background:#fff;color:#dc2626;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:13px;">View</button>
+    <button id="sos-banner-dismiss" style="background:transparent;border:1px solid rgba(255,255,255,0.4);color:#fff;border-radius:8px;padding:8px 10px;cursor:pointer;font-size:13px;">×</button>
+  </div>
+</div>
+<style>
+  @keyframes sos-banner-pulse {
+    0%,100% { box-shadow:0 12px 36px rgba(240,90,91,0.45); }
+    50%     { box-shadow:0 12px 48px rgba(240,90,91,0.85); }
+  }
+  .sos-card {
+    background:linear-gradient(135deg, rgba(240,90,91,0.12), rgba(220,38,38,0.06));
+    border:1px solid rgba(240,90,91,0.5); border-radius:14px; padding:16px 18px;
+  }
+  .sos-card.acknowledged { background:linear-gradient(135deg, rgba(245,166,35,0.10), rgba(245,166,35,0.04)); border-color:rgba(245,166,35,0.45); }
+  .sos-card .row { display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  .sos-card .driver-name { font-weight:800; font-size:16px; color:#fff; }
+  .sos-card .pill { display:inline-block; padding:2px 9px; border-radius:20px; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.06em; }
+  .sos-card .pill.active { background:rgba(240,90,91,0.18); color:#fca5a5; }
+  .sos-card .pill.ack    { background:rgba(245,166,35,0.18); color:#fbbf24; }
+  .sos-card .meta { font-size:12px; color:var(--muted2); margin-top:4px; }
+  .sos-card .mono { font-family:'IBM Plex Mono',monospace; font-size:12.5px; color:#fff; background:rgba(255,255,255,0.04); padding:2px 6px; border-radius:5px; }
+  .sos-card .actions { margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; }
+  .sos-card .actions .btn { flex:0 0 auto; }
+</style>
+
 <script>
   // ── Mobile hamburger drawer ──────────────────────────────────────────────────
   (function () {
@@ -1250,6 +1366,7 @@
 <script src="/js/admin/monitor.controller.js"></script>
 <script src="/js/admin/posTracking.controller.js"></script>
 <script src="/js/admin/posDiagnostics.controller.js"></script>
+<script src="/js/admin/sos.controller.js"></script>
 <script src="/js/admin/auth.controller.js"></script>
 <script src="/js/admin/app.js"></script>
 <script>

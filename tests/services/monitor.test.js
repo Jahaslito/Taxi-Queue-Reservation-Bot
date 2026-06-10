@@ -37,6 +37,7 @@ const {
   stopMonitor,
   allowRefireToday,
   armPositionWindowForToday,
+  startMonitor,
 } = monitor;
 
 // ─── UTC timestamp for a given Pacific Standard Time hour ─────────────────────
@@ -428,7 +429,8 @@ describe('evaluatePositionScheduler — safety rails', () => {
   test('normal case still fires when projection ≥ target and below max', () => {
     const decision = _evaluatePositionScheduler(
       makeState(),
-      { ...baseCtx, waitingCount: 80, estimatedDrift: 30 }, // 80+30 = 110 ≥ 100
+      // Drift 30 is clamped to the POS_MAX_LEAD (10) lead: 95+10 = 105 ≥ 100.
+      { ...baseCtx, waitingCount: 95, estimatedDrift: 30 },
     );
     expect(decision.action).toBe('fire');
   });
@@ -441,7 +443,7 @@ describe('evaluatePositionScheduler — safety rails', () => {
   test('carryover from yesterday → wait (no fire while still in queue)', () => {
     const decision = _evaluatePositionScheduler(
       makeState({ inQueueFromCarryover: true }),
-      { ...baseCtx, waitingCount: 80, estimatedDrift: 30 }, // would otherwise fire
+      { ...baseCtx, waitingCount: 95, estimatedDrift: 30 }, // would otherwise fire
     );
     expect(decision.action).toBe('wait');
     expect(decision.reason).toBe('awaiting_overnight_purge');
@@ -461,29 +463,32 @@ describe('evaluatePositionScheduler — safety rails', () => {
   test('carryover cleared → normal fire path resumes', () => {
     const decision = _evaluatePositionScheduler(
       makeState({ inQueueFromCarryover: false }),
-      { ...baseCtx, waitingCount: 80, estimatedDrift: 30 },
+      { ...baseCtx, waitingCount: 95, estimatedDrift: 30 },
     );
     expect(decision.action).toBe('fire');
   });
 
   // Projection-exceeds-max guard: covers the 2026-05-27 #695 case where the
   // queue is still below max RIGHT NOW (so the waitingCount>maxAcceptable rail
-  // doesn't trip) but projected landing is well past max. Firing in that
-  // window produces the +62 type overshoots that motivated this work.
+  // doesn't trip) but projected landing is past max. Since the lead clamp
+  // (POS_MAX_LEAD), the projection can only exceed max when the QUEUE ITSELF
+  // is within one lead of max — a one-tick rate spike can no longer inflate
+  // the forecast into false skips (the Jun 04 incident: drift 58–98 marked
+  // five drivers missed_impossible whose windows were still viable).
   describe('projection exceeds max → missed_impossible (does NOT fire)', () => {
-    test('drift would push landing past max', () => {
+    test('queue within clamped lead of max → skip', () => {
       const decision = _evaluatePositionScheduler(
         makeState({ scheduledPosition: 100, maxAcceptablePosition: 120 }),
-        { ...baseCtx, waitingCount: 90, estimatedDrift: 50 }, // 90+50=140 > 120
+        { ...baseCtx, waitingCount: 115, estimatedDrift: 50 }, // 115+min(50,10)=125 > 120
       );
       expect(decision.action).toBe('missed_impossible');
       expect(decision.reason).toBe('projection_exceeds_max');
     });
 
-    test('bias correction alone can push projection past max', () => {
+    test('bias participates in the lead below the clamp', () => {
       const decision = _evaluatePositionScheduler(
         makeState({ scheduledPosition: 100, maxAcceptablePosition: 120 }),
-        { ...baseCtx, waitingCount: 100, estimatedDrift: 15, biasCorrection: 10 }, // 100+15+10=125>120
+        { ...baseCtx, waitingCount: 112, estimatedDrift: 4, biasCorrection: 8 }, // 112+min(12,10)=122 > 120
       );
       expect(decision.action).toBe('missed_impossible');
       expect(decision.reason).toBe('projection_exceeds_max');
@@ -492,7 +497,7 @@ describe('evaluatePositionScheduler — safety rails', () => {
     test('projection exactly at max → fires (boundary)', () => {
       const decision = _evaluatePositionScheduler(
         makeState({ scheduledPosition: 100, maxAcceptablePosition: 120 }),
-        { ...baseCtx, waitingCount: 90, estimatedDrift: 30 }, // 90+30=120 == max
+        { ...baseCtx, waitingCount: 110, estimatedDrift: 10 }, // 110+10=120 == max
       );
       expect(decision.action).toBe('fire');
     });
@@ -506,6 +511,92 @@ describe('evaluatePositionScheduler — safety rails', () => {
       // not projection_exceeds_max
       expect(decision.action).toBe('missed_impossible');
       expect(decision.reason).toBe('queue_already_past_max');
+    });
+  });
+
+  // ─── ±10 lead clamp (POS_MAX_LEAD) ─────────────────────────────────────────
+  // The lead (drift + bias) is the worst-case UNDERSHOOT: the queue only grows
+  // during the morning window, so firing `lead` early can land at most `lead-1`
+  // below target if growth stalls the moment we fire. Clamping the lead at 10
+  // makes sub−(target−9) landings impossible by construction — the May 30 –
+  // Jun 04 misses (−36…−68 from drift 37–98) were all burst-spike drift
+  // extrapolations that this clamp would have cut to 10.
+  describe('±10 lead clamp (POS_MAX_LEAD)', () => {
+    test('burst-spike drift (98) no longer fires 40 early — waits instead', () => {
+      // Jun 03 #0034 replay: target 200, queue 113, drift 98 → old code fired
+      // (projection 207) and landed at 132 (−68). Clamped: 113+10=123 < 200.
+      const decision = _evaluatePositionScheduler(
+        makeState({ scheduledPosition: 200, maxAcceptablePosition: 220 }),
+        { ...baseCtx, waitingCount: 113, estimatedDrift: 98 },
+      );
+      expect(decision.action).toBe('wait');
+    });
+
+    test('fire happens once queue is within 10 of target, however large the drift', () => {
+      for (const estimatedDrift of [12, 55, 98]) {
+        const at89 = _evaluatePositionScheduler(
+          makeState(),
+          { ...baseCtx, waitingCount: 89, estimatedDrift }, // 89+10=99 < 100
+        );
+        const at90 = _evaluatePositionScheduler(
+          makeState(),
+          { ...baseCtx, waitingCount: 90, estimatedDrift }, // 90+10=100 ≥ 100
+        );
+        expect(at89.action).toBe('wait');
+        expect(at90.action).toBe('fire');
+      }
+    });
+
+    test('undershoot bound: any fire implies queue ≥ target − POS_MAX_LEAD', () => {
+      // Property sweep across drift × bias: scan the queue size upward and
+      // assert the FIRST size that fires is never below target − 10.
+      for (const estimatedDrift of [5, 20, 55, 98]) {
+        for (const biasCorrection of [-10, 0, 10]) {
+          let firstFire = null;
+          for (let waitingCount = 70; waitingCount <= 115; waitingCount++) {
+            const d = _evaluatePositionScheduler(
+              makeState(),
+              { ...baseCtx, waitingCount, estimatedDrift, biasCorrection },
+            );
+            if (d.action === 'fire') { firstFire = waitingCount; break; }
+          }
+          expect(firstFire).not.toBeNull();
+          expect(firstFire).toBeGreaterThanOrEqual(100 - 10);
+        }
+      }
+    });
+
+    test('negative bias still delays firing beyond the clamp (lands-early correction)', () => {
+      // drift 5 + bias −8 → lead −3: fire only when queue ≥ target + 3.
+      const at102 = _evaluatePositionScheduler(
+        makeState(),
+        { ...baseCtx, waitingCount: 102, estimatedDrift: 5, biasCorrection: -8 },
+      );
+      const at103 = _evaluatePositionScheduler(
+        makeState(),
+        { ...baseCtx, waitingCount: 103, estimatedDrift: 5, biasCorrection: -8 },
+      );
+      expect(at102.action).toBe('wait');
+      expect(at103.action).toBe('fire');
+    });
+
+    test('Jun 04 false-skip regression: viable window is no longer missed_impossible', () => {
+      // #0305 replay: target 121, max 141, queue 114, drift 58, bias −5.5 →
+      // old projection 166.5 > 141 skipped a driver who'd have landed ~+7.
+      // Clamped projection 124 ≥ 121 and ≤ 141 → fire.
+      const decision = _evaluatePositionScheduler(
+        makeState({ scheduledPosition: 121, maxAcceptablePosition: 141 }),
+        { ...baseCtx, waitingCount: 114, estimatedDrift: 58, biasCorrection: -5.5 },
+      );
+      expect(decision.action).toBe('fire');
+    });
+
+    test('ctx.maxLeadPositions overrides the default clamp', () => {
+      const decision = _evaluatePositionScheduler(
+        makeState(),
+        { ...baseCtx, waitingCount: 80, estimatedDrift: 55, maxLeadPositions: 20 }, // 80+20=100
+      );
+      expect(decision.action).toBe('fire');
     });
   });
 
@@ -524,7 +615,7 @@ describe('evaluatePositionScheduler — safety rails', () => {
     test('isLockedOut returning false → normal evaluation', () => {
       const decision = _evaluatePositionScheduler(
         makeState(),
-        { ...baseCtx, waitingCount: 80, estimatedDrift: 30, isLockedOut: () => false },
+        { ...baseCtx, waitingCount: 95, estimatedDrift: 30, isLockedOut: () => false },
       );
       expect(decision.action).toBe('fire');
     });
@@ -534,7 +625,7 @@ describe('evaluatePositionScheduler — safety rails', () => {
       // predicate must continue to work exactly as before.
       const decision = _evaluatePositionScheduler(
         makeState(),
-        { ...baseCtx, waitingCount: 80, estimatedDrift: 30 },
+        { ...baseCtx, waitingCount: 95, estimatedDrift: 30 },
       );
       expect(decision.action).toBe('fire');
     });
@@ -623,5 +714,224 @@ describe('botExecutionEstimateMs — median + freshness', () => {
     const xs = [3, 1, 2];
     monitor._computeMedian(xs);
     expect(xs).toEqual([3, 1, 2]);
+  });
+});
+
+// ─── startMonitor() — mid-day restart guard ──────────────────────────────────
+// Regression cover for the 2026-06-09 #0187 (Mataan Noor) incident:
+//   • 04:37 PT — bot fired, driver enters queue at pos #122 (target 100)
+//   • 08:29 PT — service restarted. Without the guard, armPositionWindowForToday
+//                ran again because positionWindowArmedForDate is in-memory and
+//                lost on restart. It set inQueueFromCarryover=true on the
+//                still-in-queue driver and wiped positionFiredToday.
+//   • 10:34 PT — driver dispatched (left V Holding). The carryover-cleared path
+//                fired: state → 'watching', NO triggerRequeue.
+//   • 12:27 PT — driver finally back in queue (manual self-add at terminal),
+//                ~1h 53m after their trip ended.
+//
+// The fix: at startMonitor() time, if any watched driver shows DB-restored
+// evidence of having already participated today (positionFiredToday=true OR
+// hasBeenSeen=true), pin positionWindowArmedForDate to today's PT date so the
+// poll loop skips the re-arm.
+
+describe('startMonitor() — mid-day restart guard', () => {
+  // Watch internals: addWatch is async; we need to wait for poll's first tick
+  // to settle so positionWindowArmedForDate reflects the guard's decision and
+  // not a stale null. The guard runs synchronously after `await watchAllActive()`
+  // so a microtask flush is sufficient — no fake timers needed for that part.
+
+  const buildActiveDriver = (over = {}) => ({
+    id:                       DRIVER_ID,
+    name:                     'Mataan Noor',
+    vehicle_number:           '0187',
+    san_username:             'san_user',
+    san_password:             'enc_pass',
+    is_active:                true,
+    scheduled_position:       100,
+    day_positions:            null,
+    max_acceptable_position:  null,
+    monitor_enabled:          false,
+    manually_removed_at:      null,
+    ...over,
+  });
+
+  beforeEach(() => {
+    setupMocks();
+    // Make poll's outbound HTTP fail fast so the immediate-tick at the end of
+    // startMonitor() returns at the catch in poll() without ever reaching the
+    // arming check. This keeps the test focused on the guard's effect.
+    Driver.findAllActive = jest.fn().mockResolvedValue([]);
+    Log.loadTodayContext = jest.fn().mockResolvedValue({
+      latestByDriver:       new Map(),
+      requeueCountByDriver: new Map(),
+      positionLogByDriver:  new Map(),
+    });
+  });
+
+  afterEach(() => {
+    stopMonitor();
+  });
+
+  test('fresh boot, no driver activity yet → guard NOT triggered (state preserved for normal arm later)', async () => {
+    // Pin time to 1 AM PT — outside the position window (3 AM–11 PM PT) — so
+    // poll()'s own arm check at line 1252 short-circuits on isWithinPositionHours.
+    // This lets us isolate the GUARD's contribution: with no DB activity, the
+    // guard must not pin positionWindowArmedForDate.
+    jest.useFakeTimers({ now: ptHour(1), doNotFake: ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval'] });
+    Driver.findAllActive.mockResolvedValue([buildActiveDriver()]);
+
+    await startMonitor();
+
+    // Guard didn't fire (no evidence of today's activity) and poll's arm
+    // check is blocked by the outside-position-hours gate. The 3 AM arm
+    // will run normally when the clock crosses into the position window.
+    expect(monitor._getPositionWindowArmedForDate()).toBeNull();
+
+    const state = monitor._getInternalState(DRIVER_ID);
+    expect(state.positionFiredToday).toBe(false);
+    expect(state.hasBeenSeen).toBe(false);
+    expect(state.inQueueFromCarryover).toBe(false);
+  });
+
+  test('mid-day restart, driver fired earlier today → guard kicks in, state preserved', async () => {
+    // The #0187 scenario: position scheduler fired at 04:37 PT, creating a
+    // position_schedule log row. Service restarts at 08:29 PT.
+    jest.useFakeTimers({ now: ptHour(8), doNotFake: ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval'] });
+    Driver.findAllActive.mockResolvedValue([buildActiveDriver()]);
+    Log.loadTodayContext.mockResolvedValue({
+      latestByDriver:       new Map([[DRIVER_ID, { status: 'success' }]]),
+      requeueCountByDriver: new Map(),
+      positionLogByDriver:  new Map([[DRIVER_ID, { driver_id: DRIVER_ID, status: 'success' }]]),
+    });
+
+    await startMonitor();
+
+    // Guard pinned positionWindowArmedForDate to today's PT date.
+    const todayPT = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+    expect(monitor._getPositionWindowArmedForDate()).toBe(todayPT);
+
+    // Critical: the driver's restored state survives. Without the guard,
+    // the next poll's arming would set inQueueFromCarryover=true and wipe
+    // positionFiredToday — recreating the bug.
+    const state = monitor._getInternalState(DRIVER_ID);
+    expect(state.positionFiredToday).toBe(true);
+    expect(state.hasBeenSeen).toBe(true);
+    expect(state.inQueueFromCarryover).toBe(false);
+  });
+
+  test('mid-day restart, manual-run driver (no position schedule) but hasBeenSeen=true → guard kicks in', async () => {
+    // Manual-mode driver: no scheduled_position, but did successfully run today.
+    // Log.findTodayLatest returns a success → hasBeenSeen=true on restore.
+    // positionFiredToday would be false (no position schedule). hasBeenSeen
+    // alone must still trip the guard — otherwise arming would set
+    // inQueueFromCarryover=true on them.
+    jest.useFakeTimers({ now: ptHour(10), doNotFake: ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval'] });
+    Driver.findAllActive.mockResolvedValue([buildActiveDriver({ scheduled_position: null })]);
+    Log.loadTodayContext.mockResolvedValue({
+      latestByDriver:       new Map([[DRIVER_ID, { status: 'success' }]]),
+      requeueCountByDriver: new Map(),
+      positionLogByDriver:  new Map(),
+    });
+
+    await startMonitor();
+
+    const todayPT = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+    expect(monitor._getPositionWindowArmedForDate()).toBe(todayPT);
+
+    const state = monitor._getInternalState(DRIVER_ID);
+    expect(state.hasBeenSeen).toBe(true);
+    expect(state.inQueueFromCarryover).toBe(false);
+  });
+
+  test('confirms the bug: WITHOUT the guard, mid-day restart re-arms and tags driver as carryover', () => {
+    // Direct re-creation of the broken behavior to lock in what the guard is
+    // defending against. Calls armPositionWindowForToday() against a state
+    // that mirrors a mid-day restart: driver fired earlier today, currently
+    // mid-queue. Should set inQueueFromCarryover=true (BAD) and wipe
+    // positionFiredToday (BAD) — exactly the conditions that broke #0187.
+    setupMocks();
+    Log.findTodayLatest.mockResolvedValue({ status: 'success' });
+    // Bypass startMonitor — just exercise the arming function directly.
+    return addWatch(DRIVER_ID, { isAuto: true }).then(() => {
+      const s = monitor._getInternalState(DRIVER_ID);
+      // Mimic restored mid-day state: driver fired earlier, still in queue.
+      s.state              = 'in_queue';
+      s.hasBeenSeen        = true;
+      s.positionFiredToday = true;
+      s.inQueueFromCarryover = false;
+
+      armPositionWindowForToday('2026-06-09');
+
+      const after = monitor._getInternalState(DRIVER_ID);
+      // These three assertions describe THE BUG. The guard prevents the
+      // poll loop from ever reaching this function on a mid-day restart.
+      expect(after.inQueueFromCarryover).toBe(true);  // wrongly tagged carryover
+      expect(after.positionFiredToday).toBe(false);    // fire flag wiped
+      expect(after.hasBeenSeen).toBe(false);           // seen flag wiped
+    });
+  });
+});
+
+// ─── parseQueue() — DEST extraction for dispatched rows ──────────────────────
+// Lock in the V Holding HTML shape: dispatched rows carry a DEST column
+// (T1/T2) which the dispatch notification needs to include in the SMS/push
+// body. Waiting rows do NOT have a DEST cell; the parser must yield no
+// terminal for them.
+
+describe('parseQueue() — dispatched DEST column', () => {
+  // Minimal V Holding fixture mirroring the real markup. Two dispatched rows
+  // (one T1, one T2) and one waiting row that should NOT pick up a terminal.
+  const HTML = `
+    <table>
+      <tr class="holdingdispatched">
+        <td style="">1</td>
+        <td style="font-weight:bold">0988</td>
+        <td style="">18:07:28</td>
+        <td style=""></td>
+        <td style="">T1</td>
+      </tr>
+      <tr class="holdingdispatched">
+        <td style="">2</td>
+        <td style="font-weight:bold">0251</td>
+        <td style="">18:07:59</td>
+        <td style="">BL</td>
+        <td style="">T2</td>
+      </tr>
+      <tr class="">
+        <td style="">7</td>
+        <td style="font-weight:bold">4372</td>
+        <td style="">18:17:08</td>
+      </tr>
+    </table>
+  `;
+
+  test('extracts T1 / T2 from dispatched rows', () => {
+    const { dispatched, dispatchedDest } = monitor._parseQueue(HTML);
+    expect(dispatched.get('988')).toBe(1);
+    expect(dispatched.get('251')).toBe(2);
+    expect(dispatchedDest.get('988')).toBe('T1');
+    expect(dispatchedDest.get('251')).toBe('T2');
+  });
+
+  test('waiting rows have no DEST entry', () => {
+    const { waiting, dispatchedDest } = monitor._parseQueue(HTML);
+    expect(waiting.get('4372')).toBe(7);
+    expect(dispatchedDest.has('4372')).toBe(false);
+  });
+
+  test('dispatched row missing DEST → null terminal (SAN hadn\'t filled it yet)', () => {
+    const html = `
+      <table>
+        <tr class="holdingdispatched">
+          <td style="">1</td>
+          <td style="font-weight:bold">0568</td>
+          <td style="">18:14:45</td>
+          <td style=""></td>
+          <td style=""></td>
+        </tr>
+      </table>
+    `;
+    const { dispatchedDest } = monitor._parseQueue(html);
+    expect(dispatchedDest.get('568')).toBeNull();
   });
 });

@@ -62,6 +62,17 @@ services:
       RESEND_API_KEY:   ${RESEND_API_KEY:-}
       EMAIL_FROM:       ${EMAIL_FROM:-SAN Queue <noreply@sanqueue.com>}
 
+      # Web Push (VAPID) — driver dispatch notifications + admin SOS alerts.
+      # Generate once with `npx web-push generate-vapid-keys`; never rotate
+      # without forcing all subscribers to re-enroll.
+      VAPID_PUBLIC_KEY:  ${VAPID_PUBLIC_KEY:-}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      VAPID_SUBJECT:     ${VAPID_SUBJECT:-mailto:admin@sanqueue.com}
+
+      # SMS (Telnyx) — driver dispatch SMS notifications.
+      TELNYX_API_KEY:     ${TELNYX_API_KEY:-}
+      TELNYX_FROM_NUMBER: ${TELNYX_FROM_NUMBER:-}
+
       # Stripe billing
       STRIPE_SECRET_KEY:      ${STRIPE_SECRET_KEY:-}
       STRIPE_PRICE_ID:        ${STRIPE_PRICE_ID:-}
@@ -112,6 +123,20 @@ services:
 
       # Position-scheduler tuning
       MONITOR_BIAS_CAP:      ${MONITOR_BIAS_CAP:-10}
+      # ±10 accuracy contract — undershoot half. Hard ceiling on how many
+      # positions EARLY a position fire may happen (drift + bias). See
+      # POS_MAX_LEAD in monitorService for the full derivation.
+      MONITOR_POS_MAX_LEAD:  ${MONITOR_POS_MAX_LEAD:-10}
+      # ±10 accuracy contract — overshoot half. Pre-armed fire sessions park a
+      # logged-in page on SAN's "Add To Queue" screen for drivers near their
+      # fire window, making the fire a ~1 s click (vs ~3.5 s cold launch) with
+      # no bot-queue wait. Memory: one shared Chromium + ~35 MB per armed
+      # driver, capped by BOT_ARMED_MAX — sized to fit the 1536M limit below
+      # alongside MONITOR_CONCURRENCY cold bots.
+      MONITOR_PREARM_ENABLED:    ${MONITOR_PREARM_ENABLED:-true}
+      MONITOR_PREARM_AHEAD_SECS: ${MONITOR_PREARM_AHEAD_SECS:-240}
+      BOT_ARMED_MAX:             ${BOT_ARMED_MAX:-10}
+      BOT_ARM_REFRESH_MS:        ${BOT_ARM_REFRESH_MS:-90000}
 
       # Bot session disk persistence path (relative to /app inside container)
       BOT_SESSION_PERSIST_PATH: ${BOT_SESSION_PERSIST_PATH:-/app/data/bot-sessions.json}

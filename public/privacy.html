@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Privacy Policy — SAN Queue</title>
+<style>
+  :root {
+    --bg:#0b1018; --fg:#e6edf3; --muted:#94a3b8;
+    --accent:#86efac; --border:rgba(255,255,255,0.1);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px 80px;
+    background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 16px; line-height: 1.65;
+  }
+  main { max-width: 720px; margin: 0 auto; }
+  h1 {
+    font-size: 28px; font-weight: 700; margin: 0 0 4px;
+  }
+  .effective { color: var(--muted); font-size: 13px; margin: 0 0 36px; }
+  h2 {
+    font-size: 18px; font-weight: 600; margin: 32px 0 10px;
+    padding-top: 8px; border-top: 1px solid var(--border);
+  }
+  h2:first-of-type { border-top: none; padding-top: 0; }
+  p, li { color: rgba(230,237,243,0.88); }
+  ul { padding-left: 22px; margin: 8px 0 12px; }
+  li { margin-bottom: 6px; }
+  a { color: var(--accent); }
+  .callout {
+    background: rgba(34,197,94,0.07);
+    border: 1px solid rgba(34,197,94,0.25);
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin: 16px 0;
+    font-size: 14px;
+  }
+  .back {
+    display: inline-block; margin-bottom: 20px;
+    color: var(--muted); text-decoration: none; font-size: 14px;
+  }
+  .back:hover { color: var(--fg); }
+  code { background: rgba(255,255,255,0.06); padding: 1px 6px; border-radius: 4px; font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <a href="/" class="back">← Back to SAN Queue</a>
+  <h1>Privacy Policy</h1>
+  <p class="effective">Effective date: June 10, 2026 · SAN Queue LLC</p>
+
+  <p>
+    SAN Queue LLC ("SAN Queue", "we", "us") provides an automated queue scheduler
+    and dispatch alert service for taxi drivers operating at San Diego International
+    Airport. This Privacy Policy explains what we collect, why, and how we handle it.
+  </p>
+
+  <h2>1. Information we collect</h2>
+  <p>When you sign up and use the service, we collect:</p>
+  <ul>
+    <li><strong>Account details</strong> — your name, email, mobile phone number, and a password you choose for our app.</li>
+    <li><strong>Airport credentials</strong> — your SAN eDispatch username, password, and vehicle (cab) number. Your SAN password is encrypted at rest using AES-256.</li>
+    <li><strong>Schedule preferences</strong> — the time- or position-based settings you configure in the app.</li>
+    <li><strong>Operational logs</strong> — records of when our automation queued or removed your vehicle, the resulting queue position, and timestamps. We use these to monitor reliability and to show you your own activity history.</li>
+    <li><strong>Billing information</strong> — handled by our payment processor Stripe. We never see or store your card details.</li>
+    <li><strong>Location data — only when you fire an SOS alert.</strong> See section 3 below.</li>
+  </ul>
+
+  <h2>2. SMS dispatch alerts</h2>
+  <div class="callout">
+    By signing up and providing your mobile phone number, you consent to receive
+    <strong>transactional SMS dispatch alerts</strong> from SAN Queue. These messages
+    tell you when San Diego Airport has dispatched your vehicle to Terminal 1 or Terminal 2,
+    along with your name, cab number, and the 25-minute window to reach the terminal.
+  </div>
+  <ul>
+    <li>Frequency: only when you are dispatched (typically 1–6 times per day; you control how often by how much you drive).</li>
+    <li>We never use your number for marketing, sales, or promotional messages.</li>
+    <li>You can stop SMS at any time by replying <code>STOP</code>. Reply <code>HELP</code> for support contact.</li>
+    <li>Standard message and data rates may apply from your mobile carrier.</li>
+    <li>SMS delivery is handled by our messaging provider Telnyx. Your phone number is shared with Telnyx solely to deliver these messages.</li>
+  </ul>
+
+  <h2>3. SOS alerts and location sharing</h2>
+  <div class="callout">
+    <strong>When you fire an SOS alert from the SAN Queue app, your live device location
+    is shared with the SAN Queue admin team so they can dispatch help.</strong>
+  </div>
+  <ul>
+    <li>The SOS feature is opt-in per event — your location is only accessed at the moment you press and hold the SOS button.</li>
+    <li>If you enable "Live Tracking" during an active SOS, your location continues to update until you cancel the alert or admin resolves it.</li>
+    <li>Outside an active SOS alert, the app does <strong>not</strong> read or transmit your location. We do not run background location tracking.</li>
+    <li>Location data attached to an SOS alert is retained alongside the alert record for incident review and may be shared with emergency services if needed.</li>
+  </ul>
+
+  <h2>4. Push notifications</h2>
+  <p>
+    If you enable browser push notifications in the app, your device registers a
+    push endpoint with our server. We use this only to deliver the same dispatch alerts
+    that go out by SMS. You can disable push notifications from your device settings
+    or by tapping the in-app toggle at any time.
+  </p>
+
+  <h2>5. How we use your information</h2>
+  <ul>
+    <li>To operate the queue automation on your behalf at SAN eDispatch.</li>
+    <li>To send you transactional dispatch SMS and push notifications.</li>
+    <li>To handle SOS alerts and contact you about an emergency.</li>
+    <li>To process your subscription billing through Stripe.</li>
+    <li>To debug and improve the service.</li>
+  </ul>
+  <p>We do not sell, rent, or trade your personal information.</p>
+
+  <h2>6. Service providers we share data with</h2>
+  <ul>
+    <li><strong>Telnyx</strong> — outbound SMS delivery (your phone number + message body).</li>
+    <li><strong>Stripe</strong> — subscription billing (your email + payment details you provide to Stripe directly).</li>
+    <li><strong>Resend</strong> — transactional emails such as password resets and email verification.</li>
+    <li><strong>Web push services</strong> (Apple, Google, Mozilla) — delivering push notifications to your device.</li>
+  </ul>
+
+  <h2>7. Data retention</h2>
+  <p>
+    We keep your account information and operational logs for as long as your account
+    is active. SOS alerts and the location data attached to them are retained for incident review.
+    You may delete your account at any time by contacting us — we will remove your data within
+    30 days, except where retention is required by law (e.g., billing records).
+  </p>
+
+  <h2>8. Your rights</h2>
+  <ul>
+    <li>Opt out of SMS at any time by replying <code>STOP</code>.</li>
+    <li>Disable push notifications from your device or in the app.</li>
+    <li>Request a copy or deletion of your data by emailing us.</li>
+    <li>Withdraw consent for SMS or location processing at any time.</li>
+  </ul>
+
+  <h2>9. Security</h2>
+  <p>
+    We encrypt sensitive credentials at rest, use HTTPS for all data in transit, and
+    restrict admin access to the operational team. No system is perfectly secure, but we
+    treat your data as if it were our own.
+  </p>
+
+  <h2>10. Changes to this policy</h2>
+  <p>
+    We may update this Privacy Policy from time to time. Material changes will be notified
+    via the app or by email before they take effect.
+  </p>
+
+  <h2>11. Contact</h2>
+  <p>
+    Questions about this policy or your data?
+    Email <a href="mailto:info@sanqueue.com">info@sanqueue.com</a>.
+  </p>
+</main>
+</body>
+</html>

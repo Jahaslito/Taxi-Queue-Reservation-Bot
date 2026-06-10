@@ -36,7 +36,7 @@ async function api(path, options = {}) {
 }
 
 // ─── Navigation ───────────────────────────────────────────────────────────────
-const CONTENT_PAGES = ['page-overview', 'page-drivers', 'page-logs', 'page-monitor', 'page-watchlist', 'page-pos-tracking', 'page-pos-diagnostics'];
+const CONTENT_PAGES = ['page-overview', 'page-drivers', 'page-logs', 'page-monitor', 'page-watchlist', 'page-pos-tracking', 'page-pos-diagnostics', 'page-sos'];
 
 let _activePage = null; // track current page for hide callbacks
 
@@ -44,6 +44,7 @@ function showPage(pageId) {
   // Fire hide callbacks for the page we're leaving
   if (_activePage === 'page-monitor'   && pageId !== 'page-monitor')   { if (typeof onMonitorPageHide   === 'function') onMonitorPageHide();   }
   if (_activePage === 'page-watchlist' && pageId !== 'page-watchlist') { if (typeof onWatchlistPageHide === 'function') onWatchlistPageHide(); }
+  if (_activePage === 'page-sos'       && pageId !== 'page-sos')       { if (typeof onSosPageHide       === 'function') onSosPageHide();       }
 
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-link').forEach(n => n.classList.remove('active'));
@@ -64,6 +65,7 @@ function showPage(pageId) {
   if (pageId === 'page-watchlist')    { if (typeof onWatchlistPageShow === 'function') onWatchlistPageShow(); }
   if (pageId === 'page-pos-tracking')    loadPosTracking();
   if (pageId === 'page-pos-diagnostics') loadPosDiagnostics();
+  if (pageId === 'page-sos')             { if (typeof onSosPageShow       === 'function') onSosPageShow();       }
 }
 
 // Wire sidebar nav links
@@ -82,6 +84,8 @@ document.querySelectorAll('.nav-link').forEach(btn => {
       document.getElementById('sidebar').style.display = 'flex';
       const saved = localStorage.getItem('adminActivePage');
       showPage(CONTENT_PAGES.includes(saved) ? saved : 'page-overview');
+      // SOS stream connects globally — alerts must surface on ANY admin page.
+      if (typeof window.startSosStream === 'function') window.startSosStream();
     } else {
       showLoginPage();
     }

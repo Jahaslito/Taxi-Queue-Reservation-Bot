@@ -26,7 +26,11 @@ function showView(viewId) {
   });
 
   // Trigger data loads for views that need fresh data every visit
-  if (viewId === 'view-dashboard') loadDashboard();
+  if (viewId === 'view-dashboard') {
+    loadDashboard();
+    if (window.bootSos) window.bootSos();
+    if (window.initDispatchAlerts) window.initDispatchAlerts();
+  }
   if (viewId === 'view-history')   loadHistory();
   if (viewId === 'view-schedule')  loadSchedule();
   if (viewId === 'view-account' && window.renderAccountSubscription) {

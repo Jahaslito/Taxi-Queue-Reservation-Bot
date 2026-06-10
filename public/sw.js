@@ -8,7 +8,7 @@
 //   3. activate handler purges any caches not matching CACHE_NAME
 //   4. clients.claim() takes over open tabs immediately
 //   5. Next navigation (or app reopen) serves the new files
-const CACHE_VERSION = 'v17';
+const CACHE_VERSION = 'v25';
 const CACHE_NAME    = `san-queue-${CACHE_VERSION}`;
 
 const PRECACHE = [
@@ -19,8 +19,10 @@ const PRECACHE = [
   '/js/driver/app.js',
   '/js/driver/auth.controller.js',
   '/js/driver/dashboard.controller.js',
+  '/js/driver/dispatchAlerts.controller.js',
   '/js/driver/history.controller.js',
   '/js/driver/schedule.controller.js',
+  '/js/driver/sos.controller.js',
   '/js/admin/app.js',
   '/js/admin/auth.controller.js',
   '/js/admin/daySchedule.controller.js',
@@ -29,6 +31,7 @@ const PRECACHE = [
   '/js/admin/monitor.controller.js',
   '/js/admin/overview.controller.js',
   '/js/admin/scheduledDrivers.controller.js',
+  '/js/admin/sos.controller.js',
   '/js/admin/watchlist.controller.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png',
@@ -51,6 +54,67 @@ self.addEventListener('activate', event => {
       ))
       .then(() => self.clients.claim())
   );
+});
+
+// ─── Web Push: SOS alerts (admin) and dispatch alerts (driver) ───────────────
+// Payload shape from the server:
+//   { title, body, tag, data: { type: 'dispatch'|'sos.new'|'sos.updated', url, ... } }
+// Type-specific handling (vibrate pattern, requireInteraction) lets each
+// notification feel right for its urgency — SOS demands attention until
+// dismissed; a dispatch notification just needs to land and stay readable.
+self.addEventListener('push', (event) => {
+  let payload = { title: 'SAN Queue', body: 'New event', data: {} };
+  try { if (event.data) payload = { ...payload, ...event.data.json() }; }
+  catch { /* non-JSON payload — keep defaults */ }
+
+  const isDispatch = payload.data?.type === 'dispatch';
+
+  event.waitUntil(
+    self.registration.showNotification(payload.title, {
+      body:      payload.body,
+      tag:       payload.tag || (isDispatch ? 'dispatch' : 'sos'),
+      icon:      '/icons/icon-192.png',
+      badge:     '/icons/icon-192.png',
+      data:      payload.data || {},
+      // SOS = stays until clicked (admin must see it).
+      // Dispatch = OS controls when it's dismissed — driver may already be moving.
+      requireInteraction: !isDispatch,
+      vibrate:   isDispatch ? [120, 60, 120] : [200, 100, 200, 100, 200],
+    }),
+  );
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const data = event.notification.data || {};
+  const url  = data.url || (data.type === 'dispatch' ? '/' : '/admin');
+  const focusToken = data.type === 'dispatch' ? '/' : '/admin';
+
+  event.waitUntil((async () => {
+    const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    // Focus an existing tab on the matching surface if there is one.
+    // /admin match must be exact-ish to avoid matching the driver root '/'.
+    for (const c of all) {
+      const path = new URL(c.url).pathname;
+      if (focusToken === '/admin' ? path.startsWith('/admin') : !path.startsWith('/admin')) {
+        c.focus();
+        return;
+      }
+    }
+    await self.clients.openWindow(url);
+  })());
+});
+
+// ─── Background Sync: flush queued SOS alerts when network returns ───────────
+// Driver SOS controller falls back to localStorage + this sync tag when the
+// network is down at the moment of fire. There's no API access from the SW,
+// so we just wake a client tab to do the actual POST.
+self.addEventListener('sync', (event) => {
+  if (event.tag !== 'sos-flush') return;
+  event.waitUntil((async () => {
+    const all = await self.clients.matchAll({ type: 'window' });
+    for (const c of all) c.postMessage({ type: 'sos-flush' });
+  })());
 });
 
 self.addEventListener('fetch', event => {

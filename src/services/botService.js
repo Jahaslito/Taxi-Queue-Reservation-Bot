@@ -1042,6 +1042,460 @@ async function warmSession({ sanUsername, sanPassword, vehicleNumber }) {
   }
 }
 
+// ─── Pre-armed fire sessions ──────────────────────────────────────────────────
+//
+// WHY: the position scheduler's landing error is
+//        (queue growth between fire decision and SAN assigning the slot)
+//      − (lead it fired early by).
+// The lead is clamped to the ±10 undershoot budget (see monitorService
+// POS_MAX_LEAD), so the only remaining lever on OVERSHOOT is the decision→slot
+// latency. A cold fire costs ~3.5 s (Chromium launch + navigate + search) and
+// queues behind MONITOR_CONCURRENCY (Jun 09: the second batch of simultaneous
+// fires waited ~3.5 s extra and landed +25 past the first). During a 7/s burst
+// every second of latency costs 7 positions.
+//
+// HOW: for each driver approaching their fire window, park a logged-in page on
+// SAN's vehicle-search result with the "Add To Queue" button already visible.
+// Firing is then a single click + WAIT-screen confirmation (~1 s), and needs no
+// browser launch — so it also bypasses the launch-capped jobQueue entirely.
+//
+// SHAPE: one shared Chromium for ALL armed sessions (contexts are ~35 MB each
+// vs ~180 MB per browser; the droplet caps the app at 1536 MB) with one
+// context+page per driver. monitorService declares the desired set every poll
+// via syncFireSessions(wanted) and this module converges: arms the missing,
+// refreshes the stale, disarms the no-longer-wanted. Every path degrades to
+// the cold bot — fireArmedSession() returns null rather than throwing, and
+// schedulerService falls through to addToQueue().
+//
+// SAN-side safety: arming performs the same login + search any bot run does,
+// once per driver per morning (+ a re-search every ~90 s as keep-alive) — far
+// below the polling traffic. Credential failures register the same day-scoped
+// lockout the warmer uses, so bad passwords can't cause login storms.
+
+const credentialLockout = require('./credentialLockoutService');
+
+// Hard cap on simultaneously armed contexts (memory guard).
+const ARMED_MAX             = parseInt(process.env.BOT_ARMED_MAX             ?? '10', 10);
+// Re-validate a parked page when its last check is older than this.
+const ARM_REFRESH_MS        = parseInt(process.env.BOT_ARM_REFRESH_MS        ?? '90000', 10);
+// Skip the keep-alive refresh when the fire is expected within this many
+// seconds — never have the page mid-navigation at the moment we need to click.
+const ARM_REFRESH_SKIP_SECS = parseInt(process.env.BOT_ARM_REFRESH_SKIP_SECS ?? '45', 10);
+// After a failed arm attempt, don't retry this driver for this long.
+const ARM_RETRY_COOLDOWN_MS = parseInt(process.env.BOT_ARM_RETRY_COOLDOWN_MS ?? '180000', 10);
+// Arm/refresh operations run through a small semaphore — arming is a full
+// login+search (~4 s) and happens off the critical path, so 2 wide is plenty.
+const ARM_OPS_CONCURRENCY   = parseInt(process.env.BOT_ARM_OPS_CONCURRENCY   ?? '2', 10);
+// Ceiling for the fire click → WAIT-screen confirmation. Normal is < 2 s; if
+// SAN is slower than this the cold fallback wouldn't have been faster anyway,
+// and the fallback's already-queued detection makes a double-submit harmless.
+const ARM_FIRE_TIMEOUT_MS   = parseInt(process.env.BOT_ARM_FIRE_TIMEOUT_MS   ?? '12000', 10);
+
+/** driverId → armed session record */
+const armedSessions = new Map();
+// driverId → epoch ms until which arm attempts are suppressed (failure cooldown)
+const armCooldownUntil = new Map();
+// driverIds with an arm operation currently in flight (dedup across sync ticks)
+const armingInFlight = new Set();
+
+let armedBrowser = null;          // shared Chromium — lazily launched, closed when idle
+let armedBrowserLaunching = null; // in-flight launch promise (dedup)
+
+// Tiny semaphore for arm/refresh ops. Deliberately local — schedulerService's
+// BotSemaphore caps *browser launches*; this caps page work inside the one
+// shared browser, a different resource.
+let armOpsActive = 0;
+const armOpsWaiting = [];
+function acquireArmOp() {
+  if (armOpsActive < ARM_OPS_CONCURRENCY) { armOpsActive++; return Promise.resolve(); }
+  return new Promise((resolve) => armOpsWaiting.push(resolve));
+}
+function releaseArmOp() {
+  const next = armOpsWaiting.shift();
+  if (next) next();
+  else armOpsActive = Math.max(0, armOpsActive - 1);
+}
+
+/**
+ * Launch (or reuse) the shared browser for armed sessions.
+ * No --single-process here: armed contexts all hit the same site, so default
+ * Chromium shares one renderer across them anyway — and a renderer crash then
+ * can't take the browser process down with it. 'disconnected' wipes the map:
+ * every parked page died with the browser, and the next sync re-arms cleanly.
+ */
+async function ensureArmedBrowser() {
+  if (armedBrowser?.isConnected()) return armedBrowser;
+  if (armedBrowserLaunching) return armedBrowserLaunching;
+
+  armedBrowserLaunching = chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+  }).then((browser) => {
+    browser.on('disconnected', () => {
+      if (armedBrowser === browser) {
+        armedBrowser = null;
+        if (armedSessions.size > 0) {
+          console.warn(`[Arm] shared browser disconnected — dropping ${armedSessions.size} armed session(s); next sync re-arms`);
+          armedSessions.clear();
+        }
+      }
+    });
+    armedBrowser = browser;
+    console.log('[Arm] shared browser launched');
+    return browser;
+  }).finally(() => { armedBrowserLaunching = null; });
+
+  return armedBrowserLaunching;
+}
+
+/** Close the shared browser once nothing is armed (memory back to baseline). */
+async function closeArmedBrowserIfIdle() {
+  // armingInFlight guard: an arm op building its context holds no map entry
+  // yet — closing the browser under it would kill the arm for nothing.
+  if (armedSessions.size === 0 && armingInFlight.size === 0 && armedBrowser) {
+    const b = armedBrowser;
+    armedBrowser = null;
+    await b.close().catch(() => {});
+    console.log('[Arm] shared browser closed (no armed sessions)');
+  }
+}
+
+/**
+ * Drive a page to the vehicle-search result with "Add To Queue" visible.
+ * Used by armFireSession on a fresh context. Resolves to:
+ *   'armed'                 — button visible, page parked and ready
+ *   'already_queued'        — WAIT screen: the driver is in the queue already
+ *   'vehicle_not_available' — SAN business-rule rejection (retryable later)
+ *   'not_found'             — vehicle number unknown to SAN
+ * Throws on navigation/timeout/credential errors.
+ */
+async function driveToAddButton(page, { sanUsername, sanPassword, vehicleNumber }) {
+  await page.goto(SAN_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+  await page.waitForURL(
+    (url) => url.href.includes(OIDC_HOST) || url.href.includes(APP_HOST),
+    { timeout: TIMEOUT },
+  );
+
+  if (page.url().includes(OIDC_HOST)) {
+    // Restored cookies rejected (or none) — full login, same flow as addToQueue.
+    forgetSession(sanUsername);
+    await page.waitForSelector('input[placeholder="Enter Username"]', { timeout: TIMEOUT });
+    await page.fill('input[placeholder="Enter Username"]', sanUsername);
+    await page.fill('input[placeholder="Enter Password"]', sanPassword);
+    await page.click('button:has-text("Log In")');
+
+    const winner = await Promise.race([
+      page.waitForURL(`**/${APP_HOST}/**`, { timeout: NAV_TIMEOUT }).then(() => 'redirected'),
+      page.locator('text=/Invalid username or password/i').first()
+        .waitFor({ state: 'visible', timeout: NAV_TIMEOUT })
+        .then(() => 'invalid_credentials'),
+    ]);
+    if (winner === 'invalid_credentials') {
+      // Literal "Invalid SAN" — what credentialLockout.isCredentialError matches.
+      throw new Error('Invalid SAN eDispatch username or password — check your credentials');
+    }
+  }
+
+  // Reaching the app proves the session — snapshot it for every other bot path.
+  const storageState = await page.context().storageState();
+  saveSession(sanUsername, storageState);
+
+  await page.waitForFunction(
+    () => {
+      const t = document.body.innerText;
+      return document.querySelector('input[placeholder="Vehicle Dispatch Name"]') !== null
+        || t.includes('Remove From Queue')
+        || t.includes('Dispatched: T');
+    },
+    null,
+    { timeout: TIMEOUT },
+  );
+
+  if (await isWaitScreen(page)) return 'already_queued';
+
+  await page.fill('input[placeholder="Vehicle Dispatch Name"]', String(vehicleNumber));
+  await page.click('button:has-text("Search")');
+  await page.waitForFunction(
+    (needles) => needles.some((s) => document.body.innerText.includes(s)),
+    SEARCH_RESULT_STRINGS,
+    { timeout: TIMEOUT },
+  );
+
+  const bodyText = await page.textContent('body').catch(() => '');
+  if (bodyText.includes(SAN_TEXT.VEHICLE_NOT_AVAILABLE)) return 'vehicle_not_available';
+  if (await isWaitScreen(page))                           return 'already_queued';
+
+  const buttonVisible = await page
+    .isVisible(`button:has-text("${SAN_TEXT.ADD_TO_QUEUE_BUTTON}")`)
+    .catch(() => false);
+  return buttonVisible ? 'armed' : 'not_found';
+}
+
+/** Dispose one armed session's context. Safe to call twice. */
+async function disarmFireSession(driverId, reason) {
+  const session = armedSessions.get(driverId);
+  if (!session) return;
+  armedSessions.delete(driverId);
+  await session.context.close().catch(() => {});
+  console.log(`[Arm] #${session.vehicleNumber} disarmed (${reason})`);
+  await closeArmedBrowserIfIdle();
+}
+
+/** Dispose everything (end of position window / shutdown). No-op when empty. */
+async function disarmAllFireSessions(reason) {
+  if (armedSessions.size === 0) return;
+  const ids = [...armedSessions.keys()];
+  console.log(`[Arm] disarming all ${ids.length} session(s) — ${reason}`);
+  for (const id of ids) await disarmFireSession(id, reason);
+}
+
+function hasArmedFireSession(driverId) {
+  return armedSessions.has(driverId);
+}
+
+/** Lightweight stats for the admin/monitor UI and tests. */
+function armedFireSessionStats() {
+  return {
+    armed:    armedSessions.size,
+    arming:   armingInFlight.size,
+    browser:  !!armedBrowser?.isConnected(),
+    sessions: [...armedSessions.values()].map((s) => ({
+      driverId:       s.driverId,
+      vehicleNumber:  s.vehicleNumber,
+      armedAt:        s.armedAt,
+      lastVerifiedAt: s.lastVerifiedAt,
+    })),
+  };
+}
+
+/**
+ * Arm one driver: fresh context in the shared browser, parked on the search
+ * result. Failures cool the driver down (ARM_RETRY_COOLDOWN_MS) so a broken
+ * account can't login-storm SAN at 1 s poll cadence; credential failures
+ * additionally register the standard day-scoped lockout.
+ */
+async function armFireSession({ driverId, vehicleNumber, getCredentials }) {
+  if (armedSessions.has(driverId) || armingInFlight.has(driverId)) return;
+  if ((armCooldownUntil.get(driverId) ?? 0) > Date.now()) return;
+
+  armingInFlight.add(driverId);
+  await acquireArmOp();
+
+  let context = null;
+  try {
+    const creds = await getCredentials();
+    if (!creds) throw new Error('credentials unavailable');
+    const { sanUsername, sanPassword } = creds;
+
+    const browser      = await ensureArmedBrowser();
+    const proxyConfig  = getProxyConfig();
+    const savedSession = getStoredSession(sanUsername);
+
+    context = await browser.newContext({
+      userAgent:    'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+      viewport:     { width: 390, height: 844 },
+      permissions:     [],
+      acceptDownloads: false,
+      storageState:    savedSession,
+      ...(proxyConfig ? { proxy: proxyConfig } : {}),
+    });
+    const page = await context.newPage();
+    await page.route('**/*', (route) => {
+      const type = route.request().resourceType();
+      if (['image', 'font', 'stylesheet', 'media'].includes(type)) return route.abort();
+      return route.continue();
+    });
+
+    const outcome = await driveToAddButton(page, { sanUsername, sanPassword, vehicleNumber });
+
+    if (outcome !== 'armed') {
+      // already_queued → monitor's next poll flips hasBeenSeen and drops the
+      // driver from the wanted set; not_available/not_found can clear on SAN's
+      // side, so the cooldown lets us re-try a few minutes later.
+      armCooldownUntil.set(driverId, Date.now() + ARM_RETRY_COOLDOWN_MS);
+      await context.close().catch(() => {});
+      console.log(`[Arm] #${vehicleNumber} not armed (${outcome}) — cooldown ${ARM_RETRY_COOLDOWN_MS / 1000}s`);
+      await closeArmedBrowserIfIdle();
+      return;
+    }
+
+    armedSessions.set(driverId, {
+      driverId,
+      vehicleNumber,
+      sanUsername,
+      context,
+      page,
+      armedAt:        Date.now(),
+      lastVerifiedAt: Date.now(),
+      refreshing:     null,
+    });
+    console.log(`[Arm] ✓ #${vehicleNumber} armed — fire is now a single click`);
+  } catch (err) {
+    armCooldownUntil.set(driverId, Date.now() + ARM_RETRY_COOLDOWN_MS);
+    if (context) await context.close().catch(() => {});
+    if (credentialLockout.isCredentialError(err.message)) {
+      credentialLockout.lockOut(driverId, `armer: ${err.message}`);
+    }
+    console.warn(`[Arm] ✗ #${vehicleNumber} arm failed: ${err.message} — cooldown ${ARM_RETRY_COOLDOWN_MS / 1000}s`);
+    await closeArmedBrowserIfIdle();
+  } finally {
+    armingInFlight.delete(driverId);
+    releaseArmOp();
+  }
+}
+
+/**
+ * Keep-alive: re-run the search on the parked page so (a) the SAN session
+ * stays active server-side and (b) we notice a dead page BEFORE fire time.
+ * Any failure disarms — the next sync tick re-arms if the driver still wants
+ * a session. Stores the in-flight promise so a fire arriving mid-refresh can
+ * briefly await it instead of clicking on a navigating page.
+ */
+function refreshArmedSession(driverId) {
+  const session = armedSessions.get(driverId);
+  if (!session || session.refreshing) return session?.refreshing ?? Promise.resolve();
+
+  session.refreshing = (async () => {
+    await acquireArmOp();
+    try {
+      const { page, vehicleNumber } = session;
+      await page.fill('input[placeholder="Vehicle Dispatch Name"]', String(vehicleNumber));
+      await page.click('button:has-text("Search")');
+      await page.waitForFunction(
+        (needles) => needles.some((s) => document.body.innerText.includes(s)),
+        SEARCH_RESULT_STRINGS,
+        { timeout: 15000 },
+      );
+      const stillArmed = await page
+        .isVisible(`button:has-text("${SAN_TEXT.ADD_TO_QUEUE_BUTTON}")`)
+        .catch(() => false);
+      if (!stillArmed) {
+        // WAIT screen (someone queued the driver) or SAN state change —
+        // either way this page can no longer fire.
+        await disarmFireSession(driverId, 'refresh found page no longer fireable');
+        return;
+      }
+      session.lastVerifiedAt = Date.now();
+    } catch (err) {
+      console.warn(`[Arm] #${session.vehicleNumber} keep-alive failed: ${err.message}`);
+      await disarmFireSession(driverId, 'keep-alive failure');
+    } finally {
+      session.refreshing = null;
+      releaseArmOp();
+    }
+  })();
+  return session.refreshing;
+}
+
+/**
+ * Fire a pre-armed session: click "Add To Queue", confirm the WAIT screen,
+ * read the assigned position. Returns an addToQueue-shaped result, or NULL
+ * meaning "no armed shot was taken" — caller falls back to the cold bot.
+ * The context is consumed either way: one armed session, one shot.
+ */
+async function fireArmedSession(driverId) {
+  const session = armedSessions.get(driverId);
+  if (!session) return null;
+
+  const startTime = Date.now();
+  const { page, vehicleNumber } = session;
+
+  // A keep-alive refresh may be mid-navigation — give it a moment to settle
+  // rather than racing a click against it. Refreshes are skipped inside the
+  // imminent-fire window (ARM_REFRESH_SKIP_SECS) so this rarely engages.
+  if (session.refreshing) {
+    await Promise.race([
+      session.refreshing,
+      new Promise((resolve) => setTimeout(resolve, 2000)),
+    ]).catch(() => {});
+    if (!armedSessions.has(driverId)) return null; // refresh disarmed it
+  }
+
+  try {
+    await page.click(`button:has-text("${SAN_TEXT.ADD_TO_QUEUE_BUTTON}")`, { timeout: 2000 });
+    await page.waitForFunction(
+      (needles) => needles.some((s) => document.body.innerText.includes(s)),
+      [SAN_TEXT.REMOVE_FROM_QUEUE, SAN_TEXT.VEHICLE_NOT_AVAILABLE],
+      { timeout: ARM_FIRE_TIMEOUT_MS },
+    );
+
+    const bodyText = await page.textContent('body').catch(() => '');
+    if (bodyText.includes(SAN_TEXT.VEHICLE_NOT_AVAILABLE)) {
+      console.log(`[Arm] #${vehicleNumber} → ${SAN_TEXT.VEHICLE_NOT_AVAILABLE} (SAN business-rule rejection)`);
+      return {
+        success:             false,
+        vehicleNotAvailable: true,
+        viaArmedSession:     true,
+        durationMs:          Date.now() - startTime,
+        error:               DRIVER_ERROR_COPY.VEHICLE_NOT_AVAILABLE,
+        message:             DRIVER_ERROR_COPY.VEHICLE_NOT_AVAILABLE,
+      };
+    }
+
+    const info = await extractQueueInfo(page);
+    console.log(`[Arm] ⚡ #${vehicleNumber} fired via armed session in ${Date.now() - startTime} ms → position ${info.position}`);
+    return {
+      success:         true,
+      alreadyQueued:   false,
+      viaArmedSession: true,
+      ...info,
+      durationMs:      Date.now() - startTime,
+      message:         `Added to queue — Position: ${info.position}, Location: ${info.location}`,
+    };
+  } catch (err) {
+    // Click/confirm failed — return null so the cold bot takes over. If our
+    // click actually landed despite the error, the fallback finds the WAIT
+    // screen and reports alreadyQueued with the real position (idempotent).
+    console.warn(`[Arm] ✗ #${vehicleNumber} armed fire failed (${err.message}) — falling back to cold bot`);
+    await debugCapture(page, vehicleNumber, 'armed_fire_error').catch(() => {});
+    return null;
+  } finally {
+    await disarmFireSession(driverId, 'fire attempt consumed the session');
+  }
+}
+
+/**
+ * Reconcile armed sessions with the desired set (called every monitor poll).
+ *
+ * wanted: [{ driverId, vehicleNumber, secondsUntilFire, getCredentials }]
+ *   getCredentials: async () => ({ sanUsername, sanPassword }) | null
+ *   — credentials are only fetched/decrypted when an arm actually happens.
+ *
+ * Fire-and-forget per driver; returns after this tick's operations settle so
+ * tests can await deterministically. Self-throttling: in-flight dedup, failure
+ * cooldowns, ARMED_MAX cap, and the arm-ops semaphore all live below this.
+ */
+async function syncFireSessions(wanted) {
+  const wantedById = new Map(wanted.map((w) => [w.driverId, w]));
+
+  // Disarm sessions whose driver no longer wants one (fired, seen, target gone).
+  const ops = [];
+  for (const driverId of [...armedSessions.keys()]) {
+    if (!wantedById.has(driverId)) ops.push(disarmFireSession(driverId, 'no longer scheduled'));
+  }
+
+  // Arm the closest-to-fire first; the cap bounds memory, and anyone past the
+  // cap simply stays on the cold path (correct, just slower).
+  const ranked = [...wanted].sort(
+    (a, b) => (a.secondsUntilFire ?? Infinity) - (b.secondsUntilFire ?? Infinity),
+  );
+  let budget = ARMED_MAX;
+  for (const w of ranked) {
+    if (budget <= 0) break;
+    budget--;
+    const session = armedSessions.get(w.driverId);
+    if (session) {
+      const stale    = Date.now() - session.lastVerifiedAt > ARM_REFRESH_MS;
+      const imminent = (w.secondsUntilFire ?? Infinity) < ARM_REFRESH_SKIP_SECS;
+      if (stale && !imminent && !session.refreshing) ops.push(refreshArmedSession(w.driverId));
+    } else if (!armingInFlight.has(w.driverId)) {
+      ops.push(armFireSession(w));
+    }
+  }
+
+  await Promise.allSettled(ops);
+}
+
 module.exports = {
   addToQueue,
   removeFromQueue,
@@ -1053,6 +1507,12 @@ module.exports = {
   getStoredSession,
   forgetSession,
   SESSION_TTL_MS,
+  // Pre-armed fire sessions (±10 position accuracy — see section above).
+  syncFireSessions,
+  fireArmedSession,
+  hasArmedFireSession,
+  disarmAllFireSessions,
+  armedFireSessionStats,
   // Exposed for unit tests — pure failure classifier.
   _classifyFailure:               classifyFailure,
   _extractKnownErrorFromText:     extractKnownErrorFromText,

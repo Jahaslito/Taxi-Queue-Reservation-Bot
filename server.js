@@ -92,6 +92,17 @@ app.get('/api/config', (req, res) => {
   });
 });
 
+// ─── Legal pages (must precede the SPA fallback so they don't get swallowed) ──
+// /privacy and /terms are referenced from the signup consent notice and submitted
+// to Telnyx as part of toll-free verification. Plain static HTML — no SPA shell,
+// no JS — so reviewers see the policy text immediately without navigating.
+app.get('/privacy', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'privacy.html'));
+});
+app.get('/terms', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'terms.html'));
+});
+
 // ─── SPA fallbacks ────────────────────────────────────────────────────────────
 app.get('/admin*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'admin.html'));

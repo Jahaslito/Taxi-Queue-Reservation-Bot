@@ -6,6 +6,8 @@ const { apiLimiter }            = require('../middleware/rateLimiter');
 const requireSubscription       = require('../middleware/requireSubscription');
 const validate                  = require('../middleware/validate');
 const { getProfile, updateProfile, getLogs, getTodayStatus, triggerSelf, removeFromQueue } = require('../controllers/driverController');
+const sosController             = require('../controllers/sosController');
+const driverPushController      = require('../controllers/driverPushController');
 
 const router = Router();
 
@@ -15,6 +17,15 @@ router.use(authenticateDriver);
 // Profile is intentionally NOT behind requireSubscription — the frontend needs
 // it on boot to determine which state screen to show (verify email / billing).
 router.get('/profile', getProfile);
+
+// SOS endpoints — INTENTIONALLY bypass requireSubscription. A driver in
+// trouble must be able to summon help regardless of email verification or
+// billing status. Auth is still required (authenticateDriver above).
+router.post('/sos',                       sosController.create);
+router.get( '/sos/open',                  sosController.getOpenForDriver);
+router.post('/sos/:id/location',          sosController.pushLocation);
+router.post('/sos/:id/live-tracking',     sosController.setLiveTracking);
+router.post('/sos/:id/cancel',            sosController.cancel);
 
 // All other driver endpoints require a verified email + active subscription.
 router.use(requireSubscription);
@@ -46,5 +57,10 @@ router.get('/logs',          getLogs);
 router.get('/status/today',  getTodayStatus);
 router.post('/trigger',      triggerSelf);
 router.post('/remove-queue', removeFromQueue);
+
+// Dispatch push notifications — opt-in per device.
+router.get( '/push/config',       driverPushController.config);
+router.post('/push/subscribe',    driverPushController.subscribe);
+router.post('/push/unsubscribe',  driverPushController.unsubscribe);
 
 module.exports = router;

@@ -39,4 +39,15 @@ module.exports = {
   stripeSecretKey:     process.env.STRIPE_SECRET_KEY     || null,
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || null,
   stripePriceId:       process.env.STRIPE_PRICE_ID       || null,
+  // Web Push (optional — generates with `npx web-push generate-vapid-keys`).
+  // If unset, SSE in-app SOS alerts still work; only the background browser
+  // push notifications are disabled. See sosService.js.
+  vapidPublicKey:      process.env.VAPID_PUBLIC_KEY      || null,
+  vapidPrivateKey:     process.env.VAPID_PRIVATE_KEY     || null,
+  vapidSubject:        process.env.VAPID_SUBJECT         || 'mailto:admin@sanqueue.com',
+  // Telnyx SMS (optional — drives the dispatch SMS notification in
+  // smsService.js). Cheapest of the SMS providers evaluated; falls back to a
+  // no-op when unset so dev environments don't need credentials.
+  telnyxApiKey:        process.env.TELNYX_API_KEY        || null,
+  telnyxFromNumber:    process.env.TELNYX_FROM_NUMBER    || null,
 };

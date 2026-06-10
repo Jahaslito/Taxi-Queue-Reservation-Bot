@@ -520,7 +520,7 @@
       <input type="tel" id="reg-phone" placeholder="+1 619 555 0123" />
     </div>
     <div class="form-group">
-      <label>Email <span style="color:var(--red);font-size:11px;">Required for billing</span></label>
+      <label>Email</label>
       <input type="email" id="reg-email" placeholder="john@example.com" required />
     </div>
     <div class="form-group">
@@ -545,6 +545,24 @@
     <p style="font-size:12px;color:var(--muted);margin-top:8px;margin-bottom:16px;">
       🤖 You'll choose your queue schedule (time-based or position-based) after creating your account.
     </p>
+
+    <!-- SMS + location consent — required for Telnyx toll-free verification. -->
+    <div id="consent-notice" style="
+      background:rgba(34,197,94,0.08);
+      border:1px solid rgba(34,197,94,0.3);
+      border-radius:12px;
+      padding:12px 14px;
+      margin:0 0 16px;
+      font-size:12px;
+      line-height:1.5;
+      color:var(--fg);">
+      <div style="font-weight:600;margin-bottom:6px;color:#86efac;">By creating your account, you agree that:</div>
+      <ul style="margin:0;padding-left:18px;color:rgba(255,255,255,0.8);">
+        <li>SAN Queue will send you transactional SMS dispatch alerts (your name, cab number, and assigned terminal) when you're dispatched at the airport. Reply STOP to opt out at any time. Msg &amp; data rates may apply.</li>
+        <li style="margin-top:4px;">If you fire an SOS alert from the app, your live location will be shared with the SAN Queue admin team so they can dispatch help.</li>
+        <li style="margin-top:4px;">You've read and accept our <a href="/terms" target="_blank" style="color:#86efac;text-decoration:underline;">Terms</a> and <a href="/privacy" target="_blank" style="color:#86efac;text-decoration:underline;">Privacy Policy</a>.</li>
+      </ul>
+    </div>
 
     <div class="error-msg" id="reg-error"></div>
     <button class="btn btn-primary" id="btn-register">Create Account</button>
@@ -701,7 +719,72 @@
     </div>
   </div>
 
+  <!-- ── SOS — Idle button (hold-to-confirm) ──────────────────────────────── -->
+  <button id="btn-sos" style="
+    position:relative; overflow:hidden;
+    width:100%; margin-bottom:12px;
+    background:linear-gradient(135deg, rgba(240,90,91,0.18), rgba(220,38,38,0.18));
+    border:1px solid rgba(240,90,91,0.55); border-radius:16px;
+    padding:18px 20px; display:flex; align-items:center; gap:14px;
+    cursor:pointer; text-align:left; user-select:none;
+    box-shadow:0 4px 20px rgba(240,90,91,0.2), 0 2px 0 rgba(240,90,91,0.35), 0 1px 0 rgba(255,255,255,0.06) inset;
+    transition:transform .1s, box-shadow .1s, opacity .15s;
+    -webkit-tap-highlight-color: transparent; touch-action: manipulation;">
+    <div style="font-size:26px;line-height:1;flex-shrink:0;">🚨</div>
+    <div style="flex:1;">
+      <div style="font-weight:800;color:#fff;font-size:15px;letter-spacing:0.02em;">Emergency SOS</div>
+      <div id="btn-sos-sub" style="font-size:12px;color:rgba(252,165,165,0.85);margin-top:3px;">Press and hold for 2 seconds to alert admin</div>
+    </div>
+    <!-- progress ring during hold -->
+    <div id="btn-sos-progress" style="
+      position:absolute; left:0; bottom:0; height:3px;
+      width:0%; background:linear-gradient(90deg,#F05A5B,#dc2626);
+      transition:width 80ms linear;"></div>
+  </button>
+
+  <!-- ── SOS — Active panel (replaces button while an alert is in flight) ── -->
+  <div id="sos-active-panel" style="
+    display:none; margin-bottom:12px;
+    background:linear-gradient(135deg, rgba(240,90,91,0.18), rgba(220,38,38,0.10));
+    border:1px solid rgba(240,90,91,0.55); border-radius:16px;
+    padding:16px 18px;
+    box-shadow:0 4px 20px rgba(240,90,91,0.2);">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <div style="width:10px;height:10px;border-radius:50%;background:#F05A5B;box-shadow:0 0 10px #F05A5B;animation:pulse 1.2s ease-in-out infinite;"></div>
+      <div style="flex:1;font-weight:800;color:#fff;font-size:15px;letter-spacing:0.02em;">SOS Alert Active</div>
+      <div id="sos-active-status" style="font-size:11px;color:#fca5a5;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Waiting…</div>
+    </div>
+    <div id="sos-active-detail" style="font-size:13px;color:var(--muted2);line-height:1.5;margin-bottom:12px;">
+      Admin has been notified. Help is on the way.
+    </div>
+    <div id="sos-location-status" style="font-size:12px;color:var(--muted);margin-bottom:12px;">📍 Locating you…</div>
+
+    <!-- Shown only when geolocation was denied / failed. Lets the driver retry without leaving the screen. -->
+    <div id="sos-location-help" style="display:none; font-size:12px; background:rgba(245,166,35,0.08); border:1px solid rgba(245,166,35,0.35); border-radius:10px; padding:10px 12px; margin-bottom:10px;">
+      <div style="font-weight:700;color:#fbbf24;margin-bottom:4px;">Location access blocked</div>
+      <div style="color:var(--muted2);line-height:1.5;margin-bottom:8px;">
+        Admin can still see your alert, but won't know your exact spot. If your browser remembered an earlier "Deny", you may need to enable Location for this site in browser settings.
+      </div>
+      <button id="btn-sos-retry-location" class="btn btn-ghost" style="width:100%;padding:8px 12px;font-size:13px;color:#fbbf24;border-color:rgba(245,166,35,0.35);">
+        Try sharing location again
+      </button>
+    </div>
+
+    <label style="display:flex;align-items:center;gap:10px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:12px;padding:10px 12px;margin-bottom:10px;cursor:pointer;">
+      <input type="checkbox" id="sos-live-toggle" style="width:18px;height:18px;accent-color:#F05A5B;">
+      <div style="flex:1;">
+        <div style="font-size:13px;font-weight:600;color:#fff;">Share live location</div>
+        <div style="font-size:11px;color:var(--muted);">Sends GPS updates every ~12s while alert is open</div>
+      </div>
+    </label>
+
+    <button id="btn-sos-cancel" class="btn btn-ghost" style="width:100%;font-size:14px;color:#fca5a5;border-color:rgba(240,90,91,0.35);">
+      Cancel SOS Alert
+    </button>
+  </div>
+
   <!-- Re-queue button -->
+
   <button id="btn-requeue" style="
     width:100%; margin-bottom:12px;
     background:linear-gradient(135deg,rgba(0,180,255,0.18),rgba(108,99,255,0.18));
@@ -736,6 +819,24 @@
       <div id="btn-remove-queue-sub" style="font-size:12px;color:rgba(252,165,165,0.7);margin-top:3px;">Done driving for today — opt out of auto-requeue</div>
     </div>
     <div id="btn-remove-queue-spinner" style="display:none;flex-shrink:0;"><span class="spinner"></span></div>
+  </button>
+
+  <!-- Enable dispatch alerts button — toggles SMS + push notifications for this driver/device -->
+  <button id="btn-dispatch-alerts" style="
+    display:flex;
+    width:100%; margin-bottom:16px;
+    background:linear-gradient(135deg,rgba(34,197,94,0.12),rgba(59,130,246,0.12));
+    border:1px solid rgba(34,197,94,0.4); border-radius:16px;
+    padding:14px 20px; align-items:center; gap:14px;
+    cursor:pointer; text-align:left;
+    transition:transform .1s, box-shadow .1s, opacity .15s;
+    -webkit-tap-highlight-color: transparent;">
+    <div id="btn-dispatch-alerts-icon" style="font-size:22px;line-height:1;flex-shrink:0;">🔔</div>
+    <div style="flex:1;">
+      <div id="btn-dispatch-alerts-label" style="font-weight:700;color:#86efac;font-size:14px;">Enable dispatch alerts</div>
+      <div id="btn-dispatch-alerts-sub" style="font-size:12px;color:rgba(134,239,172,0.75);margin-top:3px;">Get a push + SMS when you're sent to T1 or T2</div>
+    </div>
+    <div id="btn-dispatch-alerts-spinner" style="display:none;flex-shrink:0;"><span class="spinner"></span></div>
   </button>
 
   <!-- Confirm modal for remove-from-queue -->
@@ -976,6 +1077,8 @@
 <script src="/js/driver/schedule.controller.js"></script>
 <script src="/js/driver/history.controller.js"></script>
 <script src="/js/driver/billing.controller.js"></script>
+<script src="/js/driver/sos.controller.js"></script>
+<script src="/js/driver/dispatchAlerts.controller.js"></script>
 <script src="/js/driver/app.js"></script>
 <script>
   if ('serviceWorker' in navigator) {

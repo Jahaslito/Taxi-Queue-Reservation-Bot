@@ -718,14 +718,14 @@ function snap(state) {
 }
 
 // ─── Re-queue trigger (used by auto-detection & manual run) ──────────────────
-async function _runBot(driverId, state, triggerType = 'monitor_requeue') {
+async function _runBot(driverId, state, triggerType = 'monitor_requeue', botOpts = {}) {
   // Lazy-require to break circular dependency (monitorService ← schedulerService).
   const { runBotForDriver } = require('./schedulerService');
 
   const driver = await Driver.findByIdWithCredentials(driverId);
   if (!driver || !driver.is_active) throw new Error('Driver not found or inactive');
 
-  const result = await runBotForDriver(driver, triggerType);
+  const result = await runBotForDriver(driver, triggerType, botOpts);
 
   // Record execution time for the rolling estimator used by drift prediction.
   // Only genuine *new* adds belong in this pool — fast paths and failure paths
@@ -932,8 +932,19 @@ async function triggerPositionSchedule(driverId, state, effectivePosition, {
     state.lastPosDecision   = 'fired';
   }).catch((err) => console.error('[PosTracking] Failed to upsert fired row:', err.message));
 
-  const runFire = () =>
-    _runBot(driverId, state, 'position_schedule').catch((err) => {
+  const runFire = (armedShot = null) =>
+    _runBot(driverId, state, 'position_schedule', {
+      armedShot,
+      // A claimed fire bypassed the jobQueue, so its cold fallback must
+      // re-enter it — an uncapped fallback launch is how Jun 12's six
+      // simultaneous Chromiums produced the +28…+48 landings. Cold-from-the-
+      // start fires get no gate: they already run inside a jobQueue slot,
+      // and nesting enqueue inside a held slot would deadlock at concurrency.
+      coldGate: armedShot ? (fn) => jobQueue.enqueue(fn) : null,
+    }).catch((err) => {
+      // Idempotent no-op when the shot was already consumed — this covers
+      // _runBot throwing before runBotForDriver takes ownership.
+      disposeClaimedFireSession(armedShot, 'position fire failed before firing');
       state.state      = 'watching';
       state.hasBeenSeen = false;
       state.lastResult  = { success: false, error: err.message };
@@ -961,33 +972,54 @@ async function triggerPositionSchedule(driverId, state, effectivePosition, {
       console.error(`[Monitor] ✗ Position trigger failed #${state.vehicleNumber}: ${err.message}`);
     });
 
-  // A pre-armed fire is a click on an already-open page — no Chromium launch —
+  // Claim the armed session SYNCHRONOUSLY, before any await. The fire
+  // decision just set positionFiredToday=true, which drops this driver from
+  // the pre-arm wanted set — so THIS SAME TICK's syncFireSessions would
+  // disarm the parked page while the fire is still doing its DB roundtrips
+  // (Driver.findByIdWithCredentials + Log.create take longer than the loop
+  // takes to reach the sync call). Jun 11–12 production: all 30 fires logged
+  // "armed session ready" and then lost the session to "no longer scheduled"
+  // one tick later — zero armed shots ever happened. Claiming detaches the
+  // record from the reconciler's map, so it cannot be disarmed; the fire path
+  // owns it from here and disposes it on every outcome.
+  const armedShot = claimArmedFireSession(driverId);
+
+  // A claimed fire is a click on an already-open page — no Chromium launch —
   // so routing it through the launch-capped jobQueue would only re-introduce
   // the serialization the arming exists to remove (Jun 09: five simultaneous
   // fires at concurrency 3 → the second batch waited ~3.5 s and landed +25
-  // past the first). Armed → run immediately; cold → queue as before.
-  if (hasArmedFireSession(driverId)) {
-    console.log(`[Pos] ⚡ #${state.vehicleNumber} — armed session ready, bypassing bot queue`);
-    runFire();
+  // past the first). Claimed → run immediately; cold → queue as before.
+  if (armedShot) {
+    console.log(`[Pos] ⚡ #${state.vehicleNumber} — armed session claimed, firing now`);
+    runFire(armedShot);
   } else {
-    jobQueue.enqueue(runFire);
+    jobQueue.enqueue(() => runFire(null));
   }
 }
 
 /**
- * True when botService holds a parked, ready-to-click page for this driver.
- * Lazy require: botService pulls in Playwright — tests that exercise the
- * scheduler decision logic shouldn't pay that cost (or need that mock) unless
- * they opt in. Failure-safe: any error means "not armed" and the cold path
- * (jobQueue → full bot run) handles the fire exactly as before pre-arming.
+ * Synchronously claim botService's parked, ready-to-click page for this
+ * driver (null when none). Lazy require: botService pulls in Playwright —
+ * tests that exercise the scheduler decision logic shouldn't pay that cost
+ * (or need that mock) unless they opt in. Failure-safe: any error means "not
+ * armed" and the cold path (jobQueue → full bot run) handles the fire exactly
+ * as before pre-arming.
  */
-function hasArmedFireSession(driverId) {
-  if (!PREARM_ENABLED) return false;
+function claimArmedFireSession(driverId) {
+  if (!PREARM_ENABLED) return null;
   try {
-    return require('./botService').hasArmedFireSession(driverId);
+    return require('./botService').claimArmedSession(driverId);
   } catch {
-    return false;
+    return null;
   }
+}
+
+/** Failure-path disposal for a claimed session (idempotent, never throws). */
+function disposeClaimedFireSession(session, reason) {
+  if (!session) return;
+  try {
+    require('./botService').disposeClaimedSession(session, reason).catch(() => {});
+  } catch { /* botService unavailable — context dies with the shared browser */ }
 }
 
 // ─── Fetch with retry ─────────────────────────────────────────────────────────

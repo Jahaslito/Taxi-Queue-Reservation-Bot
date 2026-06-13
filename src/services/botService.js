@@ -1063,14 +1063,25 @@ async function warmSession({ sanUsername, sanPassword, vehicleNumber }) {
 // vs ~180 MB per browser; the droplet caps the app at 1536 MB) with one
 // context+page per driver. monitorService declares the desired set every poll
 // via syncFireSessions(wanted) and this module converges: arms the missing,
-// refreshes the stale, disarms the no-longer-wanted. Every path degrades to
-// the cold bot — fireArmedSession() returns null rather than throwing, and
-// schedulerService falls through to addToQueue().
+// refreshes the stale, disarms the no-longer-wanted.
+//
+// FIRE-TIME HAND-OFF: the fire decision flips positionFiredToday, which drops
+// the driver from the wanted set on the very same tick — so the reconciler
+// would disarm the parked page while the fire is still doing its DB roundtrips
+// (Jun 11–12 production: 30 of 30 fires lost their armed shot this way).
+// monitorService therefore claims the session SYNCHRONOUSLY at decision time
+// (claimArmedSession — removes it from the map before any await) and passes
+// the claimed record down to schedulerService, which fires it via
+// fireClaimedSession. Every path degrades to the cold bot — fireClaimedSession
+// returns null rather than throwing, and schedulerService falls through to
+// addToQueue() (gated back into the monitor's jobQueue via coldGate so a
+// failed armed shot can't stampede uncapped Chromium launches).
 //
 // SAN-side safety: arming performs the same login + search any bot run does,
-// once per driver per morning (+ a re-search every ~90 s as keep-alive) — far
-// below the polling traffic. Credential failures register the same day-scoped
-// lockout the warmer uses, so bad passwords can't cause login storms.
+// once per driver per morning (+ a fresh navigate+search every ~90 s as
+// keep-alive) — far below the polling traffic. Credential failures register
+// the same day-scoped lockout the warmer uses, so bad passwords can't cause
+// login storms.
 
 const credentialLockout = require('./credentialLockoutService');
 
@@ -1097,6 +1108,10 @@ const armedSessions = new Map();
 const armCooldownUntil = new Map();
 // driverIds with an arm operation currently in flight (dedup across sync ticks)
 const armingInFlight = new Set();
+// driverIds whose session has been CLAIMED for an in-flight fire (removed from
+// armedSessions, not yet disposed). Tracked so closeArmedBrowserIfIdle can't
+// close the shared browser under a click that hasn't happened yet.
+const claimedInFlight = new Set();
 
 let armedBrowser = null;          // shared Chromium — lazily launched, closed when idle
 let armedBrowserLaunching = null; // in-flight launch promise (dedup)
@@ -1152,7 +1167,9 @@ async function ensureArmedBrowser() {
 async function closeArmedBrowserIfIdle() {
   // armingInFlight guard: an arm op building its context holds no map entry
   // yet — closing the browser under it would kill the arm for nothing.
-  if (armedSessions.size === 0 && armingInFlight.size === 0 && armedBrowser) {
+  // claimedInFlight guard: a claimed session is out of the map but its page
+  // is about to be clicked — same hazard from the other direction.
+  if (armedSessions.size === 0 && armingInFlight.size === 0 && claimedInFlight.size === 0 && armedBrowser) {
     const b = armedBrowser;
     armedBrowser = null;
     await b.close().catch(() => {});
@@ -1231,14 +1248,44 @@ async function driveToAddButton(page, { sanUsername, sanPassword, vehicleNumber 
   return buttonVisible ? 'armed' : 'not_found';
 }
 
+/**
+ * Dispose a session RECORD (claimed or still mapped). Idempotent — the fire
+ * path, the monitor's error path, and the disarm path can all call it without
+ * coordinating, and only the first call closes the context.
+ */
+async function disposeClaimedSession(session, reason) {
+  if (!session || session._disposed) return;
+  session._disposed = true;
+  claimedInFlight.delete(session.driverId);
+  await session.context.close().catch(() => {});
+  console.log(`[Arm] #${session.vehicleNumber} disarmed (${reason})`);
+  await closeArmedBrowserIfIdle();
+}
+
 /** Dispose one armed session's context. Safe to call twice. */
 async function disarmFireSession(driverId, reason) {
   const session = armedSessions.get(driverId);
   if (!session) return;
   armedSessions.delete(driverId);
-  await session.context.close().catch(() => {});
-  console.log(`[Arm] #${session.vehicleNumber} disarmed (${reason})`);
-  await closeArmedBrowserIfIdle();
+  await disposeClaimedSession(session, reason);
+}
+
+/**
+ * Claim an armed session for an imminent fire. SYNCHRONOUS on purpose: the
+ * fire decision flips positionFiredToday, which drops the driver from the
+ * pre-arm wanted set on the SAME poll tick — so syncFireSessions would disarm
+ * the parked page before the fire's DB roundtrips reach the click (Jun 11–12
+ * production: 30 of 30 fires lost their armed shot to exactly this race).
+ * Removing the session from the map before the caller's first await makes the
+ * reconciler blind to it; the claimer owns disposal from here (fireClaimedSession
+ * always disposes in its finally; error paths call disposeClaimedSession).
+ */
+function claimArmedSession(driverId) {
+  const session = armedSessions.get(driverId);
+  if (!session) return null;
+  armedSessions.delete(driverId);
+  claimedInFlight.add(driverId);
+  return session;
 }
 
 /** Dispose everything (end of position window / shutdown). No-op when empty. */
@@ -1325,6 +1372,7 @@ async function armFireSession({ driverId, vehicleNumber, getCredentials }) {
       sanUsername,
       context,
       page,
+      getCredentials,            // kept for the keep-alive re-drive (decrypted on use)
       armedAt:        Date.now(),
       lastVerifiedAt: Date.now(),
       refreshing:     null,
@@ -1345,11 +1393,22 @@ async function armFireSession({ driverId, vehicleNumber, getCredentials }) {
 }
 
 /**
- * Keep-alive: re-run the search on the parked page so (a) the SAN session
- * stays active server-side and (b) we notice a dead page BEFORE fire time.
- * Any failure disarms — the next sync tick re-arms if the driver still wants
- * a session. Stores the in-flight promise so a fire arriving mid-refresh can
- * briefly await it instead of clicking on a navigating page.
+ * Keep-alive: re-drive the parked page through the full navigate→search flow
+ * so (a) the SAN session stays active server-side and (b) we notice a dead
+ * page BEFORE fire time. Any failure disarms — the next sync tick re-arms if
+ * the driver still wants a session. Stores the in-flight promise so a fire
+ * arriving mid-refresh can briefly await it instead of clicking on a
+ * navigating page.
+ *
+ * Why a full re-drive and not just re-running the search in place: the parked
+ * page is SAN's search RESULT screen, which does not render the
+ * "Vehicle Dispatch Name" input. The original keep-alive page.fill'd that
+ * input and therefore timed out after 30 s on EVERY refresh (Jun 11–12: every
+ * armed session flapped disarm→re-arm ~every 2 min, ~55 full SAN logins per
+ * driver per morning, each hung fill pinning one of the two arm-op slots).
+ * driveToAddButton starts from a fresh goto, so it works regardless of which
+ * screen the page is currently showing, and it's the exact flow that armed
+ * the page in the first place.
  */
 function refreshArmedSession(driverId) {
   const session = armedSessions.get(driverId);
@@ -1359,20 +1418,13 @@ function refreshArmedSession(driverId) {
     await acquireArmOp();
     try {
       const { page, vehicleNumber } = session;
-      await page.fill('input[placeholder="Vehicle Dispatch Name"]', String(vehicleNumber));
-      await page.click('button:has-text("Search")');
-      await page.waitForFunction(
-        (needles) => needles.some((s) => document.body.innerText.includes(s)),
-        SEARCH_RESULT_STRINGS,
-        { timeout: 15000 },
-      );
-      const stillArmed = await page
-        .isVisible(`button:has-text("${SAN_TEXT.ADD_TO_QUEUE_BUTTON}")`)
-        .catch(() => false);
-      if (!stillArmed) {
+      const creds = await session.getCredentials();
+      if (!creds) throw new Error('credentials unavailable');
+      const outcome = await driveToAddButton(page, { ...creds, vehicleNumber });
+      if (outcome !== 'armed') {
         // WAIT screen (someone queued the driver) or SAN state change —
         // either way this page can no longer fire.
-        await disarmFireSession(driverId, 'refresh found page no longer fireable');
+        await disarmFireSession(driverId, `keep-alive found page no longer fireable (${outcome})`);
         return;
       }
       session.lastVerifiedAt = Date.now();
@@ -1388,14 +1440,14 @@ function refreshArmedSession(driverId) {
 }
 
 /**
- * Fire a pre-armed session: click "Add To Queue", confirm the WAIT screen,
+ * Fire a CLAIMED session: click "Add To Queue", confirm the WAIT screen,
  * read the assigned position. Returns an addToQueue-shaped result, or NULL
  * meaning "no armed shot was taken" — caller falls back to the cold bot.
- * The context is consumed either way: one armed session, one shot.
+ * The record is consumed either way: one armed session, one shot. Accepts
+ * null/already-disposed records so callers can pass a failed claim through.
  */
-async function fireArmedSession(driverId) {
-  const session = armedSessions.get(driverId);
-  if (!session) return null;
+async function fireClaimedSession(session) {
+  if (!session || session._disposed) return null;
 
   const startTime = Date.now();
   const { page, vehicleNumber } = session;
@@ -1408,7 +1460,7 @@ async function fireArmedSession(driverId) {
       session.refreshing,
       new Promise((resolve) => setTimeout(resolve, 2000)),
     ]).catch(() => {});
-    if (!armedSessions.has(driverId)) return null; // refresh disarmed it
+    if (session._disposed) return null; // refresh disarmed it mid-claim
   }
 
   try {
@@ -1450,8 +1502,14 @@ async function fireArmedSession(driverId) {
     await debugCapture(page, vehicleNumber, 'armed_fire_error').catch(() => {});
     return null;
   } finally {
-    await disarmFireSession(driverId, 'fire attempt consumed the session');
+    await disposeClaimedSession(session, 'fire attempt consumed the session');
   }
+}
+
+/** Claim-and-fire convenience: the one-step path for callers that did not
+ *  claim at decision time (cold position fires that find a session anyway). */
+async function fireArmedSession(driverId) {
+  return fireClaimedSession(claimArmedSession(driverId));
 }
 
 /**
@@ -1509,6 +1567,9 @@ module.exports = {
   SESSION_TTL_MS,
   // Pre-armed fire sessions (±10 position accuracy — see section above).
   syncFireSessions,
+  claimArmedSession,
+  fireClaimedSession,
+  disposeClaimedSession,
   fireArmedSession,
   hasArmedFireSession,
   disarmAllFireSessions,

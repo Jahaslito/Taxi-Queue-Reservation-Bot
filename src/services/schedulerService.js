@@ -2,7 +2,10 @@ const cron    = require('node-cron');
 const Driver  = require('../models/Driver');
 const Log     = require('../models/Log');
 const { decrypt }    = require('./cryptoService');
-const { addToQueue, removeFromQueue, sanitizeError, fireArmedSession } = require('./botService');
+const {
+  addToQueue, removeFromQueue, sanitizeError,
+  fireArmedSession, fireClaimedSession, disposeClaimedSession,
+} = require('./botService');
 const credentialLockout = require('./credentialLockoutService');
 
 // In-memory set prevents the same driver from running twice simultaneously
@@ -88,11 +91,23 @@ async function runWithConcurrencyLimit(drivers, triggerType) {
 /**
  * Runs the queue bot for a single driver, records the result to the logs
  * table, and retries on transient failures with exponential back-off + jitter.
+ *
+ * options.armedShot — a CLAIMED pre-armed session record (botService
+ *   claimArmedSession), already detached from the reconciler at fire-decision
+ *   time. This function owns it from here: it is either consumed by
+ *   fireClaimedSession or disposed on every early-exit/error path.
+ * options.coldGate — wraps cold addToQueue launches when this run BYPASSED the
+ *   monitor's jobQueue (armed fast path). A failed armed shot must not launch
+ *   Chromium uncapped: Jun 12, six simultaneous fallback launches on the
+ *   1536 MB box produced the +28…+48 landings. Cold-from-the-start runs pass
+ *   no gate — they already run inside a jobQueue slot (nesting would deadlock).
  */
-async function runBotForDriver(driver, triggerType = 'scheduled') {
+async function runBotForDriver(driver, triggerType = 'scheduled', { armedShot = null, coldGate = null } = {}) {
   const jobKey = `driver-${driver.id}`;
+  const launchCold = coldGate ?? ((fn) => fn());
 
   if (runningJobs.has(jobKey)) {
+    await disposeClaimedSession(armedShot, 'duplicate run skipped');
     console.log(`[Scheduler] Skipping ${driver.name} (${driver.vehicle_number}) — already running`);
     return;
   }
@@ -104,6 +119,7 @@ async function runBotForDriver(driver, triggerType = 'scheduled') {
   // a normal bot failure so callers can log/render it uniformly.
   const lockout = credentialLockout.getLockout(driver.id);
   if (lockout) {
+    await disposeClaimedSession(armedShot, 'credentials locked out');
     const msg = 'Invalid SAN username or password — update your SAN password and try again';
     console.log(`[Scheduler] ⛔ Skipping ${driver.name} (${driver.vehicle_number}) — locked out (${lockout.reason})`);
     await Log.create({
@@ -143,15 +159,21 @@ async function runBotForDriver(driver, triggerType = 'scheduled') {
 
       // Pre-armed fast path: position fires try the parked page first (~1 s
       // click vs ~3.5 s cold launch — the difference between landing inside
-      // and outside ±10 during a burst). null = no armed session, or the
-      // click failed cleanly → cold path below. First attempt only: a retry
-      // means the armed shot was already consumed.
-      if (attempt === 1 && triggerType === 'position_schedule') {
-        result = await Promise.resolve(fireArmedSession(driver.id)).catch(() => null) ?? null;
+      // and outside ±10 during a burst). null = armed shot failed cleanly →
+      // cold path below. First attempt only: a retry means the armed shot was
+      // already consumed. The shot is normally claimed by the monitor at
+      // decision time (armedShot); the fireArmedSession claim-and-fire branch
+      // is a safety net for cold position fires that find a session anyway.
+      if (attempt === 1) {
+        if (armedShot) {
+          result = await fireClaimedSession(armedShot).catch(() => null) ?? null;
+        } else if (triggerType === 'position_schedule') {
+          result = await Promise.resolve(fireArmedSession(driver.id)).catch(() => null) ?? null;
+        }
       }
 
       if (!result) {
-        result = await addToQueue(driver.san_username, sanPassword, driver.vehicle_number);
+        result = await launchCold(() => addToQueue(driver.san_username, sanPassword, driver.vehicle_number));
       }
 
       if (result.success || !isTransientError(result)) break;
@@ -191,6 +213,8 @@ async function runBotForDriver(driver, triggerType = 'scheduled') {
 
     return result;
   } catch (err) {
+    // Idempotent — a no-op when fireClaimedSession already consumed the shot.
+    await disposeClaimedSession(armedShot, 'bot run threw before firing');
     const friendly = sanitizeError(err.message);
     await Log.update(logId, { status: 'failed', error_message: friendly });
     console.error(`[Scheduler] ✗ ${driver.name} → Unexpected error: ${err.message}`);

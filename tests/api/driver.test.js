@@ -9,6 +9,7 @@ jest.mock('../../src/services/botService', () => ({
   addToQueue: jest.fn().mockResolvedValue({
     success: true, alreadyQueued: false, position: 1, durationMs: 100,
   }),
+  verifyCredentials: jest.fn().mockResolvedValue({ verified: true, durationMs: 50 }),
 }));
 
 const request   = require('supertest');
@@ -146,6 +147,19 @@ describe('PUT /api/driver/profile', () => {
       .post('/api/auth/driver/login')
       .send({ vehicleNumber: driver.vehicle_number, appPassword: 'brandnewpass' });
     expect(newLogin.status).toBe(200);
+  });
+
+  test('changing the SAN password runs a live verify and returns credentialCheck', async () => {
+    const botService = require('../../src/services/botService');
+    botService.verifyCredentials.mockResolvedValueOnce({ verified: true, durationMs: 60 });
+    const res = await request(app)
+      .put('/api/driver/profile')
+      .set('Cookie', dCookie)
+      .send({ sanPassword: 'fresh-san-pass' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.credentialCheck).toMatchObject({ verified: true });
+    expect(botService.verifyCredentials).toHaveBeenCalled();
   });
 
   // 32 — Validation (test.each for format errors)

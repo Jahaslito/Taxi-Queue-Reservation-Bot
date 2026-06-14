@@ -14,6 +14,8 @@ jest.mock('../../src/services/botService', () => ({
   addToQueue: jest.fn().mockResolvedValue({
     success: true, alreadyQueued: false, position: 1, durationMs: 100,
   }),
+  warmSession:       jest.fn().mockResolvedValue({ success: true, durationMs: 100 }),
+  verifyCredentials: jest.fn().mockResolvedValue({ verified: true, durationMs: 100 }),
 }));
 
 const request   = require('supertest');
@@ -377,6 +379,171 @@ describe('POST /api/admin/drivers/:id/trigger', () => {
       .post('/api/admin/drivers/999999/trigger')
       .set('Cookie', aCookie);
     expect(res.status).toBe(404);
+  });
+});
+
+// ─── 22b — Unlock credentials ──────────────────────────────────────────────
+
+describe('POST /api/admin/drivers/:id/unlock-credentials', () => {
+  const credentialLockout = require('../../src/services/credentialLockoutService');
+  afterEach(() => credentialLockout._reset());
+
+  test('clears an active lockout and reports wasLocked=true', async () => {
+    credentialLockout.lockOut(driver.id, 'test: invalid password');
+    expect(credentialLockout.isLockedOut(driver.id)).toBe(true);
+
+    const res = await request(app)
+      .post(`/api/admin/drivers/${driver.id}/unlock-credentials`)
+      .set('Cookie', aCookie);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, wasLocked: true });
+    expect(credentialLockout.isLockedOut(driver.id)).toBe(false);
+  });
+
+  test('not-locked driver returns ok with wasLocked=false', async () => {
+    const res = await request(app)
+      .post(`/api/admin/drivers/${driver.id}/unlock-credentials`)
+      .set('Cookie', aCookie);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, wasLocked: false });
+  });
+
+  test('unknown driver returns 404', async () => {
+    const res = await request(app)
+      .post('/api/admin/drivers/999999/unlock-credentials')
+      .set('Cookie', aCookie);
+    expect(res.status).toBe(404);
+  });
+
+  test('drivers list exposes the live lockedOut flag', async () => {
+    credentialLockout.lockOut(driver.id, 'test');
+    const res = await request(app).get('/api/admin/drivers').set('Cookie', aCookie);
+    const row = res.body.drivers.find((d) => d.id === driver.id);
+    expect(row.lockedOut).toBe(true);
+  });
+});
+
+// ─── 22c — Verify credentials (live SAN login test) ─────────────────────────
+
+describe('POST /api/admin/drivers/:id/verify-credentials', () => {
+  const botService = require('../../src/services/botService');
+
+  test('verified=true → 200 with a positive message', async () => {
+    botService.verifyCredentials.mockResolvedValueOnce({ verified: true, durationMs: 80 });
+    const res = await request(app)
+      .post(`/api/admin/drivers/${driver.id}/verify-credentials`)
+      .set('Cookie', aCookie);
+    expect(res.status).toBe(200);
+    expect(res.body.verified).toBe(true);
+    expect(res.body.message).toMatch(/valid|accepted/i);
+    expect(botService.verifyCredentials).toHaveBeenCalled();
+  });
+
+  test('verified=false → 200 reporting the rejection', async () => {
+    botService.verifyCredentials.mockResolvedValueOnce({ verified: false, reason: 'invalid_credentials', error: 'bad creds' });
+    const res = await request(app)
+      .post(`/api/admin/drivers/${driver.id}/verify-credentials`)
+      .set('Cookie', aCookie);
+    expect(res.status).toBe(200);
+    expect(res.body.verified).toBe(false);
+    expect(res.body.message).toMatch(/rejected/i);
+  });
+
+  test('unknown driver returns 404', async () => {
+    const res = await request(app)
+      .post('/api/admin/drivers/999999/verify-credentials')
+      .set('Cookie', aCookie);
+    expect(res.status).toBe(404);
+  });
+});
+
+describe('PUT /api/admin/drivers/:id — credential verify on password change', () => {
+  const botService = require('../../src/services/botService');
+
+  test('changing the SAN password runs a live verify and returns credentialCheck', async () => {
+    botService.verifyCredentials.mockResolvedValueOnce({ verified: true, durationMs: 90 });
+    const res = await request(app)
+      .put(`/api/admin/drivers/${driver.id}`)
+      .set('Cookie', aCookie)
+      .send({ name: 'Same Name', sanPassword: 'brand-new-pass' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.credentialCheck).toMatchObject({ verified: true });
+    expect(botService.verifyCredentials).toHaveBeenCalled();
+  });
+
+  test('a non-credential update does NOT trigger a verify', async () => {
+    botService.verifyCredentials.mockClear();
+    const res = await request(app)
+      .put(`/api/admin/drivers/${driver.id}`)
+      .set('Cookie', aCookie)
+      .send({ name: 'Just A Rename' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.credentialCheck).toBeNull();
+    expect(botService.verifyCredentials).not.toHaveBeenCalled();
+  });
+});
+
+// ─── 22d — Overnight carryover-removal report ───────────────────────────────
+
+describe('GET /api/admin/reports/carryover/:date', () => {
+  const PositionTracking = require('../../src/models/PositionTracking');
+
+  test('joins a carryover removal to that driver\'s landing for the day', async () => {
+    // Removal event (what removeCarryoverLeftover logs)
+    await db('logs').insert({
+      driver_id:     driver.id,
+      triggered_at:  new Date(),
+      trigger_type:  'carryover_cleanup',
+      status:        'success',
+      error_message: 'manually_removed',
+    });
+    // The fresh landing that followed
+    const id = await PositionTracking.upsertDecision({
+      driverId: driver.id, vehicleNumber: driver.vehicle_number,
+      targetPosition: 100, decision: 'fired', firedAt: new Date(),
+    });
+    await PositionTracking.updateActualPosition(id, 104);
+
+    const res = await request(app).get('/api/admin/reports/carryover/today').set('Cookie', aCookie);
+    expect(res.status).toBe(200);
+    expect(res.body.records).toHaveLength(1);
+    const row = res.body.records[0];
+    expect(row.vehicle_number).toBe(driver.vehicle_number);
+    expect(row.removal_status).toBe('success');
+    expect(row.removed_at).toBeTruthy();
+    expect(row.target_position).toBe(100);
+    expect(row.actual_position).toBe(104);
+    expect(Number(row.error)).toBe(4);
+  });
+
+  test('removal with no landing yet → row present, target/actual null', async () => {
+    await db('logs').insert({
+      driver_id: driver.id, triggered_at: new Date(),
+      trigger_type: 'carryover_cleanup', status: 'success',
+    });
+    const res = await request(app).get('/api/admin/reports/carryover/today').set('Cookie', aCookie);
+    expect(res.status).toBe(200);
+    expect(res.body.records).toHaveLength(1);
+    expect(res.body.records[0].target_position).toBeNull();
+    expect(res.body.records[0].actual_position).toBeNull();
+  });
+
+  test('non-carryover logs are excluded', async () => {
+    await db('logs').insert({
+      driver_id: driver.id, triggered_at: new Date(),
+      trigger_type: 'position_schedule', status: 'success',
+    });
+    const res = await request(app).get('/api/admin/reports/carryover/today').set('Cookie', aCookie);
+    expect(res.status).toBe(200);
+    expect(res.body.records).toHaveLength(0);
+  });
+
+  test('malformed date → 400', async () => {
+    const res = await request(app).get('/api/admin/reports/carryover/13-06-2026').set('Cookie', aCookie);
+    expect(res.status).toBe(400);
   });
 });
 

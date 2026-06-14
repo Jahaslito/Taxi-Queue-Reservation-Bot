@@ -53,3 +53,49 @@ describe('computeFilteredMedian — bias signal cleaning', () => {
     expect(median([-30, -5, 0, 5, 30])).toBe(0);
   });
 });
+
+// ─── describeOutcome — exact-cause labels for the report ──────────────────────
+describe('describeOutcome — report status from decision/reason', () => {
+  const out = PositionTracking.describeOutcome;
+
+  test('landed: actual recorded → ok', () => {
+    expect(out({ decision: 'fired', target_position: 100, actual_position: 104 }))
+      .toMatchObject({ status: 'landed', tone: 'ok' });
+  });
+
+  test('locked out → bad', () => {
+    expect(out({ decision: 'skip_locked_out' })).toMatchObject({ status: 'locked_out', tone: 'bad' });
+  });
+
+  test('already in queue (skip_already_seen and already_queued) → warn', () => {
+    expect(out({ decision: 'skip_already_seen' })).toMatchObject({ status: 'already_in_queue' });
+    expect(out({ decision: 'already_queued' })).toMatchObject({ status: 'already_in_queue' });
+  });
+
+  test('missed_impossible → missed/bad', () => {
+    expect(out({ decision: 'missed_impossible', decision_reason: 'queue_already_past_max' }))
+      .toMatchObject({ status: 'missed', tone: 'bad' });
+  });
+
+  test('failed → not eligible vs bad credentials vs generic', () => {
+    expect(out({ decision: 'failed', decision_reason: 'SAN says this vehicle is not currently eligible' }))
+      .toMatchObject({ status: 'not_eligible' });
+    expect(out({ decision: 'failed', decision_reason: 'Invalid SAN username or password' }))
+      .toMatchObject({ status: 'bad_credentials' });
+    expect(out({ decision: 'failed', decision_reason: 'something odd' }))
+      .toMatchObject({ status: 'failed' });
+  });
+
+  test('wait → carryover vs generic waiting', () => {
+    expect(out({ decision: 'wait', decision_reason: 'awaiting_overnight_purge' }))
+      .toMatchObject({ status: 'carryover' });
+    expect(out({ decision: 'wait', decision_reason: 'projected_below_target' }))
+      .toMatchObject({ status: 'waiting' });
+  });
+
+  test('fired with no actual → in_flight (genuine pending), NOT a blank', () => {
+    const r = out({ decision: 'fired' });
+    expect(r.status).toBe('in_flight');
+    expect(r.label).toBeTruthy();
+  });
+});

@@ -24,6 +24,31 @@ const COOKIE_OPTS = {
   secure:   nodeEnv === 'production',
 };
 
+// ─── Public SAN credential check (used by the registration form) ──────────────
+// Lets a prospective driver test their SAN eDispatch username/password before
+// signing up. Unauthenticated but rate-limited (loginLimiter on the route) and
+// it performs the same login-only round-trip the bot uses. No driverId, so it
+// only classifies — it never touches the per-driver lockout breaker.
+async function verifySanCredentials(req, res, next) {
+  try {
+    const { sanUsername, sanPassword, vehicleNumber } = req.body;
+    const { verifyCredentials } = require('../services/botService');
+    const check = await verifyCredentials({
+      sanUsername:   String(sanUsername).trim(),
+      sanPassword:   String(sanPassword),
+      vehicleNumber: vehicleNumber ? String(vehicleNumber).trim() : undefined,
+    });
+    const message = check.verified === true
+      ? 'SAN eDispatch login confirmed — these credentials work.'
+      : check.verified === false
+        ? 'SAN eDispatch rejected this username or password.'
+        : "Couldn't reach SAN eDispatch to verify — please try again in a moment.";
+    res.json({ ...check, message });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function registerDriver(req, res, next) {
   try {
     const { name, phone, appPassword, sanUsername, sanPassword, vehicleNumber, scheduledTime, scheduledDays, daySchedules } = req.body;
@@ -43,6 +68,24 @@ async function registerDriver(req, res, next) {
       const err = new Error('Vehicle number already registered');
       err.statusCode = 409;
       throw err;
+    }
+
+    // Authoritative SAN credential check — the client gates the Register button
+    // on this same test, but never trust the client. A confirmed rejection
+    // blocks signup (no point creating an account the bot can never log into);
+    // an unreachable SAN does NOT block (don't strand a real driver over our own
+    // connectivity blip — they can fix/verify later from the dashboard).
+    try {
+      const { verifyCredentials } = require('../services/botService');
+      const check = await verifyCredentials({ sanUsername, sanPassword, vehicleNumber });
+      if (check.verified === false) {
+        const err = new Error('SAN eDispatch rejected these credentials — check your username and password.');
+        err.statusCode = 400;
+        throw err;
+      }
+    } catch (err) {
+      if (err.statusCode) throw err; // our 400 above — propagate
+      console.warn('[Auth] SAN verify could not run during registration:', err.message); // unreachable → allow
     }
 
     // Schedule fields are configured after registration via the dashboard
@@ -367,6 +410,7 @@ function logout(req, res) {
 
 module.exports = {
   registerDriver,
+  verifySanCredentials,
   loginDriver,
   loginAdmin,
   logout,

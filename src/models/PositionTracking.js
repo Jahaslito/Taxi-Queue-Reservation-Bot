@@ -119,6 +119,62 @@ class PositionTracking {
   }
 
   /**
+   * Mark a fired row as "bot found the driver already in queue" — distinct from
+   * a genuine in-flight fire. Deliberately does NOT write actual_position (the
+   * already-queued position is whoever else queued the driver and would poison
+   * bias — see the +116 #631 incident). This only relabels the row so the
+   * report can show the real cause instead of a stuck "pending".
+   */
+  static async markAlreadyQueued(id) {
+    await db(TABLE).where({ id }).update({
+      decision:        'already_queued',
+      decision_reason: 'bot_found_already_in_queue',
+    });
+  }
+
+  /**
+   * Pure mapper: position_tracking row → human-readable outcome for the report.
+   * Replaces the old blanket "pending" with the EXACT cause, derived from the
+   * decision + decision_reason already stored per row. tone drives the UI color
+   * (ok=green, warn=amber, bad=red, muted=grey, info=in-progress).
+   */
+  static describeOutcome(row) {
+    const reason = String(row.decision_reason || '').toLowerCase();
+
+    // Landed — actual position recorded (the success case).
+    if (row.actual_position != null && row.target_position != null) {
+      return { status: 'landed', label: 'Landed', tone: 'ok' };
+    }
+
+    switch (row.decision) {
+      case 'completed':
+        return { status: 'landed', label: 'Landed', tone: 'ok' };
+      case 'skip_locked_out':
+        return { status: 'locked_out', label: 'Locked out — bad SAN password', tone: 'bad' };
+      case 'skip_already_seen':
+      case 'already_queued':
+        return { status: 'already_in_queue', label: 'Already in queue', tone: 'warn' };
+      case 'skip_bot_inflight':
+        return { status: 'in_flight', label: 'Bot already running', tone: 'info' };
+      case 'missed_impossible':
+        return { status: 'missed', label: 'Missed — queue past max', tone: 'bad' };
+      case 'failed':
+        if (/eligib/.test(reason))                            return { status: 'not_eligible',    label: 'Not eligible (SAN rejected vehicle)', tone: 'bad' };
+        if (/invalid|password|credential|login/.test(reason)) return { status: 'bad_credentials', label: 'Bad SAN credentials', tone: 'bad' };
+        if (/not found/.test(reason))                         return { status: 'not_found',        label: 'Vehicle not found on SAN', tone: 'bad' };
+        return { status: 'failed', label: 'Failed (SAN error)', tone: 'bad' };
+      case 'wait':
+        if (/overnight|purge|carryover/.test(reason)) return { status: 'carryover', label: 'Carryover — waiting for SAN to drop', tone: 'muted' };
+        if (/shrink/.test(reason))                    return { status: 'waiting',   label: 'Queue settling (dispatch purge)', tone: 'muted' };
+        return { status: 'waiting', label: 'Waiting — target not reached', tone: 'muted' };
+      case 'fired':
+        return { status: 'in_flight', label: 'Firing…', tone: 'info' };
+      default:
+        return { status: 'unknown', label: row.decision || 'no decision yet', tone: 'muted' };
+    }
+  }
+
+  /**
    * Recent records for the admin accuracy table.
    * Includes the full decision so admin can see skipped/missed runs too.
    */
@@ -136,7 +192,10 @@ class PositionTracking {
       )
       .join('drivers as d', 'd.id', 'pt.driver_id')
       .orderBy('pt.tracking_date', 'desc')
-      .orderBy('pt.fired_at',     'desc')
+      // NULLS LAST: drivers that actually fired (have a fired_at) come first;
+      // skip/wait rows (locked out, carryover, waiting — fired_at IS NULL) no
+      // longer front-load the report. Postgres defaults DESC to NULLS FIRST.
+      .orderByRaw('pt.fired_at DESC NULLS LAST')
       .limit(limit)
       .offset(offset);
   }
@@ -257,6 +316,39 @@ class PositionTracking {
       medianError:         median(completed.map(r => Number(r.error))),
       medianBotDurationMs: median(completed.map(r => r.bot_duration_ms).filter(Number.isFinite)),
     };
+  }
+
+  /**
+   * Overnight carryover-removal report for a PT date. Anchored on the
+   * 'carryover_cleanup' log rows (one per removed leftover that day), LEFT
+   * JOINed to that driver's position_tracking row so each line shows the whole
+   * chain: removed at Z → target W → landed K at U. Lets the admin confirm the
+   * carryover fix is working (driver was pulled from yesterday's queue, then
+   * actually got their target today). Date is the PT day (YYYY-MM-DD).
+   */
+  static carryoverReport(date) {
+    return db('logs as l')
+      .select(
+        'l.driver_id',
+        'd.name as driver_name',
+        'd.vehicle_number',
+        'l.triggered_at as removed_at',
+        'l.status      as removal_status',
+        'pt.target_position',
+        'pt.actual_position',
+        'pt.fired_at',
+        'pt.landed_at',
+        'pt.decision',
+        db.raw('CASE WHEN pt.actual_position IS NOT NULL AND pt.target_position IS NOT NULL THEN pt.actual_position - pt.target_position END AS error'),
+      )
+      .join('drivers as d', 'd.id', 'l.driver_id')
+      .leftJoin('position_tracking as pt', function joinOnSameDay() {
+        this.on('pt.driver_id', '=', 'l.driver_id')
+            .andOn('pt.tracking_date', '=', db.raw('?', [date]));
+      })
+      .where('l.trigger_type', 'carryover_cleanup')
+      .whereRaw("DATE(l.triggered_at AT TIME ZONE 'America/Los_Angeles') = ?", [date])
+      .orderBy('l.triggered_at', 'asc');
   }
 
   /**

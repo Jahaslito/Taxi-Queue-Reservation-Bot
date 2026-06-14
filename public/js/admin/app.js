@@ -63,7 +63,7 @@ function showPage(pageId) {
   if (pageId === 'page-logs')     loadLogs();
   if (pageId === 'page-monitor')      { if (typeof onMonitorPageShow   === 'function') onMonitorPageShow();   }
   if (pageId === 'page-watchlist')    { if (typeof onWatchlistPageShow === 'function') onWatchlistPageShow(); }
-  if (pageId === 'page-pos-tracking')    loadPosTracking();
+  if (pageId === 'page-pos-tracking')    { loadPosTracking(); if (typeof loadCarryoverReport === 'function') loadCarryoverReport(); }
   if (pageId === 'page-pos-diagnostics') loadPosDiagnostics();
   if (pageId === 'page-sos')             { if (typeof onSosPageShow       === 'function') onSosPageShow();       }
 }

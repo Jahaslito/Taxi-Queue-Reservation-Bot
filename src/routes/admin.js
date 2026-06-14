@@ -110,6 +110,23 @@ router.post(
   adminController.sendDriverPasswordReset,
 );
 
+// Manually clear a driver's day-scoped credential lockout (escape hatch for
+// when the SAN password is confirmed fine and the bot should retry now).
+router.post(
+  '/drivers/:id/unlock-credentials',
+  [idParam],
+  validate,
+  adminController.unlockCredentials,
+);
+
+// Live SAN login test — confirm a driver's stored credentials actually work.
+router.post(
+  '/drivers/:id/verify-credentials',
+  [idParam],
+  validate,
+  adminController.verifyDriverCredentials,
+);
+
 router.get(
   '/position-tracking',
   [
@@ -132,6 +149,20 @@ router.get(
   ],
   validate,
   adminController.getDailyReport,
+);
+
+// Overnight carryover-removal report — confirms leftover drivers were pulled
+// from yesterday's queue and shows whether they then hit today's target.
+router.get(
+  '/reports/carryover/:date?',
+  [
+    param('date')
+      .optional()
+      .matches(/^(today|yesterday|\d{4}-\d{2}-\d{2})$/)
+      .withMessage('date must be YYYY-MM-DD, "today", or "yesterday"'),
+  ],
+  validate,
+  adminController.getCarryoverReport,
 );
 
 // Early-join diagnostics — live state + 14-day history of skip_already_seen

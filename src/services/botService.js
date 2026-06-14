@@ -1042,6 +1042,39 @@ async function warmSession({ sanUsername, sanPassword, vehicleNumber }) {
   }
 }
 
+/**
+ * Live SAN credential check — a login-only round-trip (no queue action) used to
+ * CONFIRM a driver's SAN password actually works. Wraps warmSession and maps the
+ * outcome to the day-scoped credential breaker so the answer is authoritative:
+ *
+ *   verified: true   → SAN accepted the login. Lockout cleared.
+ *   verified: false  → SAN rejected the username/password. Lockout armed.
+ *   verified: null   → couldn't reach SAN (timeout/network). Lockout left as-is
+ *                      so a transient blip can't strand or falsely clear a driver.
+ *
+ * driverId is optional (a pre-save check has no row yet); when omitted the
+ * breaker is not touched and only the classification is returned.
+ */
+async function verifyCredentials({ driverId, sanUsername, sanPassword, vehicleNumber }) {
+  const credentialLockout = require('./credentialLockoutService');
+  // Force a fresh full login with the password under test — don't let a stale
+  // accepted cookie jar mask a now-wrong password.
+  forgetSession(sanUsername);
+
+  const result = await warmSession({ sanUsername, sanPassword, vehicleNumber })
+    .catch((err) => ({ success: false, rawError: err.message, error: err.message }));
+
+  if (result.success) {
+    if (Number.isInteger(driverId)) credentialLockout.clearLockout(driverId);
+    return { verified: true, durationMs: result.durationMs };
+  }
+  if (credentialLockout.isCredentialError(result.rawError || result.error || '')) {
+    if (Number.isInteger(driverId)) credentialLockout.lockOut(driverId, result.rawError || result.error);
+    return { verified: false, reason: 'invalid_credentials', error: result.error || 'SAN rejected the username or password.' };
+  }
+  return { verified: null, reason: 'unreachable', error: result.error || 'Could not reach SAN to verify.' };
+}
+
 // ─── Pre-armed fire sessions ──────────────────────────────────────────────────
 //
 // WHY: the position scheduler's landing error is
@@ -1101,6 +1134,28 @@ const ARM_OPS_CONCURRENCY   = parseInt(process.env.BOT_ARM_OPS_CONCURRENCY   ?? 
 // SAN is slower than this the cold fallback wouldn't have been faster anyway,
 // and the fallback's already-queued detection makes a double-submit harmless.
 const ARM_FIRE_TIMEOUT_MS   = parseInt(process.env.BOT_ARM_FIRE_TIMEOUT_MS   ?? '12000', 10);
+
+// ─── HTTP-fire latency cut (overshoot fix — see ±10 accuracy notes) ───────────
+// The armed *click* serialises on the shared Chromium: 8 simultaneous fires on
+// 2026-06-14 each took ~5 s (one timed out at 2 s) because the contexts contend
+// for the one browser's event loop. The fix is to replay SAN's "Add To Queue"
+// as a direct HTTP request on the parked context's *cookie jar* (Playwright's
+// context.request) — no second tab, no render/JS contention, ~200 ms, and N
+// parallel requests don't contend like N Chromiums.
+//
+// Two flags, both default OFF so production behaviour is unchanged until we have
+// proof of SAN's add endpoint:
+//   BOT_CAPTURE_FIRE_REQUEST=1  → observe-only: log the real add request the
+//                                 next time a click fires, so we learn the exact
+//                                 method/url/headers/body without guessing.
+//   BOT_HTTP_FIRE=1             → use the HTTP path (needs the captured shape);
+//                                 always falls back to the click on any doubt.
+const CAPTURE_FIRE_REQUEST  = process.env.BOT_CAPTURE_FIRE_REQUEST === '1';
+const HTTP_FIRE_ENABLED     = process.env.BOT_HTTP_FIRE === '1';
+const HTTP_FIRE_TIMEOUT_MS  = parseInt(process.env.BOT_HTTP_FIRE_TIMEOUT_MS  ?? '4000', 10);
+// Only requests whose URL matches this host/path are treated as "the add call"
+// (set from the capture). Anything else the click triggers is ignored.
+const HTTP_FIRE_URL_MATCH   = process.env.BOT_HTTP_FIRE_URL_MATCH ?? 'gtcvms.com';
 
 /** driverId → armed session record */
 const armedSessions = new Map();
@@ -1446,11 +1501,136 @@ function refreshArmedSession(driverId) {
  * The record is consumed either way: one armed session, one shot. Accepts
  * null/already-disposed records so callers can pass a failed claim through.
  */
+// ─── Fire-request capture (observe-only; BOT_CAPTURE_FIRE_REQUEST=1) ──────────
+// Records the real network request SAN's "Add To Queue" click triggers, so the
+// HTTP-fire path can replay the exact shape instead of guessing. Secrets
+// (cookie / authorization / *token*) are redacted to length + 8-char prefix;
+// the POST body (vehicle/zone/CSRF) is logged in full — that's what we need.
+// A no-op object is returned when the flag is off, so the hot path pays nothing.
+function redactHeaderValue(name, value) {
+  const lower = String(name).toLowerCase();
+  if (lower === 'cookie' || lower === 'authorization' || lower.includes('token')) {
+    return `«${value.length} chars, "${value.slice(0, 8)}…"»`;
+  }
+  return value;
+}
+
+function installFireCapture(page, vehicleNumber, label) {
+  if (!CAPTURE_FIRE_REQUEST) return { dump: async () => {} };
+  const hits = [];
+  const onReqFinished = async (req) => {
+    try {
+      if (req.method() === 'GET') return;
+      const url = req.url();
+      if (!url.includes(HTTP_FIRE_URL_MATCH)) return;
+      // Never capture the OIDC/login request — its body carries credentials.
+      // The armed path is parked post-login, so this should never fire anyway.
+      if (url.includes(OIDC_HOST)) return;
+      const resp = await req.response().catch(() => null);
+      const status = resp ? resp.status() : null;
+      const bodySnippet = resp
+        ? await resp.text().then((t) => t.slice(0, 400)).catch(() => null)
+        : null;
+      const safeHeaders = {};
+      for (const [k, v] of Object.entries(req.headers())) safeHeaders[k] = redactHeaderValue(k, v);
+      hits.push({ method: req.method(), url, headers: safeHeaders, postData: req.postData(), status, bodySnippet });
+    } catch { /* best-effort diagnostic capture */ }
+  };
+  page.on('requestfinished', onReqFinished);
+  return {
+    async dump() {
+      page.off('requestfinished', onReqFinished);
+      // Where does the SPA keep its auth? Log localStorage KEYS only (not values),
+      // before the context closes — this tells us whether HTTP-fire needs a
+      // bearer header or whether the cookie jar alone authenticates.
+      let authKeys = [];
+      try {
+        const ss = await page.context().storageState();
+        authKeys = (ss.origins || []).flatMap((o) =>
+          (o.localStorage || []).map((e) => `${o.origin} → ${e.name}`));
+      } catch { /* context may already be closing */ }
+      console.log(`[Arm:capture] #${vehicleNumber} (${label}) — ${hits.length} non-GET ${HTTP_FIRE_URL_MATCH} request(s) during fire:`);
+      for (const h of hits) {
+        console.log(`[Arm:capture]   → ${h.method} ${h.url}  [${h.status ?? '?'}]`);
+        console.log(`[Arm:capture]     headers: ${JSON.stringify(h.headers)}`);
+        console.log(`[Arm:capture]     body:    ${h.postData ?? '(none)'}`);
+        if (h.bodySnippet) console.log(`[Arm:capture]     resp:    ${h.bodySnippet.replace(/\s+/g, ' ')}`);
+      }
+      console.log(`[Arm:capture]   storageState localStorage keys: ${authKeys.join(', ') || '(none)'}`);
+    },
+  };
+}
+
+/**
+ * HTTP-fire: replay "Add To Queue" as a direct request on the parked context's
+ * cookie jar (Playwright APIRequestContext) — no second browser tab, so N
+ * simultaneous fires don't serialise on the one Chromium event loop the way N
+ * clicks did (2026-06-14: ~5 s each, one 2 s timeout).
+ *
+ * DRAFT — default OFF (BOT_HTTP_FIRE). The request shape comes from a capture
+ * (BOT_CAPTURE_FIRE_REQUEST); until session.addRequest is populated by the arm
+ * step this returns null and the caller uses the proven click. Returns null on
+ * ANY doubt so the click fallback owns the hard cases. Never records a position
+ * it can't confirm via SAN's own V Holding (preserves the bias-contamination
+ * guard — see markAlreadyQueued / the +116 #631 incident).
+ */
+async function fireViaHttp(session) {
+  if (!HTTP_FIRE_ENABLED) return null;
+  const { context, vehicleNumber } = session;
+  const reqSpec = session.addRequest; // { url, method, headers, body } — set at arm time from capture
+  if (!context || !reqSpec || !reqSpec.url) return null;
+
+  const startTime = Date.now();
+  try {
+    // context.request shares the parked context's cookies → authenticated with
+    // no render. If SAN needs a bearer token, the arm step copies it into
+    // reqSpec.headers (captured from localStorage).
+    const resp = await context.request.fetch(reqSpec.url, {
+      method:  reqSpec.method || 'POST',
+      headers: reqSpec.headers || undefined,
+      data:    reqSpec.body ?? undefined,
+      timeout: HTTP_FIRE_TIMEOUT_MS,
+    });
+    if (!resp.ok()) {
+      console.warn(`[Arm] ✗ #${vehicleNumber} HTTP fire ${resp.status()} — falling back to click`);
+      return null;
+    }
+    // Position is SAN-authoritative from V Holding; the parked page proved we
+    // were NOT already queued, so a confirmed entry now is OUR add.
+    const info = await verifyDriverInQueue(vehicleNumber).catch(() => null);
+    if (!info || !Number.isFinite(info.position)) {
+      console.warn(`[Arm] #${vehicleNumber} HTTP fire sent but position unconfirmed — falling back to click to verify`);
+      return null;
+    }
+    console.log(`[Arm] ⚡ #${vehicleNumber} fired via HTTP in ${Date.now() - startTime} ms → position ${info.position}`);
+    return {
+      success:         true,
+      alreadyQueued:   false,
+      viaArmedSession: true,
+      viaHttp:         true,
+      ...info,
+      durationMs:      Date.now() - startTime,
+      message:         `Added to queue — Position: ${info.position}`,
+    };
+  } catch (err) {
+    console.warn(`[Arm] ✗ #${vehicleNumber} HTTP fire failed (${err.message}) — falling back to click`);
+    return null;
+  }
+}
+
 async function fireClaimedSession(session) {
   if (!session || session._disposed) return null;
 
   const startTime = Date.now();
   const { page, vehicleNumber } = session;
+
+  // Fast path: replay the add over HTTP (no Chromium contention). Returns null
+  // when disabled/unconfigured or on any uncertainty → the click below runs.
+  const httpResult = await fireViaHttp(session);
+  if (httpResult) {
+    await disposeClaimedSession(session, 'fired via HTTP — session consumed');
+    return httpResult;
+  }
 
   // A keep-alive refresh may be mid-navigation — give it a moment to settle
   // rather than racing a click against it. Refreshes are skipped inside the
@@ -1463,6 +1643,7 @@ async function fireClaimedSession(session) {
     if (session._disposed) return null; // refresh disarmed it mid-claim
   }
 
+  const cap = installFireCapture(page, vehicleNumber, 'armed');
   try {
     await page.click(`button:has-text("${SAN_TEXT.ADD_TO_QUEUE_BUTTON}")`, { timeout: 2000 });
     await page.waitForFunction(
@@ -1502,6 +1683,7 @@ async function fireClaimedSession(session) {
     await debugCapture(page, vehicleNumber, 'armed_fire_error').catch(() => {});
     return null;
   } finally {
+    await cap.dump();
     await disposeClaimedSession(session, 'fire attempt consumed the session');
   }
 }
@@ -1558,6 +1740,7 @@ module.exports = {
   addToQueue,
   removeFromQueue,
   warmSession,
+  verifyCredentials,
   sanitizeError,
   sessionStore,
   // Exposed for the warmer service and tests.

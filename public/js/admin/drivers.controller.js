@@ -91,6 +91,7 @@ async function loadDrivers(page) {
           <td><span style="font-size:12px;color:var(--muted2);">${esc(activeDaysLabel)}</span></td>
           <td>
             <span class="badge ${esc(statusCls)}"><span class="badge-dot"></span>${esc(statusLbl)}</span>
+            ${d.lockedOut ? '<span class="badge failed" style="margin-left:4px;" title="SAN rejected this account’s login — the bot is parked until midnight PT or until unlocked"><span class="badge-dot"></span>🔒 Locked</span>' : ''}
             <div style="font-size:11px;color:var(--muted2);margin-top:3px;">${d.last_run ? formatRelTime(d.last_run) : ''}</div>
           </td>
           <td>${activeBadge}</td>
@@ -98,6 +99,8 @@ async function loadDrivers(page) {
             <div style="display:flex;gap:6px;flex-wrap:wrap;">
               <button class="btn btn-trigger btn-sm" data-action="trigger"    data-id="${Number(d.id)}" data-name="${esc(d.name)}">▶ Run</button>
               ${isPosSched ? `<button class="btn btn-ghost btn-sm" data-action="arm-position" data-id="${Number(d.id)}" data-name="${esc(d.name)}" title="Reset today's position-schedule fired flag so the bot can fire again at the real target">🎯 Arm</button>` : ''}
+              ${d.lockedOut ? `<button class="btn btn-trigger btn-sm" data-action="unlock" data-id="${Number(d.id)}" data-name="${esc(d.name)}" title="Clear the credential lock so the bot retries this account now (does not change the password)">🔓 Unlock</button>` : ''}
+              <button class="btn btn-ghost btn-sm"   data-action="verify"     data-id="${Number(d.id)}" data-name="${esc(d.name)}" title="Live SAN login test — confirm this driver's stored password actually works (~5s)">🔑 Verify</button>
               <button class="btn btn-ghost btn-sm"   data-action="edit"       data-id="${Number(d.id)}">Edit</button>
               <button class="btn btn-ghost btn-sm"   data-action="send-reset" data-id="${Number(d.id)}" data-name="${esc(d.name)}" data-email="${esc(d.email || '')}" title="Send password reset email">Reset Password</button>
             </div>
@@ -223,6 +226,51 @@ async function sendPasswordReset(id, name, email, btn) {
   } finally {
     btn.disabled = false;
     btn.innerHTML = originalHTML;
+  }
+}
+
+// ─── Clear a credential lockout ───────────────────────────────────────────────
+// Manual escape hatch: the day-scoped breaker parks a driver until midnight PT
+// once SAN rejects their login. This clears it now so the bot retries on the
+// next fire (it does NOT change the password — use Reset Password for that).
+async function unlockCredentials(id, name, btn) {
+  if (!await showConfirm(`Clear the credential lock for ${esc(name)}? The bot will retry this SAN account on its next fire. (This does not change the password.)`, { title: 'Unlock Credentials', okLabel: 'Unlock', icon: '🔓' })) return;
+
+  const originalHTML = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+
+  try {
+    const data = await api(`/api/admin/drivers/${id}/unlock-credentials`, { method: 'POST' });
+    showToast(`✅ ${data.message}`, 'success', 5000);
+    loadDrivers(); // refresh so the 🔒 badge + Unlock button disappear
+  } catch (err) {
+    showToast(err.message || 'Failed to clear credential lock', 'error');
+    btn.disabled = false;
+    btn.innerHTML = originalHTML;
+  }
+}
+
+// ─── Confirm SAN credentials (live login test) ────────────────────────────────
+// Does a real SAN login round-trip (~5s) to confirm the stored password works.
+// Success clears any lock; a rejection arms it — so the list is reloaded after.
+async function verifyCredentials(id, name, btn) {
+  const originalHTML = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+  btn.style.minWidth = btn.offsetWidth + 'px';
+
+  try {
+    const data = await api(`/api/admin/drivers/${id}/verify-credentials`, { method: 'POST' });
+    const tone = data.verified === true ? 'success' : data.verified === false ? 'error' : 'info';
+    showToast(data.message || 'Verification complete', tone, 6000);
+    loadDrivers(); // refresh the 🔒 badge — verify may have set or cleared the lock
+  } catch (err) {
+    showToast(err.message || 'Failed to verify credentials', 'error');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalHTML;
+    btn.style.minWidth = '';
   }
 }
 
@@ -494,6 +542,8 @@ document.getElementById('drivers-table-body').addEventListener('click', e => {
   if (btn.dataset.action === 'trigger')      triggerDriver(id, btn.dataset.name, btn);
   if (btn.dataset.action === 'send-reset')   sendPasswordReset(id, btn.dataset.name, btn.dataset.email, btn);
   if (btn.dataset.action === 'arm-position') armPositionSchedule(id, btn.dataset.name, btn);
+  if (btn.dataset.action === 'unlock')       unlockCredentials(id, btn.dataset.name, btn);
+  if (btn.dataset.action === 'verify')       verifyCredentials(id, btn.dataset.name, btn);
 });
 
 // Save driver (create or update)
@@ -549,8 +599,16 @@ document.getElementById('btn-save-driver').addEventListener('click', async () =>
 
   try {
     if (isEdit) {
-      await api(`/api/admin/drivers/${id}`, { method: 'PUT', body: JSON.stringify(body) });
+      const res = await api(`/api/admin/drivers/${id}`, { method: 'PUT', body: JSON.stringify(body) });
       showToast('Driver updated ✓');
+      // If the SAN password/username changed, the server ran a live login test.
+      // Surface the verdict so the admin knows whether the new creds actually work.
+      const cc = res && res.credentialCheck;
+      if (cc) {
+        if (cc.verified === true)       showToast('✓ SAN credentials verified — login works.', 'success', 6000);
+        else if (cc.verified === false) showToast(`✗ SAN rejected the new credentials: ${cc.error || 'invalid username/password'}`, 'error', 8000);
+        else                            showToast(`⚠ Saved, but couldn't reach SAN to verify (${cc.error || 'unreachable'}).`, 'info', 7000);
+      }
     } else {
       if (!body.sanUsername || !sanPass || !body.vehicleNumber || !body.name) {
         throw new Error('Name, SAN username, password, and vehicle number are required');

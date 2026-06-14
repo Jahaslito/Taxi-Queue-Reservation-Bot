@@ -6,6 +6,7 @@ const { authenticateDriver }     = require('../middleware/auth');
 const validate                   = require('../middleware/validate');
 const {
   registerDriver,
+  verifySanCredentials,
   loginDriver,
   loginAdmin,
   logout,
@@ -45,6 +46,21 @@ router.post(
   ],
   validate,
   registerDriver,
+);
+
+// ─── Test SAN eDispatch credentials (pre-registration) ──────────────────────────
+// Public + rate-limited (loginLimiter). Lets the signup form confirm the SAN
+// username/password work before the Register button is enabled.
+router.post(
+  '/verify-san',
+  loginLimiter,
+  [
+    body('sanUsername').trim().notEmpty().withMessage('SAN username is required'),
+    body('sanPassword').notEmpty().withMessage('SAN password is required'),
+    body('vehicleNumber').optional({ checkFalsy: true }).trim(),
+  ],
+  validate,
+  verifySanCredentials,
 );
 
 // ─── Driver login ─────────────────────────────────────────────────────────────

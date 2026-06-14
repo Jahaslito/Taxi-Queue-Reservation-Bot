@@ -306,7 +306,13 @@ document.getElementById('btn-save-schedule').addEventListener('click', async () 
     if (!(driverProfile.day_positions || driverProfile.scheduled_position)) {
       document.getElementById('stat-time').textContent = driverProfile.scheduled_time || '--:--';
     }
-    showToast('Credentials updated ✓');
+    // When SAN creds changed, the server ran a live login test — surface the
+    // verdict so the driver knows whether their new password actually works.
+    const cc = driverProfile.credentialCheck;
+    if (cc && cc.verified === true)        showToast('✓ SAN credentials verified — login works.', 'success', 6000);
+    else if (cc && cc.verified === false)  showToast('✗ SAN rejected your new credentials — please check them.', 'error', 8000);
+    else if (cc)                           showToast("⚠ Saved, but couldn't reach SAN to verify right now.", 'info', 7000);
+    else                                   showToast('Credentials updated ✓');
   } catch (err) {
     errEl.textContent = err.message;
   } finally {

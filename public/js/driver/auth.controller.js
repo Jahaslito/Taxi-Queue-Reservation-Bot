@@ -120,6 +120,69 @@ document.getElementById('btn-inactive-back').addEventListener('click', () => {
   showView('view-login');
 });
 
+// ─── SAN credential test gate ─────────────────────────────────────────────────
+// The Register button stays disabled until the driver's SAN eDispatch login is
+// confirmed live. Editing any SAN field invalidates a prior pass and re-locks it.
+let sanVerified = false;
+function setSanVerified(ok) {
+  sanVerified = ok;
+  document.getElementById('btn-register').disabled = !ok;
+}
+function resetSanVerified() {
+  if (sanVerified || document.getElementById('san-verify-status').textContent) {
+    setSanVerified(false);
+    document.getElementById('san-verify-status').textContent = '';
+  }
+}
+['reg-san-username', 'reg-san-password', 'reg-vehicle'].forEach((id) =>
+  document.getElementById(id).addEventListener('input', resetSanVerified),
+);
+
+document.getElementById('btn-verify-san').addEventListener('click', async () => {
+  const sanUsername   = document.getElementById('reg-san-username').value.trim();
+  const sanPassword   = document.getElementById('reg-san-password').value;
+  const vehicleNumber = document.getElementById('reg-vehicle').value.trim();
+  const statusEl      = document.getElementById('san-verify-status');
+
+  if (!sanUsername || !sanPassword) {
+    statusEl.style.color = 'var(--red)';
+    statusEl.textContent = 'Enter your SAN username and password first.';
+    return;
+  }
+
+  const vbtn = document.getElementById('btn-verify-san');
+  const orig = vbtn.innerHTML;
+  vbtn.disabled = true; vbtn.innerHTML = '<span class="spinner"></span> Testing SAN login…';
+  statusEl.style.color = 'var(--muted)';
+  statusEl.textContent = 'Contacting SAN eDispatch… (can take a few seconds)';
+
+  try {
+    const data = await api('/api/auth/verify-san', {
+      method: 'POST',
+      body: JSON.stringify({ sanUsername, sanPassword, vehicleNumber }),
+    });
+    if (data.verified === true) {
+      setSanVerified(true);
+      statusEl.style.color = '#22c55e';
+      statusEl.textContent = '✓ ' + (data.message || 'SAN login confirmed — you can register.');
+    } else if (data.verified === false) {
+      setSanVerified(false);
+      statusEl.style.color = 'var(--red)';
+      statusEl.textContent = '✗ ' + (data.message || 'SAN rejected these credentials.');
+    } else {
+      setSanVerified(false);
+      statusEl.style.color = '#f5a623';
+      statusEl.textContent = '⚠ ' + (data.message || 'Could not reach SAN — please try again.');
+    }
+  } catch (err) {
+    setSanVerified(false);
+    statusEl.style.color = 'var(--red)';
+    statusEl.textContent = err.message || 'Verification failed — please try again.';
+  } finally {
+    vbtn.disabled = false; vbtn.innerHTML = orig;
+  }
+});
+
 // ─── Register ────────────────────────────────────────────────────────────────
 document.getElementById('btn-register').addEventListener('click', async () => {
   const name          = document.getElementById('reg-name').value.trim();
@@ -151,8 +214,15 @@ document.getElementById('btn-register').addEventListener('click', async () => {
     routeDriver(data.driver);
   } catch (err) {
     errEl.textContent = err.message;
+    // If the server's authoritative SAN check rejected the creds, force a re-test.
+    if (/SAN eDispatch rejected/i.test(err.message || '')) {
+      setSanVerified(false);
+      document.getElementById('san-verify-status').style.color = 'var(--red)';
+      document.getElementById('san-verify-status').textContent = '✗ SAN rejected these credentials — re-test to continue.';
+    }
   } finally {
-    btn.innerHTML = 'Create Account'; btn.disabled = false;
+    btn.innerHTML = 'Create Account';
+    btn.disabled = !sanVerified; // keep gated unless SAN creds are still confirmed
   }
 });
 

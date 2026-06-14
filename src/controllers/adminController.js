@@ -5,7 +5,7 @@ const Driver                  = require('../models/Driver');
 const Log                     = require('../models/Log');
 const PositionClaim           = require('../models/PositionClaim');
 const PositionTracking        = require('../models/PositionTracking');
-const { encrypt }             = require('../services/cryptoService');
+const { encrypt, decrypt }    = require('../services/cryptoService');
 const { runBotForDriver }     = require('../services/schedulerService');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/emailService');
 
@@ -115,7 +115,16 @@ async function listDrivers(req, res, next) {
       Driver.searchCount(filters),
     ]);
 
-    res.json({ drivers, total: parseInt(countResult.count, 10), limit, offset });
+    // Annotate each row with the live credential-lockout state (in-memory,
+    // day-scoped — see credentialLockoutService) so the admin UI can flag
+    // locked-out drivers and offer the manual unlock action.
+    const credentialLockout = require('../services/credentialLockoutService');
+    const withLockState = drivers.map((d) => ({
+      ...d,
+      lockedOut: credentialLockout.isLockedOut(Number(d.id)),
+    }));
+
+    res.json({ drivers: withLockState, total: parseInt(countResult.count, 10), limit, offset });
   } catch (err) {
     next(err);
   }
@@ -325,11 +334,10 @@ async function updateDriver(req, res, next) {
     // breaker keeps short-circuiting the bot until midnight PT.
     const credsChanged = (sanUsername && sanUsername !== driver.san_username)
                       || !!sanPassword;
+    let credentialCheck = null;
     if (credsChanged) {
-      const credentialLockout = require('../services/credentialLockoutService');
-      credentialLockout.clearLockout(Number(req.params.id));
       // Drop stale cached cookies for the OLD username (and the new one too —
-      // harmless if it doesn't exist yet).
+      // harmless if it doesn't exist yet) so the verify does a clean full login.
       try {
         const { sessionStore } = require('../services/botService');
         if (sessionStore?.delete) {
@@ -337,6 +345,24 @@ async function updateDriver(req, res, next) {
           if (sanUsername)         sessionStore.delete(sanUsername);
         }
       } catch { /* session store not exported — non-fatal */ }
+
+      // CONFIRM the new credentials actually work against SAN (login-only round
+      // trip) rather than blindly clearing the breaker. verifyCredentials maps
+      // the outcome to the lockout: success clears it, a rejection re-arms it,
+      // an unreachable SAN leaves it unchanged. Synchronous (~5 s) so the save
+      // response can tell the admin whether the password is good.
+      try {
+        const { verifyCredentials } = require('../services/botService');
+        credentialCheck = await verifyCredentials({
+          driverId:      Number(req.params.id),
+          sanUsername:   sanUsername || driver.san_username,
+          sanPassword:   sanPassword || decrypt(driver.san_password),
+          vehicleNumber: updateData.vehicle_number || driver.vehicle_number,
+        });
+      } catch (e) {
+        console.warn('[Admin] Credential verify failed to run:', e.message);
+        credentialCheck = { verified: null, reason: 'error', error: 'Verification could not run.' };
+      }
     }
 
     // If the admin added or changed the driver's email, send a fresh verification
@@ -355,7 +381,7 @@ async function updateDriver(req, res, next) {
       );
     }
 
-    res.json(updated);
+    res.json({ ...updated, credentialCheck });
   } catch (err) {
     next(err);
   }
@@ -469,7 +495,11 @@ async function getPositionTracking(req, res, next) {
       PositionTracking.recent({ limit, offset }),
       PositionTracking.recentCount(),
     ]);
-    res.json({ records: rows, total: Number(countRow.count) });
+    // Annotate each row with the exact outcome (locked out / already in queue /
+    // not eligible / missed / waiting / landed) so the report names the cause
+    // instead of a blanket "pending".
+    const records = rows.map((r) => ({ ...r, outcome: PositionTracking.describeOutcome(r) }));
+    res.json({ records, total: Number(countRow.count) });
   } catch (err) {
     next(err);
   }
@@ -511,6 +541,37 @@ async function getDailyReport(req, res, next) {
     ]);
 
     res.json({ date, summary, records });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ─── Overnight carryover-removal report ───────────────────────────────────────
+// Observability for the carryover fix: per removed leftover that day, shows
+// "removed at Z → target W → landed K at U". Date defaults to today PT and
+// accepts 'today'/'yesterday'/YYYY-MM-DD (same parsing as getDailyReport).
+async function getCarryoverReport(req, res, next) {
+  try {
+    const todayPT = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+    let date = req.params.date || 'today';
+
+    if (date === 'today') {
+      date = todayPT;
+    } else if (date === 'yesterday') {
+      const y = new Date();
+      y.setDate(y.getDate() - 1);
+      date = y.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+    }
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      const err = new Error('Date must be YYYY-MM-DD, "today", or "yesterday"');
+      err.statusCode = 400;
+      throw err;
+    }
+
+    const rows = await PositionTracking.carryoverReport(date);
+    const records = rows.map((r) => ({ ...r, outcome: PositionTracking.describeOutcome(r) }));
+    res.json({ date, records });
   } catch (err) {
     next(err);
   }
@@ -606,6 +667,75 @@ async function sendDriverPasswordReset(req, res, next) {
   }
 }
 
+// ─── Manually clear a credential lockout ──────────────────────────────────────
+// The day-scoped breaker (credentialLockoutService) parks a driver until
+// midnight PT once SAN rejects their login, so the bot stops burning fire slots
+// on a guaranteed-failed account. It already self-clears on a successful run or
+// a password change — this endpoint is the manual escape hatch: the admin
+// confirmed the SAN password is fine (or was fixed on SAN's side) and wants the
+// bot to retry now, without editing the password. We also drop the cached
+// Playwright session so a stale bad-cookie jar can't immediately re-trip the
+// lock on the next run.
+async function unlockCredentials(req, res, next) {
+  try {
+    const driverId = parseInt(req.params.id, 10);
+    const driver = await Driver.findById(driverId);
+    if (!driver) return res.status(404).json({ error: 'Driver not found' });
+
+    const credentialLockout = require('../services/credentialLockoutService');
+    const wasLocked = credentialLockout.isLockedOut(driverId);
+    credentialLockout.clearLockout(driverId);
+
+    try {
+      const { sessionStore } = require('../services/botService');
+      if (sessionStore?.delete && driver.san_username) sessionStore.delete(driver.san_username);
+    } catch { /* session store not exported — non-fatal */ }
+
+    res.json({
+      ok: true,
+      wasLocked,
+      message: wasLocked
+        ? `Credential lock cleared for ${driver.name} — the bot will retry on the next fire.`
+        : `${driver.name} was not locked out.`,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ─── Confirm a driver's SAN credentials work (live login test) ────────────────
+// Does a login-only round-trip to SAN with the driver's stored password and
+// reports whether it's valid. Authoritatively updates the credential breaker:
+// success clears the lock, a rejection arms it, an unreachable SAN leaves it
+// unchanged. ~5 s — it launches a headless browser.
+async function verifyDriverCredentials(req, res, next) {
+  try {
+    const driver = await Driver.findByIdWithCredentials(req.params.id);
+    if (!driver) return res.status(404).json({ error: 'Driver not found' });
+    if (!driver.san_username || !driver.san_password) {
+      return res.status(400).json({ error: 'Driver has no SAN credentials on file.' });
+    }
+
+    const { verifyCredentials } = require('../services/botService');
+    const check = await verifyCredentials({
+      driverId:      Number(req.params.id),
+      sanUsername:   driver.san_username,
+      sanPassword:   decrypt(driver.san_password),
+      vehicleNumber: driver.vehicle_number,
+    });
+
+    const message = check.verified === true
+      ? `✓ SAN accepted ${driver.name}'s login — credentials are valid.`
+      : check.verified === false
+        ? `✗ SAN rejected ${driver.name}'s username or password.`
+        : `⚠ Couldn't reach SAN to verify ${driver.name} — lock left unchanged.`;
+
+    res.json({ ...check, message });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   getStats,
   listDrivers,
@@ -621,4 +751,7 @@ module.exports = {
   getPositionDiagnostics,
   rearmPositionScheduler,
   sendDriverPasswordReset,
+  unlockCredentials,
+  verifyDriverCredentials,
+  getCarryoverReport,
 };

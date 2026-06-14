@@ -68,6 +68,23 @@ const RETRY_DELAYS      = [5_000, 15_000, 30_000];
 // Does NOT apply to manual Run button or scheduled triggers.
 const AUTO_REQUEUE_DELAY_MS = parseInt(process.env.MONITOR_REQUEUE_DELAY_MS ?? String(60_000), 10);
 
+// ─── Overnight carryover handling ─────────────────────────────────────────────
+// A driver still in V Holding at the midnight rollover is a leftover from
+// yesterday. SAN drains the overnight queue by dispatching everyone out the
+// front — so a leftover that reaches the front gets paper-dispatched (~1–2 AM),
+// no-shows (the driver isn't physically there), and SAN benches the account as
+// "not authorized" past the morning rush. That driver then can't take its real
+// target position (the #0187 / #4377 failures). Fix: at the reset, proactively
+// remove leftovers from V Holding so they never reach the front to be dispatched
+// — they start the morning free to fire fresh at their scheduled target.
+const CARRYOVER_REMOVE_ENABLED = (process.env.MONITOR_CARRYOVER_REMOVE_ENABLED ?? 'true') !== 'false';
+// Debounce for the carryover-cleared signal: require the driver to be absent
+// from V Holding for this many consecutive polls before dropping the carryover
+// flag. SAN's V Holding list is unstable around the midnight refresh — a single
+// missed poll wrongly flips a still-queued leftover to "fresh today" (the
+// 00:01:44 mislabel that started #0187's chain). 3 polls confirms a real exit.
+const CARRYOVER_CLEAR_POLLS    = parseInt(process.env.MONITOR_CARRYOVER_CLEAR_POLLS ?? '3', 10);
+
 // ─── Operating hours (Pacific Time) ──────────────────────────────────────────
 // Auto-requeue fires between REQUEUE_START and REQUEUE_END (8 AM–11 PM PT).
 // Position schedule fires between POS_START and POS_END (4 AM–11 PM PT).
@@ -814,11 +831,14 @@ async function _runBot(driverId, state, triggerType = 'monitor_requeue', botOpts
       .catch((err) => console.error('[PosTracking] Failed to update actual position from bot result:', err.message));
   } else if (state.pendingTrackingId && result?.alreadyQueued && !result.recoveredFromTimeout) {
     // Drop pendingTrackingId so the next poll's V-Holding observation doesn't
-    // attach a (potentially also stale) actual_position to this row. The 'fired'
-    // row stays for visibility but won't get an actual_position — preferable to
-    // a wrong one that poisons bias.
+    // attach a (potentially also stale) actual_position to this row. Relabel the
+    // row 'already_queued' (without writing actual_position — that would poison
+    // bias) so the report shows the real cause instead of a stuck "pending".
+    const aqTrackingId = state.pendingTrackingId;
     state.pendingTrackingId = null;
-    console.log(`[PosTracking] #${state.vehicleNumber} → bot found already in queue (pos ${result.position}) — NOT recording as actual (avoids bias contamination)`);
+    PositionTracking.markAlreadyQueued(aqTrackingId)
+      .catch((err) => console.error('[PosTracking] markAlreadyQueued error:', err.message));
+    console.log(`[PosTracking] #${state.vehicleNumber} → bot found already in queue (pos ${result.position}) — labelled already_queued, NOT recording actual (avoids bias contamination)`);
   } else if (state.pendingTrackingId && !result?.success) {
     // Bot returned a non-success result without throwing. This is the path for
     // fast-fail outcomes: credential lockout, "Vehicle not available for
@@ -889,6 +909,45 @@ async function triggerRequeue(driverId, state, { delayMs = 0 } = {}) {
     setTimeout(enqueue, delayMs);
   } else {
     enqueue();
+  }
+}
+
+// Debounce step for the carryover-cleared signal. Pure + exported for tests.
+// Given the count of consecutive polls a carryover driver has been absent from
+// V Holding, returns whether to clear the carryover flag now and the next count.
+// Clears only once absences reach the threshold — so a single flickered poll
+// during SAN's midnight refresh can't prematurely clear a still-queued leftover.
+function carryoverClearStep(absentPolls, threshold = CARRYOVER_CLEAR_POLLS) {
+  const next = (absentPolls || 0) + 1;
+  return next >= threshold ? { clear: true, absentPolls: 0 } : { clear: false, absentPolls: next };
+}
+
+// ─── Overnight carryover cleanup ──────────────────────────────────────────────
+// Remove one leftover driver from yesterday's V Holding at the daily reset (see
+// CARRYOVER_REMOVE_ENABLED). On success we clear the carryover flag immediately
+// so the position scheduler arms a fresh fire for today's target without waiting
+// for the debounced poll-confirmation. Never throws — a failed remove just
+// leaves the driver in queue (SAN clears them itself, same as before the fix).
+async function removeCarryoverLeftover(driverId, vehicleNumber) {
+  try {
+    const driver = await Driver.findByIdWithCredentials(driverId);
+    if (!driver || driver.is_active === false || !driver.san_username || !driver.san_password) return;
+
+    const { runRemoveBotForDriver } = require('./schedulerService');
+    const result = await runRemoveBotForDriver(driver, 'carryover_cleanup');
+
+    const s = watches.get(driverId);
+    if (result?.success && s) {
+      s.inQueueFromCarryover  = false;
+      s.hasBeenSeen           = false;
+      s.carryoverAbsentPolls  = 0;
+      if (s.state !== 'requeuing') s.state = 'watching';
+      console.log(`[Monitor] ✓ #${vehicleNumber} cleared from yesterday's leftover queue — armed for today's fresh schedule`);
+    } else if (!result?.success) {
+      console.warn(`[Monitor] carryover cleanup for #${vehicleNumber} did not remove (${result?.error || 'unknown'}) — leaving in queue, SAN will clear it`);
+    }
+  } catch (err) {
+    console.warn(`[Monitor] carryover cleanup for #${vehicleNumber} errored: ${err.message} — leaving in queue, SAN will clear it`);
   }
 }
 
@@ -1338,6 +1397,7 @@ async function poll() {
 
       s.hasBeenSeen        = false;
       s.state              = s.inQueueFromCarryover ? 'in_queue' : 'watching';
+      s.carryoverAbsentPolls = 0;   // debounce counter for the carryover-cleared signal
       s.terminalSeen       = false;
       s.terminalCheckCount = 0;
       s.terminalName       = null;
@@ -1350,6 +1410,24 @@ async function poll() {
     }
     console.log('[Monitor] Daily reset — counters and visibility state cleared');
     broadcast('daily_reset', { date: currentDayPT });
+
+    // Proactively pull leftover drivers out of yesterday's queue so SAN can't
+    // paper-dispatch them off the draining front overnight (→ no-show → benched
+    // "not authorized" → miss their morning target). Runs ONCE per day (this
+    // block only fires on the genuine date rollover, never on a mid-day restart
+    // since todayPT inits to the current day). Routed through the jobQueue so a
+    // batch of leftovers can't launch N Chromiums at once, and fire-and-forget
+    // so it never blocks the poll. Failure degrades to today's behaviour (SAN
+    // clears them itself; only the rare no-show dispatch is lost).
+    if (CARRYOVER_REMOVE_ENABLED) {
+      const leftovers = [...watches.values()].filter((s) => s.inQueueFromCarryover);
+      if (leftovers.length) {
+        console.log(`[Monitor] Daily reset — clearing ${leftovers.length} leftover driver(s) from yesterday's queue (prevents overnight no-show dispatch)`);
+        for (const s of leftovers) {
+          jobQueue.enqueue(() => removeCarryoverLeftover(s.driverId, s.vehicleNumber)).catch(() => {});
+        }
+      }
+    }
   }
 
   // ─── Position-window arming (3 AM PT) ─────────────────────────────────────────
@@ -1585,6 +1663,9 @@ async function poll() {
       }
       markSeen();
       state.lastSeenAt = new Date();
+      // Seen in V Holding again → reset the carryover-cleared debounce counter:
+      // a flicker that briefly hid this leftover doesn't count toward clearing.
+      state.carryoverAbsentPolls = 0;
       // If transitioning from at_terminal → in_queue, SAN auto-returned the driver
       // to V Holding before the terminal poll could detect they'd left. Collect for
       // requeue below (after the stateChanged broadcast fires) so we don't double-emit.
@@ -1594,12 +1675,20 @@ async function poll() {
       next = 'in_queue';
     } else if (isCarryover) {
       // Driver was carryover and is no longer in V Holding — SAN's overnight
-      // purge has cleared them. Drop the flag and reset to 'watching' so the
-      // position scheduler can fire at the right time today. NO at_terminal
-      // transition (we never claimed they were ours today, no requeue owed).
-      state.inQueueFromCarryover = false;
-      console.log(`[Monitor] #${state.vehicleNumber} — SAN cleared overnight carryover, armed for fresh schedule`);
-      next = 'watching';
+      // purge may have cleared them. DEBOUNCE: require CARRYOVER_CLEAR_POLLS
+      // consecutive absences before believing it. SAN's V Holding list flickers
+      // around the midnight refresh, and a single missed poll used to flip a
+      // still-queued leftover to "fresh today" — which mislabelled it, let it
+      // drain to the front, and get no-show-dispatched (the #0187 chain). Only
+      // clear once we've confirmed it's really gone; until then stay carryover.
+      const step = carryoverClearStep(state.carryoverAbsentPolls);
+      state.carryoverAbsentPolls = step.absentPolls;
+      if (step.clear) {
+        state.inQueueFromCarryover = false;
+        console.log(`[Monitor] #${state.vehicleNumber} — SAN cleared overnight carryover (confirmed gone over ${CARRYOVER_CLEAR_POLLS} polls), armed for fresh schedule`);
+        next = 'watching';
+      }
+      // else: not yet confirmed gone — leave next = prev (stay carryover/in_queue).
     } else if (state.hasBeenSeen) {
       // Driver was seen in V Holding but is no longer there — they've been
       // dispatched to a terminal. Enter at_terminal and let the terminal poll
@@ -2165,6 +2254,7 @@ async function addWatch(driverId, { isAuto = false, _ctx = null } = {}) {
     manuallyRemovedAt:       driver.manually_removed_at ?? null,
     positionFiredToday,
     inQueueFromCarryover: false, // set at midnight reset for drivers still in V Holding
+    carryoverAbsentPolls: 0,   // debounce: consecutive polls a carryover driver is absent from V Holding
     currentPosition:    null,  // live position updated every poll tick
     lastPosition:       null,  // position bot placed them at (from bot result)
     atTerminalSince:    null,
@@ -2786,6 +2876,7 @@ module.exports = {
   _norm:                      norm,
   _isWithinOperatingHours:    isWithinOperatingHours,
   _evaluatePositionScheduler: evaluatePositionScheduler,
+  _carryoverClearStep:        carryoverClearStep,
   _expectedNextPollMs:        expectedNextPollMs,
   _botExecutionEstimateMs:    botExecutionEstimateMs,
   _recordBotLatency:          recordBotLatency,

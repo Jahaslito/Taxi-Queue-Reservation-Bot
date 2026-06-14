@@ -3,7 +3,7 @@ const db                = require('../config/database');
 const Driver            = require('../models/Driver');
 const Log               = require('../models/Log');
 const PositionClaim     = require('../models/PositionClaim');
-const { encrypt }       = require('../services/cryptoService');
+const { encrypt, decrypt } = require('../services/cryptoService');
 const { runBotForDriver, runRemoveBotForDriver } = require('../services/schedulerService');
 
 async function getProfile(req, res, next) {
@@ -148,9 +148,10 @@ async function updateProfile(req, res, next) {
     // adminController.updateDriver for the why.
     const credsChanged = (sanUsername && sanUsername !== driver.san_username)
                       || !!sanPassword;
+    let credentialCheck = null;
     if (credsChanged) {
-      const credentialLockout = require('../services/credentialLockoutService');
-      credentialLockout.clearLockout(Number(req.driverId));
+      // Drop stale cached cookies so the verify is a clean full login with the
+      // new password.
       try {
         const { sessionStore } = require('../services/botService');
         if (sessionStore?.delete) {
@@ -158,9 +159,25 @@ async function updateProfile(req, res, next) {
           if (sanUsername)         sessionStore.delete(sanUsername);
         }
       } catch { /* session store not exported — non-fatal */ }
+
+      // CONFIRM the new credentials against SAN rather than blindly clearing the
+      // breaker — mirrors adminController.updateDriver. Success clears the lock,
+      // a rejection re-arms it, an unreachable SAN leaves it unchanged. ~5 s.
+      try {
+        const { verifyCredentials } = require('../services/botService');
+        credentialCheck = await verifyCredentials({
+          driverId:      Number(req.driverId),
+          sanUsername:   sanUsername || driver.san_username,
+          sanPassword:   sanPassword || decrypt(driver.san_password),
+          vehicleNumber: vehicleNumber || driver.vehicle_number,
+        });
+      } catch (e) {
+        console.warn('[Driver] Credential verify failed to run:', e.message);
+        credentialCheck = { verified: null, reason: 'error', error: 'Verification could not run.' };
+      }
     }
 
-    res.json(updated);
+    res.json({ ...updated, credentialCheck });
   } catch (err) {
     next(err);
   }

@@ -31,6 +31,7 @@ const monitor = require('../../src/services/monitorService');
 const {
   _isWithinOperatingHours,
   _evaluatePositionScheduler,
+  _carryoverClearStep,
   addWatch,
   manualRun,
   getState,
@@ -367,6 +368,40 @@ describe('armPositionWindowForToday() — fleet-wide 3 AM re-arm', () => {
 // ─── Position scheduler decision logic ────────────────────────────────────────
 // Tests for the safety rails added after the 5/24-5/26 over-/under-shoot
 // incidents: hard skip when queue already past max, pause when queue is being
+// ─── carryoverClearStep() — debounce for the carryover-cleared signal ────────
+// A single flickered poll during SAN's midnight refresh must NOT clear the flag;
+// only N consecutive absences should (prevents the #0187 mislabel chain).
+describe('carryoverClearStep() — carryover-clear debounce', () => {
+  test('does not clear before the threshold (default 3)', () => {
+    const a = _carryoverClearStep(0);          // 1st absence
+    expect(a).toEqual({ clear: false, absentPolls: 1 });
+    const b = _carryoverClearStep(a.absentPolls); // 2nd absence
+    expect(b).toEqual({ clear: false, absentPolls: 2 });
+  });
+
+  test('clears once absences reach the threshold', () => {
+    const c = _carryoverClearStep(2);          // 3rd consecutive absence
+    expect(c).toEqual({ clear: true, absentPolls: 0 });
+  });
+
+  test('a single flicker (reset to 0 on re-sighting) never clears', () => {
+    // Simulate: absent, absent, then seen (counter reset to 0 by the poll loop),
+    // then absent again — must not clear on that lone absence.
+    let n = 0;
+    n = _carryoverClearStep(n).absentPolls;     // 1
+    n = _carryoverClearStep(n).absentPolls;     // 2
+    n = 0;                                       // re-seen in V Holding → reset
+    const after = _carryoverClearStep(n);        // lone absence
+    expect(after.clear).toBe(false);
+    expect(after.absentPolls).toBe(1);
+  });
+
+  test('respects a custom threshold', () => {
+    expect(_carryoverClearStep(0, 1)).toEqual({ clear: true, absentPolls: 0 });
+    expect(_carryoverClearStep(undefined, 2)).toEqual({ clear: false, absentPolls: 1 });
+  });
+});
+
 // purged by SAN's dispatcher.
 describe('evaluatePositionScheduler — safety rails', () => {
   const makeState = (over = {}) => ({

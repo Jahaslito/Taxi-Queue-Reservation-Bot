@@ -542,6 +542,10 @@
       <input type="text" id="reg-vehicle" placeholder="e.g. 4000" autocomplete="off" inputmode="numeric" />
     </div>
 
+    <!-- SAN credential test gate: Register stays disabled until these verify. -->
+    <button class="btn btn-ghost" id="btn-verify-san" style="width:100%;margin-bottom:8px;">🔑 Test SAN eDispatch Login</button>
+    <div id="san-verify-status" style="font-size:13px;margin-bottom:14px;min-height:18px;"></div>
+
     <p style="font-size:12px;color:var(--muted);margin-top:8px;margin-bottom:16px;">
       🤖 You'll choose your queue schedule (time-based or position-based) after creating your account.
     </p>
@@ -565,7 +569,7 @@
     </div>
 
     <div class="error-msg" id="reg-error"></div>
-    <button class="btn btn-primary" id="btn-register">Create Account</button>
+    <button class="btn btn-primary" id="btn-register" disabled title="Test your SAN eDispatch login first">Create Account</button>
     <button class="btn btn-ghost mt-4" id="btn-back-login">← Back to Login</button>
   </div>
 </div>

@@ -9,10 +9,22 @@
  *
  * Run independently: npx jest tests/api/auth.test.js
  */
+// Mock botService BEFORE any require (Jest hoists this). Registration and the
+// public /verify-san endpoint call botService.verifyCredentials, which would
+// otherwise launch a real headless browser against SAN. Default: creds valid.
+jest.mock('../../src/services/botService', () => ({
+  verifyCredentials: jest.fn().mockResolvedValue({ verified: true, durationMs: 50 }),
+}));
+
 const request   = require('supertest');
 const createApp = require('../helpers/createApp');
 const { db, migrateUp, truncateAll }               = require('../helpers/db');
 const { createAdmin, createDriver, validRegBody }  = require('../helpers/fixtures');
+const botService = require('../../src/services/botService');
+
+beforeEach(() => {
+  botService.verifyCredentials.mockResolvedValue({ verified: true, durationMs: 50 });
+});
 
 const app = createApp();
 
@@ -49,6 +61,25 @@ describe('POST /api/auth/driver/register', () => {
       .send(body);
     expect(res.status).toBe(400);
     expect(res.body).toHaveProperty('error');
+  });
+
+  // 5b — SAN credential gate on registration
+  test('blocks signup (400) when SAN rejects the credentials', async () => {
+    botService.verifyCredentials.mockResolvedValueOnce({ verified: false, reason: 'invalid_credentials', error: 'bad' });
+    const res = await request(app)
+      .post('/api/auth/driver/register')
+      .send({ ...validRegBody, email: 'gate@example.com', vehicleNumber: '7777' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/SAN eDispatch rejected/i);
+    expect(botService.verifyCredentials).toHaveBeenCalled();
+  });
+
+  test('still registers (201) when SAN is unreachable (verify throws)', async () => {
+    botService.verifyCredentials.mockRejectedValueOnce(new Error('net down'));
+    const res = await request(app)
+      .post('/api/auth/driver/register')
+      .send({ ...validRegBody, email: 'unreach@example.com', vehicleNumber: '7778' });
+    expect(res.status).toBe(201);
   });
 
   // 6 — Success path
@@ -100,6 +131,35 @@ describe('POST /api/auth/driver/register', () => {
       .send({ ...validRegBody, vehicleNumber: 'DIFFERENT001' }); // same email
 
     expect(res.status).toBe(409);
+  });
+});
+
+// ─── POST /api/auth/verify-san (public credential test) ─────────────────────
+
+describe('POST /api/auth/verify-san', () => {
+  test('verified=true → 200 with positive message', async () => {
+    botService.verifyCredentials.mockResolvedValueOnce({ verified: true });
+    const res = await request(app)
+      .post('/api/auth/verify-san')
+      .send({ sanUsername: 'u', sanPassword: 'p', vehicleNumber: '4000' });
+    expect(res.status).toBe(200);
+    expect(res.body.verified).toBe(true);
+    expect(res.body.message).toMatch(/confirmed|work/i);
+  });
+
+  test('verified=false → 200 reporting rejection', async () => {
+    botService.verifyCredentials.mockResolvedValueOnce({ verified: false, error: 'bad' });
+    const res = await request(app)
+      .post('/api/auth/verify-san')
+      .send({ sanUsername: 'u', sanPassword: 'wrong' });
+    expect(res.status).toBe(200);
+    expect(res.body.verified).toBe(false);
+    expect(res.body.message).toMatch(/rejected/i);
+  });
+
+  test('missing fields → 400', async () => {
+    const res = await request(app).post('/api/auth/verify-san').send({ sanUsername: 'u' });
+    expect(res.status).toBe(400);
   });
 });
 

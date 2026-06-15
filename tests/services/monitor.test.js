@@ -23,7 +23,7 @@ jest.mock('../../src/services/schedulerService');
 jest.mock('../../src/models/Driver');
 jest.mock('../../src/models/Log');
 
-const { runBotForDriver } = require('../../src/services/schedulerService');
+const { runBotForDriver, runRemoveBotForDriver } = require('../../src/services/schedulerService');
 const Driver               = require('../../src/models/Driver');
 const Log                  = require('../../src/models/Log');
 
@@ -32,6 +32,8 @@ const {
   _isWithinOperatingHours,
   _evaluatePositionScheduler,
   _carryoverClearStep,
+  _removeCarryoverLeftover,
+  _setWatch,
   addWatch,
   manualRun,
   getState,
@@ -76,6 +78,8 @@ function setupMocks() {
   Driver.findById.mockResolvedValue(mockDriver);
   Driver.findByIdWithCredentials.mockResolvedValue(mockDriver);
   Log.findTodayLatest.mockResolvedValue(null);
+  Log.findTodayLatestAdd.mockResolvedValue(null);
+  Log.wasCarryoverToday.mockResolvedValue(false);
   Log.findTodayMonitorRequeues.mockResolvedValue({ count: '0' });
   runBotForDriver.mockResolvedValue({
     success: true, alreadyQueued: false, position: 5, durationMs: 100,
@@ -399,6 +403,108 @@ describe('carryoverClearStep() — carryover-clear debounce', () => {
   test('respects a custom threshold', () => {
     expect(_carryoverClearStep(0, 1)).toEqual({ clear: true, absentPolls: 0 });
     expect(_carryoverClearStep(undefined, 2)).toEqual({ clear: false, absentPolls: 1 });
+  });
+});
+
+// ─── addWatch() — restart reconstruction is carryover-safe ────────────────────
+// Locks in the fix for the 2026-06-15 fleet-wide outage: a restart between the
+// midnight reset and the morning fire window must NOT mistake a REMOVE-type log
+// for "in queue", and MUST rebuild carryover protection from the durable marker.
+describe('addWatch() — restart reconstruction (carryover-safe)', () => {
+  beforeEach(() => setupMocks());
+
+  test('REGRESSION: a leftover whose only log today is a carryover remove → NOT seen, stays carryover', async () => {
+    // The exact 06-15 trap: midnight carryover_cleanup wrote a success log, then
+    // the server restarted. findTodayLatestAdd excludes remove-type logs, so it
+    // returns null → hasBeenSeen MUST be false (a remove can never mean in-queue).
+    // The carryover marker rebuilds protection so the scheduler waits + fires fresh.
+    Log.findTodayLatestAdd.mockResolvedValue(null); // no ADD log — the only log was a remove
+    Log.wasCarryoverToday.mockResolvedValue(true);  // durable midnight marker exists
+
+    await addWatch(DRIVER_ID, { isAuto: true });
+    const s = monitor._getInternalState(DRIVER_ID);
+
+    expect(s.hasBeenSeen).toBe(false);            // was wrongly true before the fix
+    expect(s.inQueueFromCarryover).toBe(true);    // protection rebuilt from the marker
+    expect(s.wasCarryoverToday).toBe(true);
+    expect(s.state).toBe('in_queue');
+  });
+
+  test('leftover that already fired today (position_schedule success) → seen, NOT carryover', async () => {
+    Driver.findById.mockResolvedValue({ ...mockDriver, scheduled_position: 200 });
+    Log.findTodayLatestAdd.mockResolvedValue({ trigger_type: 'position_schedule', status: 'success' });
+    Log.findTodayByTriggerType.mockResolvedValue({ driver_id: DRIVER_ID, status: 'success' }); // positionFiredToday
+    Log.wasCarryoverToday.mockResolvedValue(true);
+
+    await addWatch(DRIVER_ID, { isAuto: true });
+    const s = monitor._getInternalState(DRIVER_ID);
+
+    expect(s.hasBeenSeen).toBe(true);
+    expect(s.positionFiredToday).toBe(true);
+    expect(s.inQueueFromCarryover).toBe(false);   // we fired them — they're legitimately ours
+  });
+
+  test('not a leftover, no add log → clean watching slate', async () => {
+    Log.findTodayLatestAdd.mockResolvedValue(null);
+    Log.wasCarryoverToday.mockResolvedValue(false);
+
+    await addWatch(DRIVER_ID, { isAuto: true });
+    const s = monitor._getInternalState(DRIVER_ID);
+
+    expect(s.hasBeenSeen).toBe(false);
+    expect(s.inQueueFromCarryover).toBe(false);
+    expect(s.state).toBe('watching');
+  });
+
+  test('add-type success but no marker → seen normally (not carryover)', async () => {
+    Log.findTodayLatestAdd.mockResolvedValue({ trigger_type: 'monitor_requeue', status: 'success' });
+    Log.wasCarryoverToday.mockResolvedValue(false);
+
+    await addWatch(DRIVER_ID, { isAuto: true });
+    const s = monitor._getInternalState(DRIVER_ID);
+
+    expect(s.hasBeenSeen).toBe(true);
+    expect(s.inQueueFromCarryover).toBe(false);
+    expect(s.state).toBe('in_queue');
+  });
+});
+
+// ─── removeCarryoverLeftover() — best-effort, never strips protection ─────────
+// The 06-15 bug: a bot "success" cleared inQueueFromCarryover even though the
+// driver was still in V Holding (back at pos 18 within 24s). The clear now lives
+// SOLELY in the debounced poll path, so this function must leave the flags alone
+// regardless of what the remove bot reports.
+describe('removeCarryoverLeftover() — never clears protection flags', () => {
+  beforeEach(() => setupMocks());
+
+  const seedCarryoverWatch = () => _setWatch(DRIVER_ID, {
+    driverId: DRIVER_ID, vehicleNumber: '9999',
+    inQueueFromCarryover: true, wasCarryoverToday: true, hasBeenSeen: false,
+    state: 'in_queue', carryoverAbsentPolls: 0,
+  });
+
+  test('bot reports SUCCESS → carryover protection untouched', async () => {
+    runRemoveBotForDriver.mockResolvedValue({ success: true });
+    seedCarryoverWatch();
+
+    await _removeCarryoverLeftover(DRIVER_ID, '9999');
+    const s = monitor._getInternalState(DRIVER_ID);
+
+    expect(s.inQueueFromCarryover).toBe(true);   // was wrongly cleared before the fix
+    expect(s.wasCarryoverToday).toBe(true);
+    expect(s.hasBeenSeen).toBe(false);
+    expect(s.state).toBe('in_queue');
+  });
+
+  test('bot reports FAILURE → carryover protection untouched', async () => {
+    runRemoveBotForDriver.mockResolvedValue({ success: false, error: 'Vehicle is not currently in queue' });
+    seedCarryoverWatch();
+
+    await _removeCarryoverLeftover(DRIVER_ID, '9999');
+    const s = monitor._getInternalState(DRIVER_ID);
+
+    expect(s.inQueueFromCarryover).toBe(true);
+    expect(s.state).toBe('in_queue');
   });
 });
 
@@ -797,9 +903,10 @@ describe('startMonitor() — mid-day restart guard', () => {
     // arming check. This keeps the test focused on the guard's effect.
     Driver.findAllActive = jest.fn().mockResolvedValue([]);
     Log.loadTodayContext = jest.fn().mockResolvedValue({
-      latestByDriver:       new Map(),
+      latestAddByDriver:    new Map(),
       requeueCountByDriver: new Map(),
       positionLogByDriver:  new Map(),
+      carryoverByDriver:    new Set(),
     });
   });
 
@@ -834,9 +941,10 @@ describe('startMonitor() — mid-day restart guard', () => {
     jest.useFakeTimers({ now: ptHour(8), doNotFake: ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval'] });
     Driver.findAllActive.mockResolvedValue([buildActiveDriver()]);
     Log.loadTodayContext.mockResolvedValue({
-      latestByDriver:       new Map([[DRIVER_ID, { status: 'success' }]]),
+      latestAddByDriver:    new Map([[DRIVER_ID, { trigger_type: 'position_schedule', status: 'success' }]]),
       requeueCountByDriver: new Map(),
       positionLogByDriver:  new Map([[DRIVER_ID, { driver_id: DRIVER_ID, status: 'success' }]]),
+      carryoverByDriver:    new Set(),
     });
 
     await startMonitor();
@@ -863,9 +971,10 @@ describe('startMonitor() — mid-day restart guard', () => {
     jest.useFakeTimers({ now: ptHour(10), doNotFake: ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval'] });
     Driver.findAllActive.mockResolvedValue([buildActiveDriver({ scheduled_position: null })]);
     Log.loadTodayContext.mockResolvedValue({
-      latestByDriver:       new Map([[DRIVER_ID, { status: 'success' }]]),
+      latestAddByDriver:    new Map([[DRIVER_ID, { trigger_type: 'manual', status: 'success' }]]),
       requeueCountByDriver: new Map(),
       positionLogByDriver:  new Map(),
+      carryoverByDriver:    new Set(),
     });
 
     await startMonitor();

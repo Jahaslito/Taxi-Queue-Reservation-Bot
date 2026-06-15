@@ -7,7 +7,10 @@ module.exports = {
       instances:        1,
       autorestart:      true,
       watch:            false,
-      max_memory_restart: '1400M',
+      // Kept BELOW the Docker hard cap (docker-compose.yml app limit, 4096M) so
+      // pm2 restarts the app gracefully before Docker's OOM killer kills the
+      // container. Was 1400M for the 2 GB droplet — raised 2026-06-16 for 8 GB.
+      max_memory_restart: '3584M',
 
       // Logging
       out_file:   '/tmp/san-queue-out.log',

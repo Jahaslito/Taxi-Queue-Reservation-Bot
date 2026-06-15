@@ -77,7 +77,16 @@ const AUTO_REQUEUE_DELAY_MS = parseInt(process.env.MONITOR_REQUEUE_DELAY_MS ?? S
 // target position (the #0187 / #4377 failures). Fix: at the reset, proactively
 // remove leftovers from V Holding so they never reach the front to be dispatched
 // — they start the morning free to fire fresh at their scheduled target.
-const CARRYOVER_REMOVE_ENABLED = (process.env.MONITOR_CARRYOVER_REMOVE_ENABLED ?? 'true') !== 'false';
+// DISABLED BY DEFAULT (2026-06-15): the active midnight remove proved ineffective
+// — leftovers reappeared in V Holding within seconds and still drained to the
+// front (e.g. #0034: "removed" 00:00, back at pos 18 by 00:00:44, dispatched at
+// pos 8 by 00:09) — while its "success" logs + flag-clearing stripped carryover
+// protection and stranded the whole fleet as "already in queue". Protection now
+// comes purely from the carryover machinery (durable marker + debounced clear),
+// which no longer depends on this remove. Opt back in with the env flag to
+// experiment, but it can no longer strand anyone: removeCarryoverLeftover() is
+// pure best-effort and never touches the protection flags.
+const CARRYOVER_REMOVE_ENABLED = (process.env.MONITOR_CARRYOVER_REMOVE_ENABLED ?? 'false') === 'true';
 // Debounce for the carryover-cleared signal: require the driver to be absent
 // from V Holding for this many consecutive polls before dropping the carryover
 // flag. SAN's V Holding list is unstable around the midnight refresh — a single
@@ -923,11 +932,18 @@ function carryoverClearStep(absentPolls, threshold = CARRYOVER_CLEAR_POLLS) {
 }
 
 // ─── Overnight carryover cleanup ──────────────────────────────────────────────
-// Remove one leftover driver from yesterday's V Holding at the daily reset (see
-// CARRYOVER_REMOVE_ENABLED). On success we clear the carryover flag immediately
-// so the position scheduler arms a fresh fire for today's target without waiting
-// for the debounced poll-confirmation. Never throws — a failed remove just
-// leaves the driver in queue (SAN clears them itself, same as before the fix).
+// Best-effort attempt to pull one leftover out of yesterday's V Holding at the
+// daily reset (see CARRYOVER_REMOVE_ENABLED — DISABLED by default).
+//
+// CRITICAL: this NEVER mutates the carryover protection flags. The earlier
+// version cleared inQueueFromCarryover/hasBeenSeen on the bot's self-reported
+// "success", but that success doesn't mean the driver actually left — SAN's
+// rollover re-lists them within seconds, after which the next poll re-flagged
+// hasBeenSeen=true and the scheduler skipped them as "already in queue" (the
+// 2026-06-15 fleet-wide outage). The ONLY thing that clears carryover is the
+// debounced poll confirmation (carryoverClearStep) once the driver is genuinely
+// and repeatedly absent from V Holding. So even a "successful" remove here
+// leaves protection fully intact — the worst case is a wasted bot run.
 async function removeCarryoverLeftover(driverId, vehicleNumber) {
   try {
     const driver = await Driver.findByIdWithCredentials(driverId);
@@ -936,14 +952,9 @@ async function removeCarryoverLeftover(driverId, vehicleNumber) {
     const { runRemoveBotForDriver } = require('./schedulerService');
     const result = await runRemoveBotForDriver(driver, 'carryover_cleanup');
 
-    const s = watches.get(driverId);
-    if (result?.success && s) {
-      s.inQueueFromCarryover  = false;
-      s.hasBeenSeen           = false;
-      s.carryoverAbsentPolls  = 0;
-      if (s.state !== 'requeuing') s.state = 'watching';
-      console.log(`[Monitor] ✓ #${vehicleNumber} cleared from yesterday's leftover queue — armed for today's fresh schedule`);
-    } else if (!result?.success) {
+    if (result?.success) {
+      console.log(`[Monitor] carryover cleanup for #${vehicleNumber} sent remove (protection stays until SAN confirms the driver is gone)`);
+    } else {
       console.warn(`[Monitor] carryover cleanup for #${vehicleNumber} did not remove (${result?.error || 'unknown'}) — leaving in queue, SAN will clear it`);
     }
   } catch (err) {
@@ -1394,6 +1405,13 @@ async function poll() {
       // SAN is about to clear them. The flag is cleared automatically when the
       // driver leaves V Holding (see poll loop below).
       s.inQueueFromCarryover = !!s.hasBeenSeen;
+      // Durable, day-scoped "this driver was a leftover at midnight" flag. Unlike
+      // inQueueFromCarryover (which the debounce clears once SAN drops them), this
+      // stays true all day so a leftover that gets dropped then RE-APPEARS before
+      // firing is re-protected instead of mislabelled "already in queue" (the
+      // released-too-late case). Persisted via a carryover_marker log below so it
+      // also survives a restart between midnight and the morning fire window.
+      s.wasCarryoverToday    = !!s.hasBeenSeen;
 
       s.hasBeenSeen        = false;
       s.state              = s.inQueueFromCarryover ? 'in_queue' : 'watching';
@@ -1411,21 +1429,36 @@ async function poll() {
     console.log('[Monitor] Daily reset — counters and visibility state cleared');
     broadcast('daily_reset', { date: currentDayPT });
 
-    // Proactively pull leftover drivers out of yesterday's queue so SAN can't
-    // paper-dispatch them off the draining front overnight (→ no-show → benched
-    // "not authorized" → miss their morning target). Runs ONCE per day (this
-    // block only fires on the genuine date rollover, never on a mid-day restart
-    // since todayPT inits to the current day). Routed through the jobQueue so a
-    // batch of leftovers can't launch N Chromiums at once, and fire-and-forget
-    // so it never blocks the poll. Failure degrades to today's behaviour (SAN
-    // clears them itself; only the rare no-show dispatch is lost).
-    if (CARRYOVER_REMOVE_ENABLED) {
-      const leftovers = [...watches.values()].filter((s) => s.inQueueFromCarryover);
-      if (leftovers.length) {
-        console.log(`[Monitor] Daily reset — clearing ${leftovers.length} leftover driver(s) from yesterday's queue (prevents overnight no-show dispatch)`);
-        for (const s of leftovers) {
-          jobQueue.enqueue(() => removeCarryoverLeftover(s.driverId, s.vehicleNumber)).catch(() => {});
-        }
+    // Persist a durable carryover marker for every leftover. This is what lets
+    // addWatch() rebuild carryover protection after a restart between midnight
+    // and the morning fire window — the window where neither this reset nor the
+    // 3 AM re-arm runs again, and where a restart used to come back unprotected.
+    // Runs ONCE per day (this block only fires on the genuine date rollover, not
+    // a mid-day restart, since todayPT inits to the current day). Independent of
+    // the remove below so protection holds even with the remove disabled.
+    const leftovers = [...watches.values()].filter((s) => s.inQueueFromCarryover);
+    if (leftovers.length) {
+      const triggeredAt = new Date();
+      for (const s of leftovers) {
+        // trigger_type must equal Log.CARRYOVER_MARKER (canonical const in Log.js,
+        // where the matching read queries live). Inlined here because Log is a
+        // class whose static getter doesn't survive jest's automock.
+        Log.create({ driver_id: s.driverId, triggered_at: triggeredAt, trigger_type: 'carryover_marker', status: 'info' })
+          .catch((err) => console.warn(`[Monitor] carryover marker for #${s.vehicleNumber} failed: ${err.message}`));
+      }
+      console.log(`[Monitor] Daily reset — ${leftovers.length} leftover driver(s) tagged carryover (protected until SAN drops them)`);
+    }
+
+    // OPTIONAL active remove (CARRYOVER_REMOVE_ENABLED, off by default). Tries to
+    // pull leftovers out of yesterday's queue so SAN can't paper-dispatch them off
+    // the draining front overnight (→ no-show → benched → miss their target).
+    // Routed through the jobQueue (concurrency-capped) and fire-and-forget so it
+    // never blocks the poll. NOTE: this is pure best-effort and CANNOT strand
+    // anyone — removeCarryoverLeftover never touches the protection flags.
+    if (CARRYOVER_REMOVE_ENABLED && leftovers.length) {
+      console.log(`[Monitor] Daily reset — attempting active remove of ${leftovers.length} leftover driver(s)`);
+      for (const s of leftovers) {
+        jobQueue.enqueue(() => removeCarryoverLeftover(s.driverId, s.vehicleNumber)).catch(() => {});
       }
     }
   }
@@ -1605,7 +1638,14 @@ async function poll() {
     // for today so it can fire properly once SAN drops them. The flag is
     // cleared automatically the first poll the driver is no longer in V Holding.
     const isCarryover = state.inQueueFromCarryover;
-    const markSeen    = () => { if (!isCarryover && !state.hasBeenSeen) state.hasBeenSeen = true; };
+    // A driver that was a leftover today and hasn't fired yet must NEVER earn
+    // hasBeenSeen from passive observation — otherwise the scheduler's
+    // "already in queue, skipping" branch wrongly fires for them. This guard is
+    // what makes the carryover protection airtight: hasBeenSeen now flips true
+    // only via a genuine fresh fire (the bot sets it on success), never from
+    // seeing a leftover sitting in (or re-appearing in) the queue.
+    const carryoverProtected = isCarryover || (state.wasCarryoverToday && !state.positionFiredToday);
+    const markSeen    = () => { if (!carryoverProtected && !state.hasBeenSeen) state.hasBeenSeen = true; };
 
     if (inNotAuthorized) {
       // Driver is in the red "not authorized" zone — visible but blocked by SAN.
@@ -1664,6 +1704,17 @@ async function poll() {
         PositionTracking.updateActualPosition(trackingId, livePosition)
           .then(() => console.log(`[PosTracking] #${state.vehicleNumber} landed at ${livePosition} (target was recorded)`))
           .catch((err) => console.error('[PosTracking] Failed to update actual position:', err.message));
+      }
+      // Re-protect: a leftover that left the queue (debounce cleared the flag) or
+      // came back after a restart, and is now seen in V Holding again before it
+      // fired today, is re-tagged carryover so the scheduler holds it instead of
+      // skipping it as "already in queue" (the released-too-late case). Once it
+      // fires fresh (positionFiredToday) this no longer applies and a real entry
+      // marks it seen normally.
+      if (carryoverProtected && !state.inQueueFromCarryover) {
+        state.inQueueFromCarryover = true;
+        next = 'in_queue';
+        console.log(`[Monitor] #${state.vehicleNumber} — leftover re-appeared in V Holding, re-protected as carryover`);
       }
       markSeen();
       state.lastSeenAt = new Date();
@@ -2094,6 +2145,7 @@ async function poll() {
           // Only set if carryover isn't already active from a previous cycle.
           if (!state.inQueueFromCarryover) {
             state.inQueueFromCarryover = true;
+            state.wasCarryoverToday    = true; // treat exactly like an overnight carryover
             state.hasBeenSeen          = false;
             console.warn(
               `[Pos] ⚠️  #${state.vehicleNumber} early-join auto-rearm ` +
@@ -2213,15 +2265,20 @@ async function addWatch(driverId, { isAuto = false, _ctx = null } = {}) {
 
   const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
 
-  let lastLog, requeueCountToday, positionFiredToday;
+  // lastAddLog = the latest ADD-type log today. hasBeenSeen is derived ONLY from
+  // this — a REMOVE-type success (carryover_cleanup / manual_remove) must never be
+  // read back as "the driver is in queue" (the 2026-06-15 restart bug, where a
+  // midnight carryover-removal success restored hasBeenSeen=true and the scheduler
+  // skipped the whole fleet as "already in queue").
+  let lastAddLog, requeueCountToday, positionFiredToday, wasCarryoverToday;
   if (_ctx) {
-    const latestLog = _ctx.latestByDriver.get(driverId) ?? null;
-    lastLog             = latestLog;
+    lastAddLog          = _ctx.latestAddByDriver.get(driverId) ?? null;
     requeueCountToday   = _ctx.requeueCountByDriver.get(driverId) ?? 0;
     const hasPosSched   = !!(driver.scheduled_position || driver.day_positions);
     positionFiredToday  = hasPosSched ? !!_ctx.positionLogByDriver.get(driverId) : false;
+    wasCarryoverToday   = _ctx.carryoverByDriver.has(driverId);
   } else {
-    lastLog = await Log.findTodayLatest(driverId, today);
+    lastAddLog = await Log.findTodayLatestAdd(driverId, today);
     const todayLogs   = await Log.findTodayMonitorRequeues(driverId, today);
     requeueCountToday = todayLogs ? parseInt(todayLogs.count, 10) : 0;
     const hasPosSched = !!(driver.scheduled_position || driver.day_positions);
@@ -2229,9 +2286,17 @@ async function addWatch(driverId, { isAuto = false, _ctx = null } = {}) {
       ? await Log.findTodayByTriggerType(driverId, 'position_schedule', today)
       : null;
     positionFiredToday = !!positionLog;
+    wasCarryoverToday  = await Log.wasCarryoverToday(driverId, today);
   }
 
-  const hasBeenSeen = !!(lastLog && ['success', 'already_queued'].includes(lastLog.status));
+  const hasBeenSeen = !!(lastAddLog && ['success', 'already_queued'].includes(lastAddLog.status));
+  // Rebuild carryover protection after a restart. A driver flagged a leftover at
+  // today's midnight (durable marker) that we have NOT yet fired or re-added is
+  // still carryover — restore the flag so the scheduler waits for SAN to drop
+  // them and fires fresh at target, instead of the next poll mislabelling them
+  // "already in queue". If we already fired/added them today, they're legitimately
+  // ours and not carryover.
+  const inQueueFromCarryover = wasCarryoverToday && !hasBeenSeen && !positionFiredToday;
 
   const state = {
     driverId,
@@ -2239,7 +2304,7 @@ async function addWatch(driverId, { isAuto = false, _ctx = null } = {}) {
     vehicleNumber:     driver.vehicle_number,
     vehicleNorm:       norm(driver.vehicle_number),
     isAuto,
-    state:             hasBeenSeen ? 'in_queue' : 'watching',
+    state:             (hasBeenSeen || inQueueFromCarryover) ? 'in_queue' : 'watching',
     hasBeenSeen,
     addedAt:           new Date(),
     lastSeenAt:        null,
@@ -2257,7 +2322,8 @@ async function addWatch(driverId, { isAuto = false, _ctx = null } = {}) {
     maxAcceptablePosition:   driver.max_acceptable_position ?? null, // null → default to target + 40
     manuallyRemovedAt:       driver.manually_removed_at ?? null,
     positionFiredToday,
-    inQueueFromCarryover: false, // set at midnight reset for drivers still in V Holding
+    inQueueFromCarryover,      // true at midnight reset for leftovers + rebuilt here on restart
+    wasCarryoverToday,         // durable day-scoped leftover flag (survives debounce clear + restart)
     carryoverAbsentPolls: 0,   // debounce: consecutive polls a carryover driver is absent from V Holding
     currentPosition:    null,  // live position updated every poll tick
     lastPosition:       null,  // position bot placed them at (from bot result)
@@ -2278,7 +2344,7 @@ async function addWatch(driverId, { isAuto = false, _ctx = null } = {}) {
   else         manualWatchIds.add(driverId);
 
   broadcast('watch_added', { driverId, state: snap(state) });
-  console.log(`[Monitor] Watching #${driver.vehicle_number} (id=${driverId}, auto=${isAuto}, hasBeenSeen=${hasBeenSeen})`);
+  console.log(`[Monitor] Watching #${driver.vehicle_number} (id=${driverId}, auto=${isAuto}, hasBeenSeen=${hasBeenSeen}, carryover=${inQueueFromCarryover})`);
 
   return snap(state);
 }
@@ -2374,6 +2440,7 @@ function armPositionWindowForToday(dayKey = todayPT) {
       s.hasBeenSeen === true;
 
     s.inQueueFromCarryover = isObservablyQueued;
+    s.wasCarryoverToday    = isObservablyQueued; // re-arm treats a currently-queued driver as a leftover
     s.hasBeenSeen          = false;
     s.positionFiredToday   = false;
     s.lastPosDecision      = null;
@@ -2430,6 +2497,7 @@ function allowRefireToday(driverId) {
     state.hasBeenSeen === true;
 
   state.inQueueFromCarryover = isObservablyQueued;
+  state.wasCarryoverToday    = isObservablyQueued; // re-arm treats a currently-queued driver as a leftover
   state.hasBeenSeen          = false;
   state.positionFiredToday   = false;
   state.manuallyRemovedAt    = null;
@@ -2634,11 +2702,13 @@ async function startMonitor() {
   // #0187 incident: fired at 04:37, restart at 08:29 re-tagged as carryover,
   // dispatch at 10:34 logged "SAN cleared overnight carryover" with no
   // triggerRequeue, driver had to manually re-add at the terminal ~1h 53m
-  // later). DB-restored positionFiredToday/hasBeenSeen on any watched driver
-  // is durable evidence the window already armed today — skip the re-arm.
+  // later). DB-restored positionFiredToday/hasBeenSeen/inQueueFromCarryover on
+  // any watched driver is durable evidence the window already armed today —
+  // skip the re-arm so it can't wipe the state addWatch just reconstructed
+  // (including carryover protection rebuilt from the midnight marker).
   const todayKey = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
   const dayAlreadyInProgress = [...watches.values()].some(
-    (s) => s.positionFiredToday || s.hasBeenSeen,
+    (s) => s.positionFiredToday || s.hasBeenSeen || s.inQueueFromCarryover,
   );
   if (dayAlreadyInProgress) {
     positionWindowArmedForDate = todayKey;
@@ -2829,6 +2899,7 @@ function getPositionDiagnostics() {
       maxAcceptable,
       positionFiredToday:   state.positionFiredToday,
       inQueueFromCarryover: state.inQueueFromCarryover,
+      wasCarryoverToday:    state.wasCarryoverToday,
       hasBeenSeen:          state.hasBeenSeen,
       schedulerStatus,
       warningLevel,
@@ -2881,6 +2952,8 @@ module.exports = {
   _isWithinOperatingHours:    isWithinOperatingHours,
   _evaluatePositionScheduler: evaluatePositionScheduler,
   _carryoverClearStep:        carryoverClearStep,
+  _removeCarryoverLeftover:   removeCarryoverLeftover,
+  _setWatch:                  (driverId, state) => watches.set(driverId, state),
   _expectedNextPollMs:        expectedNextPollMs,
   _botExecutionEstimateMs:    botExecutionEstimateMs,
   _recordBotLatency:          recordBotLatency,

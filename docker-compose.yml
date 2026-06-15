@@ -29,6 +29,15 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    # Guarantee Postgres a FLOOR of RAM (reservation) so an app spike can't
+    # starve it — but deliberately NO hard limit: Postgres legitimately bursts
+    # above baseline (large sorts, VACUUM, the nightly pg_dump), and a ceiling
+    # would risk an OOM-kill mid-query. Bounding the APP at 4G already prevents
+    # it from eating the whole box, so the db ceiling isn't needed.
+    deploy:
+      resources:
+        reservations:
+          memory: 512M
 
   # ── App (Node.js + Playwright) ───────────────────────────────────────────────
   app:
@@ -154,12 +163,19 @@ services:
     networks:
       - internal
 
-    # Resource limits — adjust to your droplet size
-    # 2GB droplet: keep app under 1.5GB so the OS has headroom
+    # Resource limits — sized for an 8 GB droplet (shared with the db service +
+    # OS + host nginx). The app gets the bulk so it can run more pre-armed
+    # Chromiums; the cap still contains a runaway-browser leak so it can't
+    # OOM-kill Postgres. IMPORTANT: keep pm2's max_memory_restart
+    # (ecosystem.config.js) BELOW this hard cap so pm2 restarts the app
+    # gracefully before Docker's OOM killer fires. Was 1536M when the droplet
+    # was 2 GB — raised 2026-06-16.
     deploy:
       resources:
         limits:
-          memory: 1536M
+          memory: 4096M
+        reservations:
+          memory: 1024M
 
 volumes:
   pgdata:         # postgres data persists across container restarts

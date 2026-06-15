@@ -92,6 +92,41 @@ app.get('/api/config', (req, res) => {
   });
 });
 
+// ─── Dev live-reload (never mounted in production) ────────────────────────────
+// Auto-refreshes the browser whenever a file under public/ changes, so you
+// never have to refresh by hand. The client (index.html / admin.html) opens an
+// EventSource to /__livereload only on localhost; here we push "reload" on any
+// public/ change. Backend edits restart the process (npm run dev = node --watch);
+// the client reloads on the EventSource reconnect that follows.
+if (env.nodeEnv !== 'production') {
+  const liveReloadClients = new Set();
+
+  app.get('/__livereload', (req, res) => {
+    res.set({
+      'Content-Type':  'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection:      'keep-alive',
+    });
+    res.flushHeaders?.();
+    res.write('retry: 1000\n\n');
+    liveReloadClients.add(res);
+    req.on('close', () => liveReloadClients.delete(res));
+  });
+
+  let reloadTimer = null;
+  try {
+    fs.watch(path.join(__dirname, 'public'), { recursive: true }, () => {
+      clearTimeout(reloadTimer);
+      reloadTimer = setTimeout(() => {
+        for (const res of liveReloadClients) res.write('data: reload\n\n');
+      }, 100); // debounce editor "save" bursts
+    });
+    console.log('[dev] live-reload active — browser auto-refreshes on public/ changes');
+  } catch (err) {
+    console.warn('[dev] live-reload disabled — could not watch public/:', err.message);
+  }
+}
+
 // ─── Legal pages (must precede the SPA fallback so they don't get swallowed) ──
 // /privacy and /terms are referenced from the signup consent notice and submitted
 // to Telnyx as part of toll-free verification. Plain static HTML — no SPA shell,
@@ -146,6 +181,9 @@ async function bootstrap() {
 
     const { startSessionWarmer } = require('./src/services/sessionWarmerService');
     startSessionWarmer();
+
+    const { startCardEnforcement } = require('./src/services/cardEnforcementService');
+    startCardEnforcement();
   });
 }
 

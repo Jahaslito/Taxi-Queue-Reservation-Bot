@@ -188,3 +188,65 @@ function urlBase64ToUint8Array(base64String) {
 // Expose to app.js so it can call from showView() when the dashboard mounts.
 // Same pattern as bootSos in sos.controller.js.
 window.initDispatchAlerts = initDispatchAlerts;
+
+// ─── Account view: SMS opt-in toggle ─────────────────────────────────────────
+// Lives on the account page so drivers who unchecked SMS at signup (or want
+// to revoke later) can change their mind any time. Persists via PUT
+// /api/driver/profile. UI is independent of the push channel — SMS and push
+// are two different consents.
+
+let smsBusy = false;
+
+function paintSmsToggle(enabled) {
+  const track = document.getElementById('acct-sms-toggle-track');
+  const thumb = document.getElementById('acct-sms-toggle-thumb');
+  const cb    = document.getElementById('acct-sms-toggle');
+  if (!track || !thumb || !cb) return;
+  cb.checked = !!enabled;
+  track.style.background = enabled ? '#22c55e' : 'rgba(255,255,255,0.15)';
+  thumb.style.transform  = enabled ? 'translateX(20px)' : 'translateX(0)';
+}
+
+function setSmsStatus(text, color) {
+  const el = document.getElementById('acct-sms-status');
+  if (!el) return;
+  el.style.color    = color || 'var(--muted)';
+  el.textContent    = text || '';
+}
+
+async function persistSmsOptIn(enabled) {
+  if (smsBusy) return;
+  smsBusy = true;
+  setSmsStatus('Saving…');
+  try {
+    const data = await api('/api/driver/profile', {
+      method: 'PUT',
+      body:   JSON.stringify({ smsOptIn: !!enabled }),
+    });
+    if (typeof driverProfile !== 'undefined') {
+      driverProfile = data.driver || driverProfile;
+    }
+    paintSmsToggle(enabled);
+    setSmsStatus(enabled ? '✓ SMS alerts on' : '✓ SMS alerts off', enabled ? '#86efac' : 'var(--muted)');
+  } catch (err) {
+    // Revert UI on failure so the toggle reflects the persisted truth, not
+    // the user's failed intent.
+    const prior = driverProfile?.sms_opt_in;
+    paintSmsToggle(prior);
+    setSmsStatus(err.message || 'Could not save', 'var(--red)');
+  } finally {
+    smsBusy = false;
+  }
+}
+
+function initAccountSmsToggle(profile) {
+  const cb = document.getElementById('acct-sms-toggle');
+  if (!cb || !profile) return;
+  paintSmsToggle(profile.sms_opt_in === true);
+  setSmsStatus('');
+  // Bind once per mount — listener replacement avoids stacking handlers if
+  // the account view is shown repeatedly.
+  cb.onchange = (e) => persistSmsOptIn(e.target.checked);
+}
+
+window.initAccountSmsToggle = initAccountSmsToggle;

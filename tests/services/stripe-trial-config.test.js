@@ -4,7 +4,7 @@
 // We test the pure function `_trialConfig(nowSec, pauseUntilSec)` so we don't
 // have to mock the Stripe SDK — pure inputs in, pure config out.
 
-const { _trialConfig } = require('../../src/services/stripeService');
+const { _trialConfig, _skipTrialConfig } = require('../../src/services/stripeService');
 
 const ONE_DAY = 24 * 60 * 60;
 
@@ -108,6 +108,43 @@ describe('stripeService._trialConfig — trial selection', () => {
       const result = _trialConfig(NOW, NOW + 21 * ONE_DAY);
       expect(result).toHaveProperty('trial_end');
       expect(result).not.toHaveProperty('trial_period_days');
+    });
+  });
+});
+
+describe('stripeService._skipTrialConfig — grandfathered reactivation (no free trial)', () => {
+  const NOW = 1_700_000_000;
+
+  describe('no pause window active', () => {
+    test('STRIPE_PAUSE_UNTIL unset (NaN) → null (charge at checkout)', () => {
+      expect(_skipTrialConfig(NOW, NaN)).toBeNull();
+    });
+
+    test('STRIPE_PAUSE_UNTIL = 0 → null (charge at checkout)', () => {
+      expect(_skipTrialConfig(NOW, 0)).toBeNull();
+    });
+
+    test('pauseUntil in the past → null (charge at checkout)', () => {
+      expect(_skipTrialConfig(NOW, NOW - 1000)).toBeNull();
+    });
+
+    test('pauseUntil exactly = now (boundary) → null (charge at checkout)', () => {
+      expect(_skipTrialConfig(NOW, NOW)).toBeNull();
+    });
+  });
+
+  describe('pause window active — defer first charge to pause-end, no extra trial', () => {
+    test('returns trial_end = pause-end exactly (no +14 days)', () => {
+      const pauseUntil = NOW + 21 * ONE_DAY;
+      expect(_skipTrialConfig(NOW, pauseUntil)).toEqual({ trial_end: pauseUntil });
+    });
+
+    test('never charges inside the pause window', () => {
+      const pauseUntil = NOW + 10 * ONE_DAY;
+      for (let dayOffset = 0; dayOffset < 10; dayOffset++) {
+        const t = NOW + dayOffset * ONE_DAY;
+        expect(_skipTrialConfig(t, pauseUntil).trial_end).toBeGreaterThanOrEqual(pauseUntil);
+      }
     });
   });
 });

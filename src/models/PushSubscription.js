@@ -35,6 +35,16 @@ class PushSubscription {
     return db(TABLE).where({ role });
   }
 
+  /**
+   * All subscriptions for a set of subscribers within a role — used by the
+   * broadcast fan-out to push only to the targeted drivers (vs. loading every
+   * driver subscription and filtering in JS). Empty id list → no rows.
+   */
+  static findByRoleAndSubscriberIds(role, subscriberIds) {
+    if (!subscriberIds || !subscriberIds.length) return Promise.resolve([]);
+    return db(TABLE).where({ role }).whereIn('subscriber_id', subscriberIds);
+  }
+
   static deleteByEndpoint(endpoint) {
     return db(TABLE).where({ endpoint }).del();
   }

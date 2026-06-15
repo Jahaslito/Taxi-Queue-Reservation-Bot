@@ -9,6 +9,7 @@
 //   customer.subscription.deleted      → subscription cancelled
 //   invoice.payment_succeeded / paid   → payment succeeded → ensure status = active
 //   invoice.payment_failed             → payment failed → status = past_due
+//   payment_method.attached            → card added via portal → lift card lock
 
 const express = require('express');
 const Driver  = require('../models/Driver');
@@ -59,6 +60,10 @@ router.post(
             stripe_subscription_id: session.subscription,
             subscription_status:    sub.status,
             trial_ends_at:          sub.trial_end ? new Date(sub.trial_end * 1000) : null,
+            // A card is now on file — lift any card-enforcement lock and
+            // re-activate a driver the sweep had deactivated.
+            is_active:              true,
+            card_required_by:       null,
           });
 
           console.log(`[Stripe Webhook] Driver ${driverId} subscribed — status: ${sub.status}`);
@@ -95,8 +100,27 @@ router.post(
           const driver  = await Driver.findByStripeCustomerId(invoice.customer);
           if (!driver) break;
 
-          await Driver.update(driver.id, { subscription_status: 'active' });
+          // A successful charge means a working card is on file — clear any
+          // card-enforcement lock and re-activate.
+          await Driver.update(driver.id, {
+            subscription_status: 'active',
+            is_active:           true,
+            card_required_by:    null,
+          });
           console.log(`[Stripe Webhook] Driver ${driver.id} ${event.type} → active`);
+          break;
+        }
+
+        // Fires when a driver adds a card via the Billing Portal without a new
+        // checkout (e.g. updating their payment method). Lift the lock too.
+        case 'payment_method.attached': {
+          const pm     = event.data.object;
+          const driver = await Driver.findByStripeCustomerId(pm.customer);
+          if (!driver) break;
+          if (!driver.card_required_by && driver.is_active) break; // nothing to lift
+
+          await Driver.update(driver.id, { is_active: true, card_required_by: null });
+          console.log(`[Stripe Webhook] Driver ${driver.id} payment_method.attached → card lock lifted`);
           break;
         }
 

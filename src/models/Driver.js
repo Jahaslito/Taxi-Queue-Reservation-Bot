@@ -11,6 +11,10 @@ const PUBLIC_FIELDS = [
   'manually_removed_at',
   // Subscription
   'stripe_customer_id', 'stripe_subscription_id', 'subscription_status', 'trial_ends_at',
+  // Card-on-file enforcement deadline (grandfathered cardless cohort)
+  'card_required_by',
+  // SMS opt-in (Telnyx toll-free compliance — must be an explicit per-driver choice)
+  'sms_opt_in',
 ];
 
 class Driver {
@@ -47,6 +51,23 @@ class Driver {
     return db(TABLE)
       .select(PUBLIC_FIELDS.concat(['san_password']))
       .where({ is_active: true, monitor_enabled: true });
+  }
+
+  /**
+   * Drivers whose add-a-card grace window has expired but who are still active
+   * with access — the enforcement sweep deactivates these. We only ever stamp
+   * card_required_by on the grandfathered cardless cohort, so the presence of a
+   * past deadline is itself the "still owes a card" signal; we additionally
+   * require an access-granting status so a driver who self-healed (status moved
+   * to past_due/canceled by some other path) isn't touched twice.
+   */
+  static findCardEnforcementDue() {
+    return db(TABLE)
+      .select('id', 'name', 'email', 'vehicle_number', 'card_required_by')
+      .where({ is_active: true })
+      .whereIn('subscription_status', ['active', 'trialing'])
+      .whereNotNull('card_required_by')
+      .where('card_required_by', '<', db.fn.now());
   }
 
   static async create(data) {
@@ -91,6 +112,8 @@ class Driver {
         'd.id', 'd.name', 'd.phone', 'd.email', 'd.san_username',
         'd.vehicle_number', 'd.scheduled_time', 'd.scheduled_days', 'd.day_schedules',
         'd.scheduled_position', 'd.day_positions', 'd.is_active', 'd.notes', 'd.created_at',
+        // Billing — lets the admin list derive each driver's payment status
+        'd.subscription_status', 'd.stripe_customer_id', 'd.card_required_by',
         'l.status         as last_status',
         'l.queue_position as last_position',
         'l.triggered_at   as last_run',
@@ -150,6 +173,21 @@ class Driver {
     return db(TABLE)
       .where({ password_reset_token: token })
       .first();
+  }
+
+  /**
+   * Lean recipient list for admin broadcasts — active drivers only, with just
+   * the fields the fan-out needs (id for push targeting, phone for SMS, name +
+   * vehicle for any future per-driver personalization). Omitting driverIds (or
+   * passing an empty array) returns every active driver = a blast.
+   */
+  static listForBroadcast({ driverIds } = {}) {
+    return db(TABLE)
+      .select('id', 'name', 'phone', 'vehicle_number')
+      .where({ is_active: true })
+      .modify((q) => {
+        if (driverIds && driverIds.length) q.whereIn('id', driverIds);
+      });
   }
 
   /** Counts active drivers grouped by scheduled_time for the overview dashboard */

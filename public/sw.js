@@ -8,8 +8,15 @@
 //   3. activate handler purges any caches not matching CACHE_NAME
 //   4. clients.claim() takes over open tabs immediately
 //   5. Next navigation (or app reopen) serves the new files
-const CACHE_VERSION = 'v25';
+const CACHE_VERSION = 'v32';
 const CACHE_NAME    = `san-queue-${CACHE_VERSION}`;
+
+// On localhost the service worker only gets in the way: cache-first serving of
+// stale assets is what forces a hard refresh after every edit. When running in
+// dev we tear the SW down (purge caches + unregister + reload open tabs) and
+// never intercept fetches, so a normal save shows up immediately. Production
+// (any non-localhost host) keeps the full offline-capable behaviour below.
+const DEV = self.location.hostname === 'localhost' || self.location.hostname === '127.0.0.1';
 
 const PRECACHE = [
   '/',
@@ -23,6 +30,7 @@ const PRECACHE = [
   '/js/driver/history.controller.js',
   '/js/driver/schedule.controller.js',
   '/js/driver/sos.controller.js',
+  '/js/driver/messages.controller.js',
   '/js/admin/app.js',
   '/js/admin/auth.controller.js',
   '/js/admin/daySchedule.controller.js',
@@ -32,6 +40,7 @@ const PRECACHE = [
   '/js/admin/overview.controller.js',
   '/js/admin/scheduledDrivers.controller.js',
   '/js/admin/sos.controller.js',
+  '/js/admin/messages.controller.js',
   '/js/admin/watchlist.controller.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png',
@@ -39,6 +48,7 @@ const PRECACHE = [
 ];
 
 self.addEventListener('install', event => {
+  if (DEV) { self.skipWaiting(); return; }
   event.waitUntil(
     caches.open(CACHE_NAME)
       .then(cache => cache.addAll(PRECACHE))
@@ -47,6 +57,18 @@ self.addEventListener('install', event => {
 });
 
 self.addEventListener('activate', event => {
+  if (DEV) {
+    // Dev kill-switch: remove ourselves so the page is served straight from the
+    // network from now on, then reload any open tabs to drop the stale assets.
+    event.waitUntil((async () => {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k)));
+      await self.registration.unregister();
+      const clients = await self.clients.matchAll({ type: 'window' });
+      clients.forEach(c => c.navigate(c.url));
+    })());
+    return;
+  }
   event.waitUntil(
     caches.keys()
       .then(keys => Promise.all(
@@ -56,39 +78,52 @@ self.addEventListener('activate', event => {
   );
 });
 
-// ─── Web Push: SOS alerts (admin) and dispatch alerts (driver) ───────────────
+// ─── Web Push: SOS alerts (admin), dispatch + admin messages (driver) ────────
 // Payload shape from the server:
-//   { title, body, tag, data: { type: 'dispatch'|'sos.new'|'sos.updated', url, ... } }
+//   { title, body, tag, data: { type: 'dispatch'|'admin_message'|'sos.new'|'sos.updated', url, ... } }
 // Type-specific handling (vibrate pattern, requireInteraction) lets each
 // notification feel right for its urgency — SOS demands attention until
-// dismissed; a dispatch notification just needs to land and stay readable.
+// dismissed; an admin message should stay readable until acknowledged; a
+// dispatch notification just needs to land (driver may already be moving).
 self.addEventListener('push', (event) => {
   let payload = { title: 'SAN Queue', body: 'New event', data: {} };
   try { if (event.data) payload = { ...payload, ...event.data.json() }; }
   catch { /* non-JSON payload — keep defaults */ }
 
-  const isDispatch = payload.data?.type === 'dispatch';
+  const type       = payload.data?.type;
+  const isDispatch = type === 'dispatch';
+  const isAdminMsg = type === 'admin_message';
 
-  event.waitUntil(
-    self.registration.showNotification(payload.title, {
+  event.waitUntil((async () => {
+    await self.registration.showNotification(payload.title, {
       body:      payload.body,
-      tag:       payload.tag || (isDispatch ? 'dispatch' : 'sos'),
+      tag:       payload.tag || (isDispatch ? 'dispatch' : isAdminMsg ? 'admin-msg' : 'sos'),
       icon:      '/icons/icon-192.png',
       badge:     '/icons/icon-192.png',
       data:      payload.data || {},
-      // SOS = stays until clicked (admin must see it).
-      // Dispatch = OS controls when it's dismissed — driver may already be moving.
+      // SOS + admin messages stay until clicked; dispatch can auto-dismiss.
       requireInteraction: !isDispatch,
       vibrate:   isDispatch ? [120, 60, 120] : [200, 100, 200, 100, 200],
-    }),
-  );
+    });
+
+    // Live in-app update: if a driver tab is open, tell it to refresh its bell
+    // badge + show the banner immediately (don't wait for the next poll).
+    if (isAdminMsg) {
+      const clientsArr = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      for (const c of clientsArr) {
+        c.postMessage({ type: 'admin_message', messageId: payload.data?.messageId });
+      }
+    }
+  })());
 });
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   const data = event.notification.data || {};
-  const url  = data.url || (data.type === 'dispatch' ? '/' : '/admin');
-  const focusToken = data.type === 'dispatch' ? '/' : '/admin';
+  // dispatch + admin_message belong to the driver app (root); SOS to /admin.
+  const isDriverSurface = data.type === 'dispatch' || data.type === 'admin_message';
+  const url  = data.url || (isDriverSurface ? '/' : '/admin');
+  const focusToken = isDriverSurface ? '/' : '/admin';
 
   event.waitUntil((async () => {
     const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
@@ -97,7 +132,12 @@ self.addEventListener('notificationclick', (event) => {
     for (const c of all) {
       const path = new URL(c.url).pathname;
       if (focusToken === '/admin' ? path.startsWith('/admin') : !path.startsWith('/admin')) {
-        c.focus();
+        await c.focus();
+        // Deep-link the driver app straight to the tapped message (open inbox,
+        // highlight + mark read). A freshly opened window picks it up on boot.
+        if (data.type === 'admin_message') {
+          c.postMessage({ type: 'open_message', messageId: data.messageId });
+        }
         return;
       }
     }
@@ -118,6 +158,9 @@ self.addEventListener('sync', (event) => {
 });
 
 self.addEventListener('fetch', event => {
+  // Dev: never intercept — let every request hit the network for fresh assets.
+  if (DEV) return;
+
   const { request } = event;
   const url = new URL(request.url);
 

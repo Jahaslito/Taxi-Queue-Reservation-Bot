@@ -8,6 +8,7 @@ const PositionTracking        = require('../models/PositionTracking');
 const { encrypt, decrypt }    = require('../services/cryptoService');
 const { runBotForDriver }     = require('../services/schedulerService');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/emailService');
+const { derivePaymentStatus } = require('../services/paymentStatus');
 
 async function getStats(req, res, next) {
   try {
@@ -121,7 +122,8 @@ async function listDrivers(req, res, next) {
     const credentialLockout = require('../services/credentialLockoutService');
     const withLockState = drivers.map((d) => ({
       ...d,
-      lockedOut: credentialLockout.isLockedOut(Number(d.id)),
+      lockedOut:     credentialLockout.isLockedOut(Number(d.id)),
+      paymentStatus: derivePaymentStatus(d),
     }));
 
     res.json({ drivers: withLockState, total: parseInt(countResult.count, 10), limit, offset });
@@ -143,7 +145,7 @@ async function getDriver(req, res, next) {
       throw err;
     }
 
-    res.json({ ...driver, recentLogs });
+    res.json({ ...driver, recentLogs, paymentStatus: derivePaymentStatus(driver) });
   } catch (err) {
     next(err);
   }
@@ -736,6 +738,53 @@ async function verifyDriverCredentials(req, res, next) {
   }
 }
 
+// ─── Manually lock a driver out until they add a card ─────────────────────────
+// Immediate version of the card-enforcement sweep: deactivates the driver
+// (is_active=false stops the bot + shows them as inactive) and stamps
+// card_required_by=now. They can still log in (auth relaxes for billing-locked
+// drivers) and land on the "Add a Card to Reactivate" screen; the Stripe webhook
+// flips them back to active the moment a card is confirmed. Intended for drivers
+// with no card on file — the admin UI only surfaces this for that cohort.
+async function requireCard(req, res, next) {
+  try {
+    const driver = await Driver.findById(req.params.id);
+    if (!driver) return res.status(404).json({ error: 'Driver not found' });
+
+    await Driver.update(driver.id, {
+      is_active:           false,
+      subscription_status: 'past_due',
+      card_required_by:    new Date(),
+    });
+
+    console.log(`[Admin] Driver ${driver.id} (#${driver.vehicle_number}) locked — card required`);
+    res.json({ ok: true, message: `${driver.name} is locked out until they add a card.` });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ─── Clear a card requirement (admin waiver / undo a mistaken lock) ────────────
+// Restores grandfathered access: clears the deadline, re-activates, and puts the
+// subscription back to active. Use when a driver should keep access without a
+// card, or to reverse an accidental lock.
+async function clearCardRequirement(req, res, next) {
+  try {
+    const driver = await Driver.findById(req.params.id);
+    if (!driver) return res.status(404).json({ error: 'Driver not found' });
+
+    await Driver.update(driver.id, {
+      is_active:           true,
+      subscription_status: 'active',
+      card_required_by:    null,
+    });
+
+    console.log(`[Admin] Driver ${driver.id} (#${driver.vehicle_number}) card requirement cleared`);
+    res.json({ ok: true, message: `Card requirement cleared for ${driver.name}.` });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   getStats,
   listDrivers,
@@ -754,4 +803,6 @@ module.exports = {
   unlockCredentials,
   verifyDriverCredentials,
   getCarryoverReport,
+  requireCard,
+  clearCardRequirement,
 };

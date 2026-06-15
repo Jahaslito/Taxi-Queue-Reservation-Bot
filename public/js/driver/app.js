@@ -30,11 +30,13 @@ function showView(viewId) {
     loadDashboard();
     if (window.bootSos) window.bootSos();
     if (window.initDispatchAlerts) window.initDispatchAlerts();
+    if (window.initMessages) window.initMessages();
   }
   if (viewId === 'view-history')   loadHistory();
   if (viewId === 'view-schedule')  loadSchedule();
-  if (viewId === 'view-account' && window.renderAccountSubscription) {
-    window.renderAccountSubscription(driverProfile);
+  if (viewId === 'view-account') {
+    if (window.renderAccountSubscription) window.renderAccountSubscription(driverProfile);
+    if (window.initAccountSmsToggle)      window.initAccountSmsToggle(driverProfile);
   }
 
   window.scrollTo(0, 0);

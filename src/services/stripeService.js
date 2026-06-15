@@ -64,25 +64,56 @@ function trialConfig(nowSec, pauseUntilSec) {
 }
 
 /**
+ * Compute the subscription config when the trial is intentionally skipped.
+ *
+ * Used for grandfathered drivers who already had free access and are now
+ * reactivating by adding a card — they should be charged at checkout rather
+ * than handed a fresh 14-day trial.
+ *
+ * Pause-window override: if a billing pause is active we must still NOT charge
+ * inside the window (consistent with `trialConfig` and pause-subscriptions.js),
+ * so we defer the first charge to exactly the pause-end via `trial_end`. No
+ * extra 14 days — the moment the pause clears, billing begins.
+ *
+ * Returns `null` when there is nothing to set (immediate charge at checkout).
+ *
+ * Pure / no I/O — exported for unit testing via `_skipTrialConfig`.
+ */
+function skipTrialConfig(nowSec, pauseUntilSec) {
+  if (Number.isFinite(pauseUntilSec) && pauseUntilSec > nowSec) {
+    return { trial_end: pauseUntilSec };
+  }
+  return null;
+}
+
+/**
  * Create a hosted Checkout Session for a new subscription.
  * The trial period is handled on the subscription_data side so Stripe
  * collects card details upfront but charges nothing until the trial ends.
  *
- * See `trialConfig` above for the pause-window behavior.
+ * Pass `skipTrial: true` for grandfathered reactivations — no free trial, the
+ * card is charged at checkout (still deferred if a billing pause is active).
+ *
+ * See `trialConfig` / `skipTrialConfig` above for the pause-window behavior.
  */
-async function createCheckoutSession({ customerId, driverId, successUrl, cancelUrl }) {
+async function createCheckoutSession({ customerId, driverId, successUrl, cancelUrl, skipTrial = false }) {
   const priceId = process.env.STRIPE_PRICE_ID;
   if (!priceId) throw new Error('STRIPE_PRICE_ID is not set');
 
   const pauseUntilSec = parseInt(process.env.STRIPE_PAUSE_UNTIL ?? '0', 10);
   const nowSec        = Math.floor(Date.now() / 1000);
 
+  const subscriptionData = skipTrial
+    ? skipTrialConfig(nowSec, pauseUntilSec)
+    : trialConfig(nowSec, pauseUntilSec);
+
   return getStripe().checkout.sessions.create({
     customer:             customerId,
     payment_method_types: ['card'],
     mode:                 'subscription',
     line_items:           [{ price: priceId, quantity: 1 }],
-    subscription_data:    trialConfig(nowSec, pauseUntilSec),
+    // Omitted entirely when skipTrial has nothing to defer → charge at checkout.
+    ...(subscriptionData ? { subscription_data: subscriptionData } : {}),
     success_url:          successUrl || `${appUrl}/?billing=success`,
     cancel_url:           cancelUrl  || `${appUrl}/?billing=canceled`,
     // Store driver_id so the webhook can identify which driver subscribed
@@ -123,5 +154,6 @@ module.exports = {
   retrieveSubscription,
   constructWebhookEvent,
   // Exported for unit testing — not called by route handlers.
-  _trialConfig: trialConfig,
+  _trialConfig:     trialConfig,
+  _skipTrialConfig: skipTrialConfig,
 };

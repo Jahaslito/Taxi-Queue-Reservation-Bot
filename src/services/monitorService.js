@@ -1639,7 +1639,11 @@ async function poll() {
               driverId,
               driverName:    driver.name,
               vehicleNumber: state.vehicleNumber,
-              phone:         driver.phone || null,
+              // Telnyx compliance — SMS only goes to drivers who explicitly
+              // opted in at signup (or via the account-settings toggle).
+              // Pushing phone=null here makes notifyDispatch skip the SMS
+              // branch but still fire any registered push subscriptions.
+              phone:         driver.sms_opt_in ? (driver.phone || null) : null,
               terminal,
             });
           })

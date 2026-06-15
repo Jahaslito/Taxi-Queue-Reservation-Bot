@@ -64,6 +64,25 @@ async function loadDrivers(page) {
       const activeBadge = d.is_active
         ? '<span class="badge success"><span class="badge-dot"></span>Active</span>'
         : '<span class="badge inactive">Inactive</span>';
+
+      // Payment status badge (derived server-side from the billing columns)
+      const pay     = d.paymentStatus || {};
+      const payCls  = {
+        card_on_file: 'success', trialing: 'success',
+        card_grace: 'pending', grandfathered: 'pending', incomplete: 'pending',
+        card_overdue: 'failed', card_locked: 'failed', past_due: 'failed', unpaid: 'failed',
+        canceled: 'inactive', none: 'inactive',
+      }[pay.code] || 'inactive';
+      const payBadge = pay.label
+        ? `<div style="margin-top:4px;"><span class="badge ${payCls}" title="Payment status">💳 ${esc(pay.label)}</span></div>`
+        : '';
+
+      // Card lock / clear action — shown only for the relevant cohort
+      const cardBtn = d.card_required_by
+        ? `<button class="btn btn-ghost btn-sm" data-action="clear-card" data-id="${Number(d.id)}" data-name="${esc(d.name)}" title="Clear the card requirement and restore this driver's access">💳 Clear card-lock</button>`
+        : (pay.noCard && d.is_active
+            ? `<button class="btn btn-ghost btn-sm" data-action="require-card" data-id="${Number(d.id)}" data-name="${esc(d.name)}" title="Lock this driver out until they add a card on file">🔒 Require card</button>`
+            : '');
       const isPosSched = !!(d.scheduled_position || d.day_positions);
       const schedCell  = isPosSched
         ? `<span style="color:var(--amber);">📍 Position</span>`
@@ -94,12 +113,13 @@ async function loadDrivers(page) {
             ${d.lockedOut ? '<span class="badge failed" style="margin-left:4px;" title="SAN rejected this account’s login — the bot is parked until midnight PT or until unlocked"><span class="badge-dot"></span>🔒 Locked</span>' : ''}
             <div style="font-size:11px;color:var(--muted2);margin-top:3px;">${d.last_run ? formatRelTime(d.last_run) : ''}</div>
           </td>
-          <td>${activeBadge}</td>
+          <td>${activeBadge}${payBadge}</td>
           <td>
             <div style="display:flex;gap:6px;flex-wrap:wrap;">
               <button class="btn btn-trigger btn-sm" data-action="trigger"    data-id="${Number(d.id)}" data-name="${esc(d.name)}">▶ Run</button>
               ${isPosSched ? `<button class="btn btn-ghost btn-sm" data-action="arm-position" data-id="${Number(d.id)}" data-name="${esc(d.name)}" title="Reset today's position-schedule fired flag so the bot can fire again at the real target">🎯 Arm</button>` : ''}
               ${d.lockedOut ? `<button class="btn btn-trigger btn-sm" data-action="unlock" data-id="${Number(d.id)}" data-name="${esc(d.name)}" title="Clear the credential lock so the bot retries this account now (does not change the password)">🔓 Unlock</button>` : ''}
+              ${cardBtn}
               <button class="btn btn-ghost btn-sm"   data-action="verify"     data-id="${Number(d.id)}" data-name="${esc(d.name)}" title="Live SAN login test — confirm this driver's stored password actually works (~5s)">🔑 Verify</button>
               <button class="btn btn-ghost btn-sm"   data-action="edit"       data-id="${Number(d.id)}">Edit</button>
               <button class="btn btn-ghost btn-sm"   data-action="send-reset" data-id="${Number(d.id)}" data-name="${esc(d.name)}" data-email="${esc(d.email || '')}" title="Send password reset email">Reset Password</button>
@@ -246,6 +266,50 @@ async function unlockCredentials(id, name, btn) {
     loadDrivers(); // refresh so the 🔒 badge + Unlock button disappear
   } catch (err) {
     showToast(err.message || 'Failed to clear credential lock', 'error');
+    btn.disabled = false;
+    btn.innerHTML = originalHTML;
+  }
+}
+
+// ─── Lock a driver out until they add a card ──────────────────────────────────
+async function requireCard(id, name, btn) {
+  if (!await showConfirm(
+    `Lock ${esc(name)} out until they add a card on file?\n\nThey'll be deactivated immediately and shown an "Add a Card to Reactivate" screen. Access returns automatically once they add a card.`,
+    { title: 'Require Card', okLabel: 'Lock out', icon: '🔒' },
+  )) return;
+
+  const originalHTML = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+
+  try {
+    const data = await api(`/api/admin/drivers/${id}/require-card`, { method: 'POST' });
+    showToast(`✅ ${data.message}`, 'success', 5000);
+    loadDrivers(driversPage); // refresh badges + buttons
+  } catch (err) {
+    showToast(err.message || 'Failed to lock driver out', 'error');
+    btn.disabled = false;
+    btn.innerHTML = originalHTML;
+  }
+}
+
+// ─── Clear a card requirement (waiver / undo) ─────────────────────────────────
+async function clearCardRequirement(id, name, btn) {
+  if (!await showConfirm(
+    `Clear the card requirement for ${esc(name)} and restore their access?`,
+    { title: 'Clear Card Lock', okLabel: 'Clear', icon: '💳' },
+  )) return;
+
+  const originalHTML = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+
+  try {
+    const data = await api(`/api/admin/drivers/${id}/clear-card-requirement`, { method: 'POST' });
+    showToast(`✅ ${data.message}`, 'success', 5000);
+    loadDrivers(driversPage);
+  } catch (err) {
+    showToast(err.message || 'Failed to clear card requirement', 'error');
     btn.disabled = false;
     btn.innerHTML = originalHTML;
   }
@@ -544,6 +608,8 @@ document.getElementById('drivers-table-body').addEventListener('click', e => {
   if (btn.dataset.action === 'arm-position') armPositionSchedule(id, btn.dataset.name, btn);
   if (btn.dataset.action === 'unlock')       unlockCredentials(id, btn.dataset.name, btn);
   if (btn.dataset.action === 'verify')       verifyCredentials(id, btn.dataset.name, btn);
+  if (btn.dataset.action === 'require-card') requireCard(id, btn.dataset.name, btn);
+  if (btn.dataset.action === 'clear-card')   clearCardRequirement(id, btn.dataset.name, btn);
 });
 
 // Save driver (create or update)

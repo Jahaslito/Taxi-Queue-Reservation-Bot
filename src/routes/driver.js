@@ -8,6 +8,7 @@ const validate                  = require('../middleware/validate');
 const { getProfile, updateProfile, getLogs, getTodayStatus, triggerSelf, removeFromQueue } = require('../controllers/driverController');
 const sosController             = require('../controllers/sosController');
 const driverPushController      = require('../controllers/driverPushController');
+const driverMessagesController  = require('../controllers/driverMessagesController');
 
 const router = Router();
 
@@ -26,6 +27,17 @@ router.get( '/sos/open',                  sosController.getOpenForDriver);
 router.post('/sos/:id/location',          sosController.pushLocation);
 router.post('/sos/:id/live-tracking',     sosController.setLiveTracking);
 router.post('/sos/:id/cancel',            sosController.cancel);
+
+// Driver messages / announcements — INTENTIONALLY bypass requireSubscription so
+// the admin can always reach a driver (account notices, billing reminders,
+// outage alerts) even if their email is unverified or their subscription lapsed.
+// Auth is still required (authenticateDriver above).
+// '/messages/read-all' is declared before '/messages/:id/read' to read clearly,
+// though the paths don't actually collide (different segment counts).
+router.get( '/messages',              driverMessagesController.list);
+router.get( '/messages/unread-count', driverMessagesController.unreadCount);
+router.post('/messages/read-all',     driverMessagesController.markAllRead);
+router.post('/messages/:id/read',     driverMessagesController.markRead);
 
 // All other driver endpoints require a verified email + active subscription.
 router.use(requireSubscription);

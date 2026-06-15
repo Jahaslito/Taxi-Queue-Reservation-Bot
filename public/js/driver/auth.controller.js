@@ -192,6 +192,8 @@ document.getElementById('btn-register').addEventListener('click', async () => {
   const sanUsername   = document.getElementById('reg-san-username').value.trim();
   const sanPassword   = document.getElementById('reg-san-password').value;
   const vehicleNumber = document.getElementById('reg-vehicle').value.trim();
+  // SMS opt-in is optional per Telnyx toll-free verification. Unchecked → no SMS.
+  const smsOptIn      = document.getElementById('reg-sms-opt-in')?.checked === true;
   const errEl         = document.getElementById('reg-error');
   errEl.textContent   = '';
 
@@ -208,7 +210,7 @@ document.getElementById('btn-register').addEventListener('click', async () => {
   try {
     const data = await api('/api/auth/driver/register', {
       method: 'POST',
-      body: JSON.stringify({ name, phone, email, appPassword, sanUsername, sanPassword, vehicleNumber }),
+      body: JSON.stringify({ name, phone, email, appPassword, sanUsername, sanPassword, vehicleNumber, smsOptIn }),
     });
     showToast('Account created! Welcome 🎉');
     routeDriver(data.driver);

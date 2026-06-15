@@ -51,7 +51,7 @@ async function verifySanCredentials(req, res, next) {
 
 async function registerDriver(req, res, next) {
   try {
-    const { name, phone, appPassword, sanUsername, sanPassword, vehicleNumber, scheduledTime, scheduledDays, daySchedules } = req.body;
+    const { name, phone, appPassword, sanUsername, sanPassword, vehicleNumber, scheduledTime, scheduledDays, daySchedules, smsOptIn } = req.body;
     const email = req.body.email ? req.body.email.toLowerCase().trim() : null;
 
     if (email) {
@@ -124,6 +124,9 @@ async function registerDriver(req, res, next) {
       day_schedules:                  daySchedulesJson,
       email_verification_token:       verificationToken,
       email_verification_expires_at:  verificationExpires,
+      // Telnyx compliance: SMS only goes to drivers who explicitly checked the
+      // opt-in box at signup. Anything else (omitted, false, "no") → false.
+      sms_opt_in:                     smsOptIn === true || smsOptIn === 'true',
     });
 
     // Send verification email (non-blocking — a failure here shouldn't break registration)
@@ -164,7 +167,12 @@ async function loginDriver(req, res, next) {
     // valid (so 401 would be misleading), but the account is not authorized
     // to use the app. 403 + accountInactive flag lets the client render a
     // dedicated "contact admin" screen instead of looping back to login.
-    if (!driver.is_active) {
+    //
+    // Exception: a billing-locked driver (deactivated by the card-enforcement
+    // sweep — carries a card_required_by stamp) CAN log in, so they can add a
+    // card and self-reactivate. requireSubscription keeps them confined to the
+    // billing screen until they pay.
+    if (!driver.is_active && !driver.card_required_by) {
       console.log(`[Auth] Login blocked — driver ${driver.id} (#${driver.vehicle_number}) is inactive`);
       return res.status(403).json({
         error: 'Your account is inactive. Please contact the admin to reactivate it.',
@@ -354,6 +362,10 @@ async function createCheckoutSession(req, res, next) {
     const session = await stripeService.createCheckoutSession({
       customerId,
       driverId: driver.id,
+      // Grandfathered drivers who already had free access (carry a
+      // card_required_by stamp) are charged at checkout instead of getting a
+      // fresh trial — they're reactivating, not signing up.
+      skipTrial: !!driver.card_required_by,
     });
 
     res.json({ url: session.url });
@@ -388,6 +400,7 @@ async function billingPortal(req, res, next) {
       const checkout = await stripeService.createCheckoutSession({
         customerId: customer.id,
         driverId:   driver.id,
+        skipTrial:  !!driver.card_required_by,
       });
       return res.json({ url: checkout.url });
     }

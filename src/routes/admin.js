@@ -1,11 +1,12 @@
 const { Router } = require('express');
 const { body, param, query } = require('express-validator');
 
-const { authenticateAdmin }          = require('../middleware/auth');
-const { triggerLimiter, apiLimiter } = require('../middleware/rateLimiter');
+const { authenticateAdmin }                          = require('../middleware/auth');
+const { triggerLimiter, apiLimiter, broadcastLimiter } = require('../middleware/rateLimiter');
 const validate               = require('../middleware/validate');
 const adminController        = require('../controllers/adminController');
 const sosController          = require('../controllers/sosController');
+const adminMessagesController = require('../controllers/adminMessagesController');
 
 const router = Router();
 
@@ -23,6 +24,35 @@ router.post('/sos/:id/acknowledge',       sosController.adminAcknowledge);
 router.post('/sos/:id/resolve',           sosController.adminResolve);
 
 const idParam = param('id').isInt({ min: 1 }).withMessage('Driver ID must be a positive integer');
+
+// ─── Driver Messages (broadcast) ───────────────────────────────────────────────
+router.get(
+  '/messages',
+  [
+    query('limit').optional().isInt({ min: 1, max: 100 }).toInt(),
+    query('offset').optional().isInt({ min: 0 }).toInt(),
+  ],
+  validate,
+  adminMessagesController.listMessages,
+);
+
+router.post(
+  '/messages/broadcast',
+  broadcastLimiter,
+  [
+    body('title').trim().notEmpty().withMessage('Title is required')
+      .isLength({ max: 100 }).withMessage('Title must be 100 characters or fewer'),
+    body('body').trim().notEmpty().withMessage('Message is required')
+      .isLength({ max: 1000 }).withMessage('Message must be 1000 characters or fewer'),
+    body('driverIds').optional().isArray().withMessage('driverIds must be an array'),
+    body('driverIds.*').optional().isInt({ min: 1 }).withMessage('driverIds must be positive integers'),
+    body('sendSms').optional().isBoolean().withMessage('sendSms must be a boolean'),
+    body('url').optional({ checkFalsy: true }).isString().isLength({ max: 300 })
+      .withMessage('url must be 300 characters or fewer'),
+  ],
+  validate,
+  adminMessagesController.broadcast,
+);
 
 router.get('/stats', adminController.getStats);
 
@@ -125,6 +155,22 @@ router.post(
   [idParam],
   validate,
   adminController.verifyDriverCredentials,
+);
+
+// Lock a driver out until they add a card on file (manual card enforcement).
+router.post(
+  '/drivers/:id/require-card',
+  [idParam],
+  validate,
+  adminController.requireCard,
+);
+
+// Clear a card requirement (admin waiver / undo a mistaken lock).
+router.post(
+  '/drivers/:id/clear-card-requirement',
+  [idParam],
+  validate,
+  adminController.clearCardRequirement,
 );
 
 router.get(

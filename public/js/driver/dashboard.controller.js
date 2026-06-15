@@ -65,6 +65,10 @@ async function loadDashboard() {
     const needsVerify = driverProfile.email && !driverProfile.email_verified_at;
     document.getElementById('dash-verify-banner').style.display = needsVerify ? 'block' : 'none';
 
+    // Persistent "add a card" banner — stays visible until a card is on file
+    // (card_required_by is cleared by the Stripe webhook once that happens).
+    if (window.renderCardBanner) window.renderCardBanner(driverProfile);
+
     const statusData = await api('/api/driver/status/today');
     renderTodayStatus(statusData);
 

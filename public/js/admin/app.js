@@ -36,7 +36,7 @@ async function api(path, options = {}) {
 }
 
 // ─── Navigation ───────────────────────────────────────────────────────────────
-const CONTENT_PAGES = ['page-overview', 'page-drivers', 'page-logs', 'page-monitor', 'page-watchlist', 'page-pos-tracking', 'page-pos-diagnostics', 'page-sos'];
+const CONTENT_PAGES = ['page-overview', 'page-drivers', 'page-logs', 'page-monitor', 'page-watchlist', 'page-pos-tracking', 'page-pos-diagnostics', 'page-sos', 'page-messages'];
 
 let _activePage = null; // track current page for hide callbacks
 
@@ -66,6 +66,7 @@ function showPage(pageId) {
   if (pageId === 'page-pos-tracking')    { loadPosTracking(); if (typeof loadCarryoverReport === 'function') loadCarryoverReport(); }
   if (pageId === 'page-pos-diagnostics') loadPosDiagnostics();
   if (pageId === 'page-sos')             { if (typeof onSosPageShow       === 'function') onSosPageShow();       }
+  if (pageId === 'page-messages')        { if (typeof onMessagesPageShow  === 'function') onMessagesPageShow();  }
 }
 
 // Wire sidebar nav links

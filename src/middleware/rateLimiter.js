@@ -40,4 +40,18 @@ const apiLimiter = rateLimit({
   skip:            (req) => req.method === 'OPTIONS' || skipInTest(),
 });
 
-module.exports = { loginLimiter, triggerLimiter, apiLimiter };
+/**
+ * Applied to the admin broadcast endpoint — a broadcast fans out to every
+ * driver, so an accidental rapid double-send (or a runaway script) is costly.
+ * Tighter than apiLimiter on purpose.
+ */
+const broadcastLimiter = rateLimit({
+  windowMs:        60 * 1000, // 1 minute
+  max:             10,
+  message:         { error: 'Too many broadcasts. Please wait a moment before sending again.' },
+  standardHeaders: true,
+  legacyHeaders:   false,
+  skip:            skipInTest,
+});
+
+module.exports = { loginLimiter, triggerLimiter, apiLimiter, broadcastLimiter };

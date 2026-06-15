@@ -29,7 +29,7 @@ async function updateProfile(req, res, next) {
       throw err;
     }
 
-    const { name, phone, scheduledTime, scheduledDays, daySchedules, scheduledPosition, dayPositions, sanUsername, sanPassword, vehicleNumber, currentPassword, newAppPassword } = req.body;
+    const { name, phone, scheduledTime, scheduledDays, daySchedules, scheduledPosition, dayPositions, sanUsername, sanPassword, vehicleNumber, currentPassword, newAppPassword, smsOptIn } = req.body;
 
     if (newAppPassword) {
       if (!currentPassword) {
@@ -91,6 +91,12 @@ async function updateProfile(req, res, next) {
       san_password:       sanPassword    ? encrypt(sanPassword)                  : driver.san_password,
       vehicle_number:     vehicleNumber  || driver.vehicle_number,
       app_password:       newAppPassword ? await bcrypt.hash(newAppPassword, 10) : driver.app_password,
+      // SMS opt-in: keep current value unless the request explicitly toggles it.
+      // Accept boolean or string ("true"/"false") for resilience against
+      // form-encoded vs JSON callers.
+      sms_opt_in:         smsOptIn === undefined
+        ? driver.sms_opt_in
+        : (smsOptIn === true || smsOptIn === 'true'),
     };
 
     // Sync position_claims whenever any schedule field is explicitly in the request.

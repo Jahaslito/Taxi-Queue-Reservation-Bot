@@ -192,6 +192,60 @@
     .search-input:focus { border-color: var(--teal); }
     .search-input::placeholder { color: var(--muted); }
 
+    /* ── Messages page ── */
+    .messages-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+      gap: 20px; align-items: start;
+    }
+    /* Stack to a single column on narrower viewports so neither card is cramped. */
+    @media (max-width: 1100px) {
+      .messages-grid { grid-template-columns: minmax(0, 1fr); }
+    }
+    .card {
+      background: var(--bg2); border: 1px solid var(--border); border-radius: 14px;
+    }
+    .field-label {
+      display: block; font-size: 12px; font-weight: 700; color: var(--muted2);
+      letter-spacing: 0.04em; text-transform: uppercase; margin-bottom: 6px;
+    }
+    #msg-body {
+      background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
+      padding: 10px 14px; color: var(--white); font-family: 'DM Sans', sans-serif;
+      font-size: 14px; outline: none;
+    }
+    #msg-body:focus { border-color: var(--teal); }
+    #msg-body::placeholder { color: var(--muted); }
+    .msg-counter { font-size: 11px; color: var(--muted); text-align: right; }
+    .msg-target-toggle { display: flex; gap: 18px; flex-wrap: wrap; }
+    .msg-radio, .msg-checkbox {
+      display: flex; align-items: center; gap: 8px; font-size: 14px;
+      color: var(--white); cursor: pointer;
+    }
+    .msg-checkbox { align-items: flex-start; line-height: 1.4; }
+    .msg-radio input, .msg-checkbox input { accent-color: var(--teal); cursor: pointer; }
+    .msg-checkbox input { margin-top: 2px; }
+    .msg-driver-list {
+      max-height: 240px; overflow-y: auto; border: 1px solid var(--border);
+      border-radius: 10px; background: var(--bg);
+    }
+    .msg-driver-item {
+      display: flex; align-items: center; gap: 10px; padding: 9px 14px;
+      border-bottom: 1px solid var(--border); cursor: pointer; font-size: 14px;
+    }
+    .msg-driver-item:last-child { border-bottom: none; }
+    .msg-driver-item:hover { background: rgba(255,255,255,0.03); }
+    .msg-driver-item input { accent-color: var(--teal); cursor: pointer; }
+    .msg-driver-item .sub { color: var(--muted2); font-size: 12px; margin-left: auto; }
+    .msg-history-item {
+      padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px;
+      margin-bottom: 10px; background: var(--bg);
+    }
+    .msg-history-item:last-child { margin-bottom: 0; }
+    .msg-history-item .title { font-weight: 700; font-size: 14px; margin-bottom: 4px; }
+    .msg-history-item .body { font-size: 13px; color: var(--muted2); margin-bottom: 8px; white-space: pre-wrap; }
+    .msg-history-item .meta { font-size: 11px; color: var(--muted); display: flex; gap: 12px; flex-wrap: wrap; }
+
     /* ── Watchlist stat cards ── */
     .wl-stat-card {
       background: var(--bg2); border: 1px solid var(--border);
@@ -456,6 +510,9 @@
       <span class="icon">🚨</span><span>SOS Alerts</span>
       <span id="sos-nav-badge" style="display:none;margin-left:auto;min-width:18px;height:18px;border-radius:9px;background:var(--red);color:#fff;font-size:10px;font-weight:700;align-items:center;justify-content:center;padding:0 5px;">0</span>
     </button>
+    <button class="nav-link" data-page="page-messages">
+      <span class="icon">📣</span><span>Messages</span>
+    </button>
   </div>
   <div class="nav-group">
     <div class="nav-group-label">Automation</div>
@@ -710,6 +767,75 @@
           </tbody>
         </table>
       </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════ MESSAGES PAGE ══════════════════════════ -->
+  <div class="page" id="page-messages">
+    <div class="page-header">
+      <h1>📣 Messages</h1>
+      <p>Send a push notification to drivers' apps — blast everyone or target specific drivers</p>
+    </div>
+
+    <div class="messages-grid">
+
+      <!-- Compose -->
+      <div class="card" style="padding:20px;">
+        <div style="font-weight:700;margin-bottom:16px;font-size:15px;">Compose message</div>
+
+        <label class="field-label">Title</label>
+        <input class="search-input" id="msg-title" maxlength="100" placeholder="e.g. Airport surge tonight" style="width:100%;margin-bottom:4px;" />
+        <div class="msg-counter"><span id="msg-title-count">0</span>/100</div>
+
+        <label class="field-label" style="margin-top:14px;">Message</label>
+        <textarea id="msg-body" maxlength="1000" rows="4" placeholder="What do you want drivers to know?" style="width:100%;resize:vertical;margin-bottom:4px;"></textarea>
+        <div class="msg-counter"><span id="msg-body-count">0</span>/1000</div>
+
+        <!-- Targeting -->
+        <label class="field-label" style="margin-top:16px;">Send to</label>
+        <div class="msg-target-toggle">
+          <label class="msg-radio"><input type="radio" name="msg-target" value="all" checked /> <span>All active drivers</span></label>
+          <label class="msg-radio"><input type="radio" name="msg-target" value="selected" /> <span>Selected drivers</span></label>
+        </div>
+
+        <div id="msg-driver-picker" style="display:none;margin-top:12px;">
+          <input class="search-input" id="msg-driver-search" placeholder="Search drivers by name or taxi #…" style="width:100%;margin-bottom:8px;" />
+          <div id="msg-driver-list" class="msg-driver-list">
+            <div style="color:var(--muted2);text-align:center;padding:18px;">Loading drivers…</div>
+          </div>
+          <div id="msg-selected-count" style="font-size:12px;color:var(--muted2);margin-top:8px;">0 selected</div>
+        </div>
+
+        <!-- SMS toggle -->
+        <label class="msg-checkbox" style="margin-top:16px;">
+          <input type="checkbox" id="msg-send-sms" />
+          <span>Also send as SMS <span style="color:var(--muted2);">(reaches drivers even without the app — uses Telnyx credits)</span></span>
+        </label>
+
+        <div style="margin-top:18px;display:flex;align-items:center;gap:12px;">
+          <button class="btn btn-primary" id="btn-send-message">Send message</button>
+          <span id="msg-send-status" style="font-size:13px;color:var(--muted2);"></span>
+        </div>
+      </div>
+
+      <!-- Sent history -->
+      <div class="card" style="padding:20px;">
+        <div style="font-weight:700;margin-bottom:14px;font-size:15px;">Sent history</div>
+        <div id="msg-history">
+          <div style="color:var(--muted2);text-align:center;padding:18px;">Loading…</div>
+        </div>
+
+        <!-- Pagination bar -->
+        <div id="msg-history-pagination" style="display:none;align-items:center;justify-content:space-between;padding:14px 2px 2px;gap:12px;flex-wrap:wrap;">
+          <span id="msg-history-info" style="font-size:13px;color:var(--muted2);"></span>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <button class="btn btn-ghost btn-sm" id="msg-history-prev" disabled>← Prev</button>
+            <span id="msg-history-label" style="font-size:13px;color:var(--muted2);white-space:nowrap;min-width:80px;text-align:center;"></span>
+            <button class="btn btn-ghost btn-sm" id="msg-history-next" disabled>Next →</button>
+          </div>
+        </div>
+      </div>
+
     </div>
   </div>
 
@@ -1305,6 +1431,21 @@
   </div>
 </div>
 
+<!-- ── Send-message confirm modal ── -->
+<div class="modal-overlay" id="msg-confirm-modal">
+  <div class="modal" style="max-width:400px;">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
+      <div style="font-size:26px;line-height:1;">📣</div>
+      <h3 style="margin:0;">Send message?</h3>
+    </div>
+    <p id="msg-confirm-body" style="color:var(--muted2);font-size:14px;line-height:1.5;margin:0 0 6px;"></p>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="msg-confirm-cancel">Cancel</button>
+      <button class="btn btn-primary" id="msg-confirm-ok">Send</button>
+    </div>
+  </div>
+</div>
+
 <!-- ── SOS Global Banner — appears on ANY admin page when a new SOS hits ── -->
 <div id="sos-global-banner" style="
   display:none; position:fixed; top:16px; left:50%; transform:translateX(-50%);
@@ -1392,14 +1533,50 @@
 <script src="/js/admin/posTracking.controller.js"></script>
 <script src="/js/admin/posDiagnostics.controller.js"></script>
 <script src="/js/admin/sos.controller.js"></script>
+<script src="/js/admin/messages.controller.js"></script>
 <script src="/js/admin/auth.controller.js"></script>
 <script src="/js/admin/app.js"></script>
 <script>
-  if ('serviceWorker' in navigator) {
-    window.addEventListener('load', () => {
-      navigator.serviceWorker.register('/sw.js').catch(() => {});
-    });
-  }
+  (function () {
+    var isDev = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+
+    if ('serviceWorker' in navigator) {
+      if (isDev) {
+        // Dev: no service worker — it caches assets and forces hard refreshes.
+        navigator.serviceWorker.getRegistrations().then(function (rs) { rs.forEach(function (r) { r.unregister(); }); });
+        if (window.caches) caches.keys().then(function (ks) { ks.forEach(function (k) { caches.delete(k); }); });
+      } else {
+        window.addEventListener('load', function () {
+          navigator.serviceWorker.register('/sw.js').then(function (reg) {
+            // Admins keep this tab open all day, so polling is what actually
+            // surfaces a deploy: it re-checks /sw.js, and a bumped CACHE_VERSION
+            // installs the new worker → skipWaiting → controllerchange below.
+            setInterval(function () { reg.update().catch(function () {}); }, 60 * 1000);
+          }).catch(function () {});
+        });
+
+        // A new service worker taking control means a new version was deployed.
+        // Reload to pick up the fresh admin assets — no manual/hard refresh.
+        // (This is the handler the admin side was missing; the driver app has
+        // had the equivalent in js/driver/app.js all along.)
+        var refreshing = false;
+        navigator.serviceWorker.addEventListener('controllerchange', function () {
+          if (refreshing) return;
+          refreshing = true;
+          if (window.showToast) showToast('🔄 New version — updating…', 'success', 1500);
+          setTimeout(function () { location.reload(); }, 800);
+        });
+      }
+    }
+
+    // Dev live-reload: auto-refresh when a file changes or the server restarts.
+    if (isDev && 'EventSource' in window) {
+      var opened = false;
+      var es = new EventSource('/__livereload');
+      es.onopen    = function ()  { if (opened) location.reload(); opened = true; }; // reconnect after restart
+      es.onmessage = function (e) { if (e.data === 'reload') location.reload(); };   // a file changed
+    }
+  })();
 </script>
 <script>
   (function () {

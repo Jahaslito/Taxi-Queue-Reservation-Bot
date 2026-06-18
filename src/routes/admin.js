@@ -230,8 +230,8 @@ router.get(
     query('offset').optional().isInt({ min: 0 }).toInt(),
     query('search').optional().trim().isLength({ max: 100 }),
     query('date').optional().isDate().withMessage('date must be YYYY-MM-DD'),
-    query('status').optional().isIn(['success', 'already_queued', 'failed', 'pending'])
-      .withMessage('Invalid status value'),
+    query('status').optional().isIn(['success', 'already_queued', 'failed', 'pending', 'info'])
+      .withMessage('Invalid status value'), // 'info' = carryover markers (Overnight carryover filter)
   ],
   validate,
   adminController.getLogs,

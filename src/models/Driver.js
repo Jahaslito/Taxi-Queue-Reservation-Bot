@@ -104,6 +104,9 @@ class Driver {
     const latestLogSubquery = db('logs')
       .select('id')
       .whereRaw('driver_id = d.id')
+      // "LAST RUN" means an actual run — carryover markers (Log.CARRYOVER_MARKER)
+      // are midnight bookkeeping, not a run, so they must not become last_status.
+      .whereNot('trigger_type', 'carryover_marker')
       .orderBy('triggered_at', 'desc')
       .limit(1);
 

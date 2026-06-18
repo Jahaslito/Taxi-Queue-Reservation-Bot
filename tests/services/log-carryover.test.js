@@ -75,17 +75,32 @@ describe('Log.loadTodayContext() — batch restart context', () => {
   });
 });
 
-describe('Log.search()/count() — carryover markers are hidden from the activity log', () => {
-  test('a carryover_marker row never appears in search results or the count', async () => {
+describe('Log.search()/count() — carryover markers ARE shown in the admin activity log', () => {
+  test('a carryover_marker row appears in search results and the count', async () => {
     const driver = await createDriver();
     await insertLog(driver.id, 'carryover_marker', 'info');
     await insertLog(driver.id, 'position_schedule', 'success');
 
     const rows = await Log.search({});
-    expect(rows.every((r) => r.trigger_type !== 'carryover_marker')).toBe(true);
+    expect(rows.some((r) => r.trigger_type === 'carryover_marker')).toBe(true);
     expect(rows.some((r) => r.trigger_type === 'position_schedule')).toBe(true);
 
     const { count } = await Log.count({});
+    expect(Number(count)).toBe(2); // both the marker and the position_schedule row
+  });
+});
+
+describe('Log.findByDriver()/countByDriver() — carryover markers are hidden from the driver', () => {
+  test('a carryover_marker row never reaches the driver-facing history', async () => {
+    const driver = await createDriver();
+    await insertLog(driver.id, 'carryover_marker', 'info');
+    await insertLog(driver.id, 'position_schedule', 'success');
+
+    const rows = await Log.findByDriver(driver.id, {});
+    expect(rows.every((r) => r.trigger_type !== 'carryover_marker')).toBe(true);
+    expect(rows.some((r) => r.trigger_type === 'position_schedule')).toBe(true);
+
+    const { count } = await Log.countByDriver(driver.id);
     expect(Number(count)).toBe(1); // only the position_schedule row
   });
 });

@@ -62,9 +62,20 @@ async function loadLogs(page) {
     const iconMap = { success: '✅', already_queued: '🔁', failed: '❌', pending: '⏳' };
     const clsMap  = { success: 'success', already_queued: 'queued', failed: 'failed', pending: 'pending' };
 
-    container.innerHTML = data.logs.map(log => `
+    container.innerHTML = data.logs.map(log => {
+      // Carryover markers (status 'info') are internal "still in V Holding at the
+      // midnight reset" records — render them with a meaningful label, not "info".
+      const isCarryover = log.trigger_type === 'carryover_marker';
+      const icon       = isCarryover ? '🌙' : (iconMap[log.status] || '⏳');
+      const iconCls    = isCarryover ? 'pending'  : (clsMap[log.status] || 'pending');
+      const badgeCls   = isCarryover ? 'inactive' : (clsMap[log.status] || 'inactive');
+      const badgeText  = isCarryover ? 'Overnight carryover' : log.status.replace('_', ' ');
+      const triggerTxt = isCarryover ? '🌙 Still in V Holding at midnight reset'
+                       : (log.trigger_type === 'manual' ? '🔧 Manual' : '🤖 Scheduled');
+
+      return `
       <div class="log-entry">
-        <div class="log-icon2 ${esc(clsMap[log.status] || 'pending')}" style="background:rgba(255,255,255,0.05);">${iconMap[log.status] || '⏳'}</div>
+        <div class="log-icon2 ${esc(iconCls)}" style="background:rgba(255,255,255,0.05);">${icon}</div>
         <div class="log-details2">
           <div class="log-title">
             <strong>${esc(log.driver_name)}</strong>
@@ -76,11 +87,12 @@ async function loadLogs(page) {
             ${log.queue_location ? `<span>Location: <strong>${esc(log.queue_location)}</strong></span>`  : ''}
             ${log.queue_time     ? `<span>Queue Time: <strong>${esc(log.queue_time)}</strong></span>`     : ''}
             ${log.error_message  ? `<span style="color:var(--red);">${esc(log.error_message)}</span>`    : ''}
-            <span><span class="badge ${esc(clsMap[log.status] || 'inactive')}"><span class="badge-dot"></span>${esc(log.status.replace('_', ' '))}</span></span>
-            <span style="color:var(--muted);">${log.trigger_type === 'manual' ? '🔧 Manual' : '🤖 Scheduled'}</span>
+            <span><span class="badge ${esc(badgeCls)}"><span class="badge-dot"></span>${esc(badgeText)}</span></span>
+            <span style="color:var(--muted);">${esc(triggerTxt)}</span>
           </div>
         </div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
 
     setLogsPagination(data.total);
   } catch (err) {

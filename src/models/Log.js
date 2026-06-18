@@ -36,13 +36,18 @@ class Log {
   static findByDriver(driverId, { limit = 20, offset = 0 } = {}) {
     return db(TABLE)
       .where({ driver_id: driverId })
+      .whereNot('trigger_type', CARRYOVER_MARKER) // internal marker — hidden from the driver app
       .orderBy('triggered_at', 'desc')
       .limit(limit)
       .offset(offset);
   }
 
   static countByDriver(driverId) {
-    return db(TABLE).where({ driver_id: driverId }).count('* as count').first();
+    return db(TABLE)
+      .where({ driver_id: driverId })
+      .whereNot('trigger_type', CARRYOVER_MARKER) // mirror findByDriver so pagination total matches
+      .count('* as count')
+      .first();
   }
 
   /**
@@ -52,6 +57,7 @@ class Log {
   static findTodayLatest(driverId, today) {
     return db(TABLE)
       .where({ driver_id: driverId })
+      .whereNot('trigger_type', CARRYOVER_MARKER) // marker isn't a run — keep it off the driver dashboard
       .whereRaw("DATE(triggered_at AT TIME ZONE 'America/Los_Angeles') = ?", [today])
       .orderBy('triggered_at', 'desc')
       .first();
@@ -117,7 +123,8 @@ class Log {
     return db('logs as l')
       .select('l.*', 'd.name as driver_name', 'd.vehicle_number')
       .join('drivers as d', 'l.driver_id', 'd.id')
-      .whereNot('l.trigger_type', CARRYOVER_MARKER) // internal bookkeeping, not a real run
+      // carryover markers ARE surfaced in the admin activity log (rendered as
+      // "Overnight carryover") — only the driver-facing queries hide them.
       .modify((q) => {
         if (driverId) q.where('l.driver_id', driverId);
         if (status)   q.where('l.status', status);
@@ -139,7 +146,7 @@ class Log {
   static count({ driverId, status, date, search } = {}) {
     return db('logs as l')
       .join('drivers as d', 'l.driver_id', 'd.id')
-      .whereNot('l.trigger_type', CARRYOVER_MARKER) // mirror search()
+      // mirror search() — markers are counted in the admin activity log
       .modify((q) => {
         if (driverId) q.where('l.driver_id', driverId);
         if (status)   q.where('l.status', status);

@@ -273,6 +273,58 @@ describe('GET /api/admin/drivers/:id', () => {
   });
 });
 
+// ─── Hard delete driver ────────────────────────────────────────────────────
+
+describe('POST /api/admin/drivers/:id/delete', () => {
+  test('removes the driver, cascade children, AND the polymorphic push subs', async () => {
+    // FK child (cascades) + polymorphic push sub (no FK — must be deleted by hand)
+    await db('logs').insert({
+      driver_id: driver.id, triggered_at: new Date(), trigger_type: 'manual', status: 'success',
+    });
+    await db('push_subscriptions').insert({
+      role: 'driver', subscriber_id: driver.id,
+      endpoint: `https://example.com/push/${driver.id}`, p256dh_key: 'k', auth_key: 'a',
+    });
+
+    const res = await request(app)
+      .post(`/api/admin/drivers/${driver.id}/delete`)
+      .set('Cookie', aCookie);
+
+    expect(res.status).toBe(200);
+
+    const stillThere = await db('drivers').where({ id: driver.id }).first();
+    const logsLeft   = await db('logs').where({ driver_id: driver.id });
+    const subsLeft   = await db('push_subscriptions').where({ role: 'driver', subscriber_id: driver.id });
+
+    expect(stillThere).toBeUndefined();   // driver row gone
+    expect(logsLeft).toHaveLength(0);     // cascade worked
+    expect(subsLeft).toHaveLength(0);     // polymorphic cleanup worked
+  });
+
+  test('returns 404 for an unknown driver ID', async () => {
+    const res = await request(app)
+      .post('/api/admin/drivers/999999/delete')
+      .set('Cookie', aCookie);
+    expect(res.status).toBe(404);
+  });
+
+  test('returns 400 for a non-integer ID', async () => {
+    const res = await request(app)
+      .post('/api/admin/drivers/abc/delete')
+      .set('Cookie', aCookie);
+    expect(res.status).toBe(400);
+  });
+
+  test('rejects a driver cookie (admin-only)', async () => {
+    const res = await request(app)
+      .post(`/api/admin/drivers/${driver.id}/delete`)
+      .set('Cookie', driverCookie(driver.id));
+    expect(res.status).toBe(403);
+    // and the driver must still exist
+    expect(await db('drivers').where({ id: driver.id }).first()).toBeTruthy();
+  });
+});
+
 // ─── 20 — Update driver ───────────────────────────────────────────────────
 
 describe('PUT /api/admin/drivers/:id', () => {

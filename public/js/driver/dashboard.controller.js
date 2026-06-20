@@ -74,6 +74,10 @@ async function loadDashboard() {
 
     const logsData = await api('/api/driver/logs?limit=5');
     renderDashLogs(logsData.logs);
+
+    // Keep the live-position card tracking the driver's SAN state after this
+    // initial load (in V Holding → dispatched → at terminal).
+    startDashboardLivePolling();
   } catch (err) {
     // Driver was active when they logged in but admin has since deactivated
     // them — middleware now returns 403 + accountInactive. Show the same
@@ -88,6 +92,51 @@ async function loadDashboard() {
     }
   }
 }
+
+// ─── Live dashboard refresh ───────────────────────────────────────────────────
+// The today-status card surfaces the driver's live SAN state (in V Holding /
+// dispatched / at a terminal) via renderLiveLocation. That state changes as the
+// monitor re-polls SAN, but loadDashboard() runs only once per view visit — so
+// the card would otherwise freeze on whatever was true at load and never move
+// to "Dispatched" / "At Terminal" on its own. Poll the status endpoint on an
+// interval — the REST equivalent of how the admin monitor updates its cards
+// live over SSE — so the driver's card tracks them through the queue.
+//
+// Good citizenship: pauses while the tab/PWA is backgrounded, stops itself once
+// the driver navigates off the dashboard, and yields to the manual-requeue poll
+// loop (which already refreshes this same card every 5s) so we never double-fetch.
+const DASH_LIVE_POLL_MS = 15000;
+let dashLivePollTimer = null;
+
+function dashboardIsActive() {
+  const v = document.getElementById('view-dashboard');
+  return !!v && v.classList.contains('active');
+}
+
+async function refreshTodayStatusLive() {
+  if (!dashboardIsActive()) { stopDashboardLivePolling(); return; } // left the view
+  if (document.hidden)  return;  // backgrounded — skip tick, keep timer alive
+  if (requeueCooldown)  return;  // requeue loop owns the card while the bot runs
+  try {
+    const statusData = await api('/api/driver/status/today');
+    renderTodayStatus(statusData);
+  } catch { /* transient blip — try again next tick */ }
+}
+
+function startDashboardLivePolling() {
+  stopDashboardLivePolling();
+  dashLivePollTimer = setInterval(refreshTodayStatusLive, DASH_LIVE_POLL_MS);
+}
+
+function stopDashboardLivePolling() {
+  if (dashLivePollTimer) { clearInterval(dashLivePollTimer); dashLivePollTimer = null; }
+}
+
+// Refresh immediately when the driver brings the app back to the foreground,
+// rather than making them wait up to DASH_LIVE_POLL_MS for the next tick.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && dashboardIsActive()) refreshTodayStatusLive();
+});
 
 // ─── Remove-from-queue button visibility ──────────────────────────────────────
 // Show the red "Remove from Queue" button whenever the driver is observably in

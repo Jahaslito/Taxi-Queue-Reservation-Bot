@@ -125,6 +125,16 @@ router.delete(
   adminController.deactivateDriver,
 );
 
+// Hard delete — permanently removes the driver row + all history (cascade) plus
+// their polymorphic push subscriptions. Distinct from the soft-delete DELETE
+// route above. POST (not DELETE) so the two destructive levels stay unambiguous.
+router.post(
+  '/drivers/:id/delete',
+  [idParam],
+  validate,
+  adminController.deleteDriver,
+);
+
 router.post(
   '/drivers/:id/trigger',
   [idParam],

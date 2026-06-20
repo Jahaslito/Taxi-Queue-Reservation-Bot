@@ -123,6 +123,7 @@ async function loadDrivers(page) {
               <button class="btn btn-ghost btn-sm"   data-action="verify"     data-id="${Number(d.id)}" data-name="${esc(d.name)}" title="Live SAN login test — confirm this driver's stored password actually works (~5s)">🔑 Verify</button>
               <button class="btn btn-ghost btn-sm"   data-action="edit"       data-id="${Number(d.id)}">Edit</button>
               <button class="btn btn-ghost btn-sm"   data-action="send-reset" data-id="${Number(d.id)}" data-name="${esc(d.name)}" data-email="${esc(d.email || '')}" title="Send password reset email">Reset Password</button>
+              <button class="btn btn-danger btn-sm"  data-action="delete"     data-id="${Number(d.id)}" data-name="${esc(d.name)}" data-vehicle="${esc(d.vehicle_number)}" title="Permanently delete this driver and all their history">🗑 Delete</button>
             </div>
           </td>
         </tr>`;
@@ -135,23 +136,29 @@ async function loadDrivers(page) {
 }
 
 // ─── Confirm dialog (promise-based) ──────────────────────────────────────────
-function showConfirm(message, { title = 'Run Bot', okLabel = 'Run Now', icon = '▶' } = {}) {
+function showConfirm(message, { title = 'Run Bot', okLabel = 'Run Now', icon = '▶', danger = false } = {}) {
   return new Promise(resolve => {
+    const okBtn = document.getElementById('btn-confirm-ok');
     document.getElementById('confirm-message').textContent = message;
     document.getElementById('confirm-title').textContent   = title;
     document.getElementById('confirm-icon').textContent    = icon;
-    document.getElementById('btn-confirm-ok').textContent  = okLabel;
+    okBtn.textContent = okLabel;
+    // Destructive actions get a red OK button; restored to the default on cleanup.
+    okBtn.classList.toggle('btn-danger',  danger);
+    okBtn.classList.toggle('btn-trigger', !danger);
     document.getElementById('confirm-modal').classList.add('open');
 
     function onOk()     { cleanup(); resolve(true);  }
     function onCancel() { cleanup(); resolve(false); }
     function cleanup() {
       document.getElementById('confirm-modal').classList.remove('open');
-      document.getElementById('btn-confirm-ok').removeEventListener('click', onOk);
+      okBtn.classList.remove('btn-danger');
+      okBtn.classList.add('btn-trigger');
+      okBtn.removeEventListener('click', onOk);
       document.getElementById('btn-confirm-cancel').removeEventListener('click', onCancel);
     }
 
-    document.getElementById('btn-confirm-ok').addEventListener('click', onOk);
+    okBtn.addEventListener('click', onOk);
     document.getElementById('btn-confirm-cancel').addEventListener('click', onCancel);
   });
 }
@@ -335,6 +342,34 @@ async function verifyCredentials(id, name, btn) {
     btn.disabled = false;
     btn.innerHTML = originalHTML;
     btn.style.minWidth = '';
+  }
+}
+
+// ─── Permanently delete a driver (irreversible) ──────────────────────────────
+// Hard delete: removes the driver row plus ALL their history (logs, position
+// tracking, claims, SOS, messages) and their push subscriptions. There is no
+// undo — the confirm dialog spells this out before anything happens.
+async function deleteDriver(id, name, vehicle, btn) {
+  const ok = await showConfirm(
+    `Permanently delete ${name} (vehicle #${vehicle})? This removes the driver and ` +
+    `their entire history — runs, position tracking, claims, SOS alerts and messages. ` +
+    `This cannot be undone.`,
+    { title: 'Delete Driver', okLabel: 'Delete permanently', icon: '🗑️', danger: true },
+  );
+  if (!ok) return;
+
+  const originalHTML = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+
+  try {
+    const data = await api(`/api/admin/drivers/${id}/delete`, { method: 'POST' });
+    showToast(`✅ ${data.message}`, 'success', 5000);
+    loadDrivers(driversPage); // refresh the table — the row is gone
+  } catch (err) {
+    showToast(err.message || 'Failed to delete driver', 'error', 6000);
+    btn.disabled = false;
+    btn.innerHTML = originalHTML;
   }
 }
 
@@ -610,6 +645,7 @@ document.getElementById('drivers-table-body').addEventListener('click', e => {
   if (btn.dataset.action === 'verify')       verifyCredentials(id, btn.dataset.name, btn);
   if (btn.dataset.action === 'require-card') requireCard(id, btn.dataset.name, btn);
   if (btn.dataset.action === 'clear-card')   clearCardRequirement(id, btn.dataset.name, btn);
+  if (btn.dataset.action === 'delete')       deleteDriver(id, btn.dataset.name, btn.dataset.vehicle, btn);
 });
 
 // Save driver (create or update)

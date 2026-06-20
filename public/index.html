@@ -1342,5 +1342,105 @@
     });
   })();
 </script>
+<script>
+  (function () {
+    // Android "add to home screen" hint — the counterpart to the iOS banner
+    // above. Two modes:
+    //   • If Chrome fires `beforeinstallprompt` we capture it and offer a
+    //     one-tap "Install" button (native install dialog).
+    //   • If it never fires (Firefox, in-app webviews, or criteria not yet
+    //     met), we fall back to manual instructions: ⋮ menu → Add to Home screen.
+    const ua           = navigator.userAgent || '';
+    const isAndroid    = /Android/.test(ua);
+    const isStandalone = (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches)
+                         || window.navigator.standalone === true;
+    if (!isAndroid || isStandalone || localStorage.getItem('android-hint-dismissed')) return;
+
+    let deferredPrompt = null;
+
+    const banner = document.createElement('div');
+    banner.id = 'android-install-hint';
+    banner.innerHTML = `
+      <div style="display:flex;align-items:center;gap:12px;">
+        <div style="font-size:26px;line-height:1;">
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#00C2D4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+        </div>
+        <div style="flex:1;min-width:0;">
+          <div style="font-weight:700;font-size:13px;color:#F0F4FF;">Install SAN Queue</div>
+          <div id="android-hint-manual" style="font-size:12px;color:#7A8AB5;margin-top:2px;">Tap <strong style="color:#F0F4FF;">⋮</strong> then <strong style="color:#F0F4FF;">"Add to Home screen"</strong></div>
+          <div id="android-hint-auto" style="display:none;font-size:12px;color:#7A8AB5;margin-top:2px;">One tap to add it to your home screen</div>
+        </div>
+        <button id="android-hint-install" style="display:none;background:#00C2D4;color:#04121f;border:none;border-radius:10px;padding:8px 14px;font-size:13px;font-weight:700;cursor:pointer;flex-shrink:0;">Install</button>
+        <button id="android-hint-close" aria-label="Dismiss" style="background:none;border:none;color:#7A8AB5;font-size:18px;cursor:pointer;padding:4px;line-height:1;flex-shrink:0;">✕</button>
+      </div>
+    `;
+    Object.assign(banner.style, {
+      position:     'fixed',
+      bottom:       '80px',
+      left:         '16px',
+      right:        '16px',
+      background:   'rgba(13,27,69,0.97)',
+      border:       '1px solid rgba(255,255,255,0.1)',
+      borderRadius: '16px',
+      padding:      '14px 16px',
+      zIndex:       '9999',
+      boxShadow:    '0 8px 32px rgba(0,0,0,0.5)',
+      backdropFilter: 'blur(12px)',
+      animation:    'slideUp 0.3s ease',
+    });
+
+    const style = document.createElement('style');
+    style.textContent = '@keyframes slideUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}';
+    document.head.appendChild(style);
+
+    document.body.appendChild(banner);
+
+    const manualEl  = banner.querySelector('#android-hint-manual');
+    const autoEl    = banner.querySelector('#android-hint-auto');
+    const installBtn = banner.querySelector('#android-hint-install');
+
+    function showAuto()   { manualEl.style.display = 'none'; autoEl.style.display = ''; installBtn.style.display = ''; }
+    function showManual() { autoEl.style.display = 'none'; installBtn.style.display = 'none'; manualEl.style.display = ''; }
+
+    function dismiss() {
+      banner.remove();
+      localStorage.setItem('android-hint-dismissed', '1');
+    }
+
+    banner.querySelector('#android-hint-close').addEventListener('click', dismiss);
+
+    installBtn.addEventListener('click', function () {
+      if (!deferredPrompt) return;
+      installBtn.disabled = true;
+      deferredPrompt.prompt();
+      Promise.resolve(deferredPrompt.userChoice).then(function (choice) {
+        if (choice && choice.outcome === 'accepted') {
+          dismiss();
+        } else {
+          // User backed out — the prompt is single-use, so drop back to the
+          // manual instructions rather than leaving a dead Install button.
+          deferredPrompt = null;
+          installBtn.disabled = false;
+          showManual();
+        }
+      }).catch(function () { installBtn.disabled = false; });
+    });
+
+    // Chrome fires this before showing its own mini-infobar — intercept it so
+    // the install happens from our button instead. May arrive after first paint.
+    window.addEventListener('beforeinstallprompt', function (e) {
+      e.preventDefault();
+      deferredPrompt = e;
+      showAuto();
+    });
+
+    // Installed (via our button or the browser's own UI) — clear the hint.
+    window.addEventListener('appinstalled', dismiss);
+  })();
+</script>
 </body>
 </html>

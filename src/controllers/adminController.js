@@ -419,6 +419,48 @@ async function deactivateDriver(req, res, next) {
   }
 }
 
+// ─── Hard-delete a driver (irreversible) ─────────────────────────────────────
+// Unlike deactivateDriver (a soft delete that flips is_active=false), this
+// permanently removes the driver row and ALL their history. FK children cascade
+// (logs, position_tracking, position_claims, sos_alerts → sos_location_history,
+// driver_message_recipients). push_subscriptions is polymorphic (role +
+// subscriber_id, NO foreign key) so it must be cleared explicitly or it orphans.
+// Both run in one transaction so a mid-delete failure leaves nothing half-gone.
+async function deleteDriver(req, res, next) {
+  try {
+    const id     = Number(req.params.id);
+    const driver = await Driver.findById(id);
+    if (!driver) {
+      const err = new Error('Driver not found');
+      err.statusCode = 404;
+      throw err;
+    }
+
+    await db.transaction(async (trx) => {
+      await trx('push_subscriptions')
+        .where({ role: 'driver', subscriber_id: id })
+        .del();
+      await trx('drivers').where({ id }).del();
+    });
+
+    // Stop the monitor acting on the now-deleted row immediately (the poll skips
+    // inactive drivers); the next auto-refresh purges the watch entirely.
+    try {
+      const monitorService = require('../services/monitorService');
+      if (typeof monitorService.syncDriverSchedule === 'function') {
+        monitorService.syncDriverSchedule(id, { isActive: false });
+      }
+    } catch (e) {
+      console.warn('[Admin] Could not notify monitor of deletion:', e.message);
+    }
+
+    console.log(`[Admin] Hard-deleted driver #${driver.vehicle_number} (id=${driver.id}, ${driver.name})`);
+    res.json({ message: `Deleted ${driver.name} — vehicle #${driver.vehicle_number}` });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function triggerDriver(req, res, next) {
   try {
     const driver = await Driver.findByIdWithCredentials(req.params.id);
@@ -792,6 +834,7 @@ module.exports = {
   addDriver,
   updateDriver,
   deactivateDriver,
+  deleteDriver,
   triggerDriver,
   checkPositions,
   getLogs,

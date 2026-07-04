@@ -492,7 +492,19 @@ async function enablePushNotifications() {
   const btn = document.getElementById('btn-sos-enable-push');
   try {
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
-      showToast('This browser does not support push notifications', 'error');
+      // iOS only exposes the Push API to a Home-Screen PWA (iOS 16.4+), never
+      // in a Safari tab. Detect that case and give the actual fix instead of a
+      // dead-end "not supported" — otherwise the admin can't get locked-phone
+      // SOS alerts.
+      const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent)
+        || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+      const isStandalone = window.navigator.standalone === true
+        || window.matchMedia('(display-mode: standalone)').matches;
+      if (isIOS && !isStandalone) {
+        showToast('On iPhone/iPad: tap Share → "Add to Home Screen", then open SAN Queue Admin from that icon and tap Enable Push.', 'error', 9000);
+      } else {
+        showToast('This browser does not support push notifications', 'error');
+      }
       return;
     }
 

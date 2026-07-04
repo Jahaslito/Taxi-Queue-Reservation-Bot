@@ -508,6 +508,80 @@ describe('removeCarryoverLeftover() — never clears protection flags', () => {
   });
 });
 
+describe('dropAndArmLeftover() — 3 AM forced drop + re-arm', () => {
+  beforeEach(() => setupMocks());
+
+  const seedStuckLeftover = (overrides = {}) => _setWatch(DRIVER_ID, {
+    driverId: DRIVER_ID, vehicleNumber: '9999',
+    inQueueFromCarryover: true, wasCarryoverToday: true,
+    hasBeenSeen: false, positionFiredToday: false,
+    state: 'in_queue', carryoverAbsentPolls: 0, ...overrides,
+  });
+
+  test('CONFIRMED removal → clears carryover/seen/fired, keeps wasCarryoverToday, arms watching', async () => {
+    runRemoveBotForDriver.mockResolvedValue({ success: true, removed: true });
+    seedStuckLeftover({ hasBeenSeen: true, positionFiredToday: true });
+
+    await monitor._dropAndArmLeftover(DRIVER_ID, '9999');
+    const s = monitor._getInternalState(DRIVER_ID);
+
+    expect(s.inQueueFromCarryover).toBe(false); // stops the scheduler waiting
+    expect(s.hasBeenSeen).toBe(false);          // can fire fresh
+    expect(s.positionFiredToday).toBe(false);
+    expect(s.wasCarryoverToday).toBe(true);     // safety net if SAN re-lists before fire
+    expect(s.state).toBe('watching');
+  });
+
+  test('NOT confirmed (still queued) → every flag left intact (no stranding)', async () => {
+    runRemoveBotForDriver.mockResolvedValue({ success: false, notConfirmed: true, error: 'Remove not confirmed' });
+    seedStuckLeftover();
+
+    await monitor._dropAndArmLeftover(DRIVER_ID, '9999');
+    const s = monitor._getInternalState(DRIVER_ID);
+
+    expect(s.inQueueFromCarryover).toBe(true);
+    expect(s.wasCarryoverToday).toBe(true);
+    expect(s.hasBeenSeen).toBe(false);
+    expect(s.state).toBe('in_queue');
+  });
+
+  test('driver already dispatched → flags untouched, no re-arm', async () => {
+    runRemoveBotForDriver.mockResolvedValue({ success: false, dispatched: true });
+    seedStuckLeftover();
+
+    await monitor._dropAndArmLeftover(DRIVER_ID, '9999');
+    const s = monitor._getInternalState(DRIVER_ID);
+
+    expect(s.inQueueFromCarryover).toBe(true);
+    expect(s.state).toBe('in_queue');
+  });
+
+  test('not a carryover leftover (plain watching) → no bot run at all', async () => {
+    _setWatch(DRIVER_ID, {
+      driverId: DRIVER_ID, vehicleNumber: '9999',
+      inQueueFromCarryover: false, state: 'watching',
+    });
+
+    await monitor._dropAndArmLeftover(DRIVER_ID, '9999');
+    expect(runRemoveBotForDriver).not.toHaveBeenCalled();
+  });
+});
+
+describe('dropAndArmCarryoverLeftovers() — selects only stuck leftovers', () => {
+  beforeEach(() => setupMocks());
+
+  test('enqueues a drop for each in_queue carryover driver WITH a target, skips the rest', () => {
+    _setWatch(1, { driverId: 1, vehicleNumber: 'A', inQueueFromCarryover: true,  state: 'in_queue',  scheduledPosition: 118 });
+    _setWatch(2, { driverId: 2, vehicleNumber: 'B', inQueueFromCarryover: true,  state: 'in_queue',  dayPositions: '{"mon":130}' });
+    _setWatch(3, { driverId: 3, vehicleNumber: 'C', inQueueFromCarryover: false, state: 'watching',  scheduledPosition: 100 }); // not a leftover
+    _setWatch(4, { driverId: 4, vehicleNumber: 'D', inQueueFromCarryover: true,  state: 'requeuing', scheduledPosition: 100 }); // in-flight bot
+    _setWatch(5, { driverId: 5, vehicleNumber: 'E', inQueueFromCarryover: true,  state: 'in_queue' }); // manual driver, no target
+
+    const count = monitor._dropAndArmCarryoverLeftovers('2026-06-30');
+    expect(count).toBe(2); // only 1 and 2 (in_queue carryover + has a target)
+  });
+});
+
 // purged by SAN's dispatcher.
 describe('evaluatePositionScheduler — safety rails', () => {
   const makeState = (over = {}) => ({

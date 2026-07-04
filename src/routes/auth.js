@@ -15,6 +15,8 @@ const {
   verifyEmail,
   resendVerification,
   createCheckoutSession,
+  reactivateCheckout,
+  resumeSubscription,
   billingPortal,
 } = require('../controllers/authController');
 
@@ -119,6 +121,14 @@ router.post(
 // ─── Stripe Billing ───────────────────────────────────────────────────────────
 // Create a Checkout Session → returns { url } for the frontend to redirect to
 router.post('/driver/create-checkout', authenticateDriver, createCheckoutSession);
+
+// Reactivate a past_due subscription → re-collect card via setup-mode Checkout,
+// then settle the open invoice immediately (webhook). Returns { url }.
+router.post('/driver/reactivate-checkout', authenticateDriver, reactivateCheckout);
+
+// Undo a scheduled "cancel at period end" during the grace window → keeps the
+// live subscription running, no new charge. Returns { ok, subscription_status }.
+router.post('/driver/resume-subscription', authenticateDriver, resumeSubscription);
 
 // Open the Stripe Customer Portal → returns { url } for managing billing
 router.post('/driver/billing-portal', authenticateDriver, billingPortal);

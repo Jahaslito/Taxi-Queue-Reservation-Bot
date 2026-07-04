@@ -733,7 +733,7 @@
   <div style="text-align:center;margin-bottom:28px;">
     <div style="display:inline-flex;align-items:baseline;gap:4px;background:rgba(0,194,212,0.1);border:1px solid rgba(0,194,212,0.25);border-radius:40px;padding:10px 24px;">
       <span style="font-family:'Syne',sans-serif;font-size:32px;font-weight:800;color:var(--white);">$16</span>
-      <span style="font-size:15px;color:var(--muted);">/ month after trial</span>
+      <span id="billing-price-suffix" style="font-size:15px;color:var(--muted);">/ month after trial</span>
     </div>
   </div>
 
@@ -777,7 +777,7 @@
   <button class="btn btn-primary" id="btn-start-billing" style="margin-bottom:10px;background:linear-gradient(135deg,#00b4ff,#7c6dff);border:none;font-size:17px;font-weight:700;padding:18px;border-radius:16px;">
     Start Free Trial →
   </button>
-  <p style="text-align:center;font-size:13px;color:var(--muted);margin-bottom:24px;">
+  <p id="billing-cta-note" style="text-align:center;font-size:13px;color:var(--muted);margin-bottom:24px;">
     Card required — you won't be charged until day 15. Cancel any time.
   </p>
   <button class="btn btn-ghost" id="btn-logout-billing" style="opacity:0.5;font-size:14px;">Log out</button>
@@ -832,6 +832,14 @@
     <div style="font-weight:700;color:#F05A5B;margin-bottom:4px;">💳 Add a card to keep your account active</div>
     <div id="dash-card-banner-text" style="font-size:13px;color:var(--muted2);margin-bottom:10px;">Your account doesn't have a payment method on file. Add a card to avoid losing access.</div>
     <button id="btn-dash-add-card" class="btn btn-primary btn-sm" style="font-size:13px;font-weight:700;background:linear-gradient(135deg,#00b4ff,#7c6dff);border:none;padding:12px 18px;border-radius:12px;">Add card →</button>
+  </div>
+
+  <!-- Scheduled-cancellation banner (persistent — shows during the grace window
+       between a cancel request and the Stripe cancel date) -->
+  <div id="dash-cancel-banner" style="display:none;background:rgba(245,166,35,0.12);border:1px solid rgba(245,166,35,0.4);border-radius:14px;padding:14px 16px;margin-bottom:16px;">
+    <div style="font-weight:700;color:#F5A623;margin-bottom:4px;">⚠️ Your subscription is canceled</div>
+    <div id="dash-cancel-banner-text" style="font-size:13px;color:var(--muted2);margin-bottom:10px;">Your access will end soon. Resubscribe to keep using SAN Queue.</div>
+    <button id="btn-dash-resume-sub" class="btn btn-primary btn-sm" style="font-size:13px;font-weight:700;background:linear-gradient(135deg,#00b4ff,#7c6dff);border:none;padding:12px 18px;border-radius:12px;">Keep my subscription →</button>
   </div>
 
   <!-- Today's Status -->

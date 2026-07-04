@@ -5,9 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="SQ Admin" />
   <meta name="theme-color" content="#07090F" />
   <title>SAN Queue — Admin</title>
-  <link rel="manifest" href="/manifest.json" />
+  <!-- Admin-specific manifest: start_url "/admin" so an installed Home Screen
+       icon opens the admin console (NOT the driver app at /app/). Required on
+       iOS for the SOS "Enable Push" button — web push only exists in a
+       Home-Screen PWA launched from an admin-scoped start_url. -->
+  <link rel="manifest" href="/admin-manifest.json" />
   <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
@@ -1079,6 +1084,36 @@
           </tr></thead>
           <tbody id="diag-live-tbody">
             <tr><td colspan="11" style="text-align:center;color:var(--muted2);padding:32px;">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Borrowed probe drivers (MONITOR_BORROW_PROBE) -->
+    <div class="table-wrap" id="diag-borrowed-wrap" style="margin-bottom:24px;display:none;">
+      <div class="table-header">
+        <div>
+          <h3>🤝 Borrowed Probe Drivers — Today</h3>
+          <div style="font-size:12px;color:var(--muted2);margin-top:2px;">
+            High-target drivers whose idle account was lent to the tail probe. Each was added/removed a few times, re-parked between cycles, then handed back for its <b>real</b> placement. Confirm every row ends “Fired ✓ on target”. Use 🛟 Rescue if one looks stuck.
+          </div>
+        </div>
+      </div>
+      <div style="overflow-x:auto;">
+        <table style="min-width:860px;">
+          <thead><tr>
+            <th>Vehicle</th>
+            <th>Driver</th>
+            <th>Target</th>
+            <th>Probe Cycles</th>
+            <th>Borrow Status</th>
+            <th>Real Fire</th>
+            <th>Landed</th>
+            <th>On Target?</th>
+            <th style="text-align:center;">Action</th>
+          </tr></thead>
+          <tbody id="diag-borrowed-tbody">
+            <tr><td colspan="9" style="text-align:center;color:var(--muted2);padding:24px;">No borrowed drivers today.</td></tr>
           </tbody>
         </table>
       </div>

@@ -686,6 +686,34 @@ async function rearmPositionScheduler(req, res, next) {
   }
 }
 
+/**
+ * POST /api/admin/drivers/:id/rescue-borrow
+ *
+ * Emergency rescue for a borrowed probe driver that looks stuck: force-retire
+ * the probe (force-removes the vehicle from SAN's queue), stop borrowing them
+ * for the rest of today, and re-arm the position scheduler so they still land
+ * at their real target. Idempotent and safe to call even if the driver isn't
+ * currently borrowed. Also called by scripts/rescueBorrowedDriver.js.
+ */
+async function rescueBorrowedDriver(req, res, next) {
+  try {
+    const monitorService = require('../services/monitorService');
+    const driverId = parseInt(req.params.id, 10);
+
+    if (typeof monitorService.rescueBorrowedDriver !== 'function') {
+      return res.status(503).json({ error: 'Monitor service not running' });
+    }
+
+    const result = await monitorService.rescueBorrowedDriver(driverId);
+    if (!result.ok) {
+      return res.status(404).json({ error: 'Driver not found in active monitor', ...result });
+    }
+    res.json({ message: `Rescued & re-armed #${result.vehicleNumber ?? driverId}`, ...result });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // ─── Send password reset link to a driver ────────────────────────────────────
 async function sendDriverPasswordReset(req, res, next) {
   try {
@@ -842,6 +870,7 @@ module.exports = {
   getDailyReport,
   getPositionDiagnostics,
   rearmPositionScheduler,
+  rescueBorrowedDriver,
   sendDriverPasswordReset,
   unlockCredentials,
   verifyDriverCredentials,

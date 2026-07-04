@@ -42,7 +42,7 @@ function buildPushPayload({ messageId, title, body, url }) {
     data: {
       type:      'admin_message',
       messageId,
-      url:       url || '/',
+      url:       url || '/app',
     },
   });
 }

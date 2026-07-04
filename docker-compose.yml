@@ -139,13 +139,74 @@ services:
       # ±10 accuracy contract — overshoot half. Pre-armed fire sessions park a
       # logged-in page on SAN's "Add To Queue" screen for drivers near their
       # fire window, making the fire a ~1 s click (vs ~3.5 s cold launch) with
-      # no bot-queue wait. Memory: one shared Chromium + ~35 MB per armed
-      # driver, capped by BOT_ARMED_MAX — sized to fit the 1536M limit below
-      # alongside MONITOR_CONCURRENCY cold bots.
+      # no bot-queue wait. Memory: BOT_ARMED_BROWSERS shared Chromiums
+      # (~180 MB each) + ~35 MB per armed driver — 40 armed on 3 browsers
+      # ≈ 2 GB worst case, inside the 4096M limit below alongside
+      # MONITOR_CONCURRENCY cold bots. BOT_ARMED_MAX must cover the WHOLE
+      # day's position roster: a chunk storm fires everyone on one tick, and
+      # unarmed drivers fall to the cold path at peak burst (2026-06-30: the
+      # old cap of 10 left 7 drivers cold → landings +46…+127 past target).
       MONITOR_PREARM_ENABLED:    ${MONITOR_PREARM_ENABLED:-true}
       MONITOR_PREARM_AHEAD_SECS: ${MONITOR_PREARM_AHEAD_SECS:-240}
-      BOT_ARMED_MAX:             ${BOT_ARMED_MAX:-10}
+      # Arm every waiting driver once the queue reaches this position — bursts
+      # are position-locked (onset at queue 60–85 every morning), so proximity
+      # in POSITION, not projected fire time, is what predicts the storm.
+      MONITOR_PREARM_QUEUE_POS:  ${MONITOR_PREARM_QUEUE_POS:-45}
+      BOT_ARMED_MAX:             ${BOT_ARMED_MAX:-40}
+      BOT_ARMED_BROWSERS:        ${BOT_ARMED_BROWSERS:-3}
+      BOT_ARM_OPS_CONCURRENCY:   ${BOT_ARM_OPS_CONCURRENCY:-4}
+      # Persistent vehicle_not_available = broken SAN account/vehicle data
+      # (the #142/#70/#4006 class): after N consecutive not-available arm
+      # attempts, suspend re-arming that driver for the suspend window instead
+      # of looping SAN logins every 180 s cooldown (06-30: 47 logins each for
+      # #70/#4006 in one day).
+      BOT_ARM_NOT_AVAIL_MAX:        ${BOT_ARM_NOT_AVAIL_MAX:-3}
+      BOT_ARM_NOT_AVAIL_SUSPEND_MS: ${BOT_ARM_NOT_AVAIL_SUSPEND_MS:-21600000}
       BOT_ARM_REFRESH_MS:        ${BOT_ARM_REFRESH_MS:-90000}
+      # Sacrificial tail probe (anti-straddle observation feed, default OFF).
+      # Dedicated probe vehicle(s) run add → read slot → confirm-remove cycles
+      # during the storm, feeding exact true-tail samples to the fleet probe —
+      # the ~5 s stepped display can't show intra-chunk growth, the server's
+      # own slot assignment can. Requires DEDICATED SAN account(s) (never a
+      # real driver's) and one off-peak smoke cycle per account before first
+      # storm use. SAMPLING CADENCE IS THE LEVER (5-day replay, pooled):
+      # 1 probe ≈ 3.5 s → 88% of fires ≤ +15 (worst +27); 2 probes ≈ 1.8 s →
+      # 94% ≤ +15 (worst +24); 3 probes ≈ 1.2 s → 96% ≤ +15 (worst +23).
+      # Multiple probes: comma-separated ALIGNED lists in the three vars
+      # (e.g. "9998,9999" / "userA,userB" / "passA,passB"); each probe gets
+      # its own loop + browser, first cycles staggered so samples interleave.
+      # MAX_CYCLES is PER PROBE (total SAN adds/day = cap × #probes).
+      MONITOR_TAIL_PROBE:        ${MONITOR_TAIL_PROBE:-0}
+      TAIL_PROBE_VEHICLE:        ${TAIL_PROBE_VEHICLE:-}
+      TAIL_PROBE_SAN_USERNAME:   ${TAIL_PROBE_SAN_USERNAME:-}
+      TAIL_PROBE_SAN_PASSWORD:   ${TAIL_PROBE_SAN_PASSWORD:-}
+      TAIL_PROBE_MAX_CYCLES:     ${TAIL_PROBE_MAX_CYCLES:-150}
+      TAIL_PROBE_STAGGER_MS:     ${TAIL_PROBE_STAGGER_MS:-1700}
+      # Imminence gate: probe only while some pending fire is within this many
+      # seconds. Storm days: secsToFire collapses in the burst zone, so the
+      # probe runs continuously there. Calm days: short probe windows just
+      # before each fire cluster instead of burning the cycle cap all morning.
+      MONITOR_TAIL_PROBE_AHEAD_SECS: ${MONITOR_TAIL_PROBE_AHEAD_SECS:-90}
+      # Borrowed tail probe (default OFF) — use when NO dedicated probe account
+      # exists. Lends the probe the highest-target watched drivers (their real
+      # fire is minutes away); each is force-removed and handed back the instant
+      # the tail closes to within BORROW_PROBE_MARGIN of their target, leaving
+      # that many positions of runway for a clean, accurate real placement. The
+      # driver only ever sees their one real placement, never the probe cycles.
+      # NOTE: this cycles a paying driver's SAN account for fleet-wide benefit —
+      # disclose it in your terms of service before enabling. Runs on
+      # MONITOR_BORROW_PROBE=1 ALONE (independent of MONITOR_TAIL_PROBE, which is
+      # only for dedicated accounts). REQUIRES MONITOR_FLEET_PROBE=1 to be
+      # useful — that flag is what consumes the probe's tail samples; without it
+      # the borrowed adds/removes feed nothing and are pure risk.
+      MONITOR_BORROW_PROBE:        ${MONITOR_BORROW_PROBE:-0}
+      MONITOR_BORROW_PROBE_MAX:    ${MONITOR_BORROW_PROBE_MAX:-2}
+      MONITOR_BORROW_PROBE_MARGIN: ${MONITOR_BORROW_PROBE_MARGIN:-60}
+      # Poll cache-buster — TESTED 2026-07-03, DON'T BOTHER: spacezone already
+      # returns "cache-control: no-cache, no-store, max-age=0" (identical with
+      # a buster param), so there is no intermediary cache; the ~5 s step is
+      # SAN's own server-side render cadence. Kept only as a header knob.
+      MONITOR_POLL_CACHE_BUST:   ${MONITOR_POLL_CACHE_BUST:-0}
 
       # Bot session disk persistence path (relative to /app inside container)
       BOT_SESSION_PERSIST_PATH: ${BOT_SESSION_PERSIST_PATH:-/app/data/bot-sessions.json}

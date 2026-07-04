@@ -233,6 +233,17 @@ router.post(
   adminController.rearmPositionScheduler,
 );
 
+// Rescue a borrowed probe driver that appears stuck: force-retire the probe
+// (force-removes the vehicle from SAN), exclude from borrowing today, and
+// re-arm the scheduler so they still get their real target. Also invoked by
+// scripts/rescueBorrowedDriver.js.
+router.post(
+  '/drivers/:id/rescue-borrow',
+  [idParam],
+  validate,
+  adminController.rescueBorrowedDriver,
+);
+
 router.get(
   '/logs',
   [

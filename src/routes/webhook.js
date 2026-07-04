@@ -13,7 +13,8 @@
 
 const express = require('express');
 const Driver  = require('../models/Driver');
-const { constructWebhookEvent, retrieveSubscription } = require('../services/stripeService');
+const { constructWebhookEvent, retrieveSubscription, reactivateFromSetupIntent } = require('../services/stripeService');
+const { sendPaymentFailedEmail } = require('../services/emailService');
 
 const router = express.Router();
 
@@ -44,6 +45,26 @@ router.post(
 
         case 'checkout.session.completed': {
           const session = event.data.object;
+
+          // Reactivation: card collected via a setup-mode Checkout for a driver
+          // whose subscription went past_due. Attach the card + pay the open
+          // invoice immediately. Re-activation itself is handled by the
+          // resulting invoice.payment_succeeded / subscription.updated events.
+          if (session.mode === 'setup' && session.metadata?.purpose === 'reactivate') {
+            const driver = await Driver.findByStripeCustomerId(session.customer);
+            if (!driver) {
+              console.warn(`[Stripe Webhook] setup reactivate — no driver for customer ${session.customer}`);
+              break;
+            }
+            const { invoicePaid } = await reactivateFromSetupIntent({
+              customerId:     session.customer,
+              subscriptionId: driver.stripe_subscription_id,
+              setupIntentId:  session.setup_intent,
+            });
+            console.log(`[Stripe Webhook] Driver ${driver.id} reactivation setup — invoice ${invoicePaid ? 'paid' : 'not charged (none open)'}`);
+            break;
+          }
+
           if (session.mode !== 'subscription') break;
 
           const driverId = session.metadata?.driver_id;
@@ -64,6 +85,8 @@ router.post(
             // re-activate a driver the sweep had deactivated.
             is_active:              true,
             card_required_by:       null,
+            // Fresh subscription — drop any prior scheduled-cancel date.
+            subscription_cancel_at: null,
           });
 
           console.log(`[Stripe Webhook] Driver ${driverId} subscribed — status: ${sub.status}`);
@@ -80,15 +103,26 @@ router.post(
             break;
           }
 
+          // Scheduled cancellation ("cancel at period end"): the subscription
+          // stays active/trialing but Stripe stamps cancel_at with the date
+          // access will end. Persist it to drive the grace-window banner; clear
+          // it the moment the schedule is removed (driver un-cancels) or the sub
+          // is deleted. `deleted` events carry cancel_at_period_end=false, so
+          // this naturally clears on final cancellation too.
+          const cancelAt = (sub.cancel_at_period_end && sub.cancel_at)
+            ? new Date(sub.cancel_at * 1000)
+            : null;
+
           // Also persist stripe_subscription_id here so the link is recoverable
           // even if checkout.session.completed never reached this endpoint.
           await Driver.update(driver.id, {
-            stripe_subscription_id: sub.id,
-            subscription_status:    sub.status,
-            trial_ends_at:          sub.trial_end ? new Date(sub.trial_end * 1000) : null,
+            stripe_subscription_id:  sub.id,
+            subscription_status:     sub.status,
+            trial_ends_at:           sub.trial_end ? new Date(sub.trial_end * 1000) : null,
+            subscription_cancel_at:  cancelAt,
           });
 
-          console.log(`[Stripe Webhook] Driver ${driver.id} ${event.type}: ${sub.status}`);
+          console.log(`[Stripe Webhook] Driver ${driver.id} ${event.type}: ${sub.status}${cancelAt ? ` (cancels ${cancelAt.toISOString()})` : ''}`);
           break;
         }
 
@@ -103,9 +137,10 @@ router.post(
           // A successful charge means a working card is on file — clear any
           // card-enforcement lock and re-activate.
           await Driver.update(driver.id, {
-            subscription_status: 'active',
-            is_active:           true,
-            card_required_by:    null,
+            subscription_status:    'active',
+            is_active:              true,
+            card_required_by:       null,
+            subscription_cancel_at: null,
           });
           console.log(`[Stripe Webhook] Driver ${driver.id} ${event.type} → active`);
           break;
@@ -131,6 +166,14 @@ router.post(
 
           await Driver.update(driver.id, { subscription_status: 'past_due' });
           console.log(`[Stripe Webhook] Driver ${driver.id} payment failed → past_due`);
+
+          // Notify the driver their account is paused and they must re-add a
+          // card. Non-blocking — a mail failure must not 5xx the webhook.
+          if (driver.email) {
+            sendPaymentFailedEmail(driver).catch((err) =>
+              console.error(`[Stripe Webhook] Failed to send payment-failed email to driver ${driver.id}:`, err.message),
+            );
+          }
           break;
         }
 

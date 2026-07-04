@@ -1,9 +1,9 @@
 {
-  "name": "SAN Queue Scheduler",
-  "short_name": "SAN Queue",
-  "description": "Automated queue scheduler for SAN airport taxi drivers",
-  "start_url": "/app/",
-  "scope": "/",
+  "name": "SAN Queue Admin",
+  "short_name": "SQ Admin",
+  "description": "Admin console — SOS alerts, queue monitor, driver management",
+  "start_url": "/admin",
+  "scope": "/admin",
   "display": "standalone",
   "orientation": "portrait-primary",
   "theme_color": "#07090F",
@@ -20,14 +20,5 @@
     { "src": "/icons/icon-512.png",          "sizes": "512x512", "type": "image/png", "purpose": "any" },
     { "src": "/icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
     { "src": "/icons/apple-touch-icon.png",  "sizes": "180x180", "type": "image/png" }
-  ],
-  "shortcuts": [
-    {
-      "name": "Queue Monitor",
-      "short_name": "Monitor",
-      "description": "Open the live queue monitor",
-      "url": "/admin",
-      "icons": [{ "src": "/icons/icon-96.png", "sizes": "96x96" }]
-    }
   ]
 }

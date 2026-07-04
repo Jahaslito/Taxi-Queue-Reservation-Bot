@@ -91,6 +91,62 @@ window.renderCardBanner = function (profile) {
   banner.style.display = 'block';
 };
 
+// ─── Scheduled-cancellation grace banner ──────────────────────────────────────
+// Shown when the driver has canceled but is still inside the grace window: the
+// subscription is live (status active/trialing) with a future
+// subscription_cancel_at. Access continues; the banner counts down to the cutoff
+// and offers a one-tap "keep my subscription" (removes the scheduled cancel, no
+// new charge). Cleared server-side the moment the cancellation is undone.
+window.renderCancelBanner = function (profile) {
+  const banner = document.getElementById('dash-cancel-banner');
+  if (!banner) return;
+
+  // Only during the grace window: a future cancel date AND still-active access.
+  // Once status flips to canceled the driver is on the lockout screen instead.
+  const active = ['trialing', 'active'].includes(profile?.subscription_status);
+  if (!profile || !profile.subscription_cancel_at || !active) {
+    banner.style.display = 'none';
+    return;
+  }
+
+  const textEl = document.getElementById('dash-cancel-banner-text');
+  if (textEl) {
+    const end  = new Date(profile.subscription_cancel_at);
+    const days = Math.ceil((end - Date.now()) / 86400000);
+    const on   = end.toLocaleDateString(undefined, { month: 'long', day: 'numeric' });
+    if (days > 1) {
+      textEl.textContent = `Your access ends on ${on} (${days} days left). Keep your subscription to stay active — you won't be charged anything extra.`;
+    } else if (days === 1) {
+      textEl.textContent = `Your access ends tomorrow (${on}). Keep your subscription to stay active — you won't be charged anything extra.`;
+    } else {
+      textEl.textContent = `Your access ends today (${on}). Keep your subscription now to avoid losing access.`;
+    }
+  }
+
+  banner.style.display = 'block';
+};
+
+// "Keep my subscription →" — removes the scheduled cancellation on the still-live
+// subscription. No redirect, no charge; on success we hide the banner and patch
+// local state so the UI updates instantly.
+document.getElementById('btn-dash-resume-sub')?.addEventListener('click', async function () {
+  this.disabled = true;
+  this.innerHTML = '<span class="spinner"></span> Updating…';
+  try {
+    const data = await api('/api/auth/driver/resume-subscription', { method: 'POST' });
+    if (typeof driverProfile !== 'undefined' && driverProfile) {
+      driverProfile.subscription_cancel_at = null;
+      if (data.subscription_status) driverProfile.subscription_status = data.subscription_status;
+    }
+    document.getElementById('dash-cancel-banner').style.display = 'none';
+    showToast('✅ Your subscription will continue. Welcome back!', 'success');
+  } catch (err) {
+    showToast(err.message || 'Could not update your subscription. Please try again.', 'error');
+    this.disabled  = false;
+    this.textContent = 'Keep my subscription →';
+  }
+});
+
 // "Add card →" button on the dashboard banner — same hosted Checkout as the
 // trial button (self-heals grandfathered drivers: creates the customer + a
 // subscription and collects the card in one step).
@@ -124,36 +180,71 @@ window.prepareBillingView = function (profile) {
   errEl.style.display = 'none';
   errEl.textContent   = '';
 
+  // Fine print under the primary CTA. The default markup is trial copy
+  // ("not charged until day 15") — accurate only for genuinely new drivers.
+  // Reactivating drivers are charged at checkout (skipTrial), so we rewrite it
+  // per branch to match what actually happens at Stripe.
+  const ctaNote   = document.getElementById('billing-cta-note');
+  const TRIAL_NOTE = "Card required — you won't be charged until day 15. Cancel any time.";
+
+  // The pricing pill's "/ month after trial" suffix is only true for the
+  // new-trial branch — every reactivation path charges immediately.
+  const priceSuffix = document.getElementById('billing-price-suffix');
+  const setPriceSuffix = (withTrial) => {
+    if (priceSuffix) priceSuffix.textContent = withTrial ? '/ month after trial' : '/ month';
+  };
+
   const status = profile?.subscription_status;
+
+  // Default the primary CTA to the standard new-subscription Checkout. The
+  // past_due branch overrides this to the reactivate endpoint (which re-collects
+  // a card and settles the open invoice without creating a second subscription).
+  btnStart.dataset.endpoint = '/api/auth/driver/create-checkout';
 
   // Card-enforcement deactivation takes precedence over the generic past_due
   // copy: these drivers were deactivated for having no card on file, and they
   // reactivate by adding one (hosted Checkout via btn-start-billing), not via
-  // the billing portal.
+  // the billing portal. They already used the system on a free ride, so
+  // checkout charges them immediately (no fresh trial) — say so.
   if (profile?.card_required_by) {
     title.textContent    = 'Add a Card to Reactivate';
     subtitle.textContent = 'Your subscription is inactive because there is no card on file. Add a card to reactivate your account.';
     btnStart.textContent = 'Add Card →';
     btnStart.style.display   = '';
     manageSection.style.display = 'none';
+    setPriceSuffix(false);
+    if (ctaNote) { ctaNote.textContent = 'Your card will be charged today to reactivate your account. Cancel any time.'; ctaNote.style.display = ''; }
   } else if (status === 'past_due') {
+    // Failed payment → locked out. Re-add a card in-app; the card is charged
+    // immediately to settle the missed payment (reactivate endpoint), rather
+    // than bouncing the driver to the Stripe portal and waiting on dunning.
     title.textContent    = 'Payment Required';
-    subtitle.textContent = 'Your last payment failed. Update your card to restore access.';
-    btnStart.style.display   = 'none';
-    manageSection.style.display = 'block';
-    document.querySelector('#billing-view-subtitle + p')?.style && (document.querySelector('#billing-view-subtitle + p').style.display = 'none');
+    subtitle.textContent = 'Your last payment failed and your account is paused. Add your card to settle the missed payment and restore access.';
+    btnStart.textContent = 'Add Card & Pay Now →';
+    btnStart.dataset.endpoint = '/api/auth/driver/reactivate-checkout';
+    btnStart.style.display   = '';
+    manageSection.style.display = 'none';
+    setPriceSuffix(false);
+    if (ctaNote) { ctaNote.textContent = 'Your card will be charged now to settle the missed payment. Cancel any time.'; ctaNote.style.display = ''; }
   } else if (status === 'canceled' || status === 'unpaid') {
+    // Resubscribing drivers already used their trial — checkout charges the
+    // card immediately (skipTrial server-side), so the fine print must not
+    // promise a free trial.
     title.textContent    = 'Subscription Ended';
-    subtitle.textContent = 'Your subscription has ended. Resubscribe to continue using SAN Queue.';
+    subtitle.textContent = 'You do not have an active subscription. Add your card back to continue using SAN Queue.';
     btnStart.textContent = 'Resubscribe →';
     btnStart.style.display   = '';
     manageSection.style.display = 'none';
+    setPriceSuffix(false);
+    if (ctaNote) { ctaNote.textContent = 'Your card will be charged today to restart your subscription. Cancel any time.'; ctaNote.style.display = ''; }
   } else {
     title.textContent    = 'Start Your Free Trial';
     subtitle.textContent = '14 days free — then just $16 / month';
     btnStart.textContent = 'Start Free Trial →';
     btnStart.style.display   = '';
     manageSection.style.display = 'none';
+    setPriceSuffix(true);
+    if (ctaNote) { ctaNote.textContent = TRIAL_NOTE; ctaNote.style.display = ''; }
   }
 };
 
@@ -164,14 +255,23 @@ document.getElementById('btn-start-billing').addEventListener('click', async fun
   this.disabled = true;
   this.innerHTML = '<span class="spinner"></span> Connecting to Stripe…';
 
+  // Endpoint depends on account state — past_due reactivates the existing
+  // subscription; everyone else starts/restarts one. Set by prepareBillingView.
+  const endpoint = this.dataset.endpoint || '/api/auth/driver/create-checkout';
+
   try {
-    const data = await api('/api/auth/driver/create-checkout', { method: 'POST' });
+    const data = await api(endpoint, { method: 'POST' });
     window.location.href = data.url;
   } catch (err) {
     errEl.textContent   = err.message || 'Could not start checkout. Please try again.';
     errEl.style.display = 'block';
     this.disabled       = false;
-    this.textContent    = 'Start Free Trial →';
+    // Restore the state-correct button label (varies: trial / reactivate / etc.)
+    if (typeof driverProfile !== 'undefined' && driverProfile && window.prepareBillingView) {
+      window.prepareBillingView(driverProfile);
+    } else {
+      this.textContent = 'Start Free Trial →';
+    }
   }
 });
 

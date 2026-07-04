@@ -69,6 +69,13 @@ async function api(path, options = {}) {
     const err = new Error(friendlyHttpError(res.status, data.error));
     err.status = res.status;
     err.data   = data;
+    // 402 = subscription lapsed mid-session (canceled / payment failed while
+    // the app was open). Let the driver app re-route to the billing lockout
+    // screen instead of leaving a dashboard whose every call silently fails.
+    // Fire-and-forget — the caller still gets its error.
+    if (res.status === 402 && typeof window.onSubscriptionRequired === 'function') {
+      try { window.onSubscriptionRequired(data); } catch { /* never mask the original error */ }
+    }
     throw err;
   }
   return data;

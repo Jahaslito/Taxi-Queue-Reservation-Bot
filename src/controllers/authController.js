@@ -362,12 +362,64 @@ async function createCheckoutSession(req, res, next) {
     const session = await stripeService.createCheckoutSession({
       customerId,
       driverId: driver.id,
-      // Grandfathered drivers who already had free access (carry a
-      // card_required_by stamp) are charged at checkout instead of getting a
-      // fresh trial — they're reactivating, not signing up.
-      skipTrial: !!driver.card_required_by,
+      // Charged at checkout instead of getting a fresh trial:
+      //   • grandfathered drivers who already had free access (carry a
+      //     card_required_by stamp) — they're reactivating, not signing up.
+      //   • drivers whose subscription ended (canceled/unpaid) — otherwise
+      //     cancel → resubscribe would mint a new 14-day trial every cycle.
+      skipTrial: !!driver.card_required_by
+        || ['canceled', 'unpaid'].includes(driver.subscription_status),
     });
 
+    res.json({ url: session.url });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ─── Reactivate a past_due subscription (re-add card + immediate charge) ──────
+// For a driver whose subscription went `past_due` after a failed payment. They
+// still have a LIVE subscription, so we must NOT create a second one — instead
+// we open a setup-mode Checkout to collect a new card; the webhook then settles
+// the open invoice immediately (see stripeService.reactivateFromSetupIntent).
+//
+// Falls back to a normal Checkout (new subscription, charged at checkout) if the
+// driver somehow has no live subscription to reactivate.
+async function reactivateCheckout(req, res, next) {
+  try {
+    const driver = await Driver.findByIdWithCredentials(req.driverId);
+    if (!driver) {
+      const err = new Error('Driver not found');
+      err.statusCode = 404;
+      throw err;
+    }
+    if (!driver.email_verified_at) {
+      const err = new Error('Please verify your email address before setting up billing.');
+      err.statusCode = 403;
+      throw err;
+    }
+
+    // No live subscription/customer to reactivate → behave like a fresh signup,
+    // but charge at checkout (skipTrial) since they've used the service before.
+    if (!driver.stripe_customer_id || !driver.stripe_subscription_id) {
+      let customerId = driver.stripe_customer_id;
+      if (!customerId) {
+        const customer = await stripeService.createCustomer(driver);
+        customerId = customer.id;
+        await Driver.update(driver.id, { stripe_customer_id: customerId });
+      }
+      const checkout = await stripeService.createCheckoutSession({
+        customerId,
+        driverId:  driver.id,
+        skipTrial: true,
+      });
+      return res.json({ url: checkout.url });
+    }
+
+    const session = await stripeService.createSetupSession({
+      customerId: driver.stripe_customer_id,
+      driverId:   driver.id,
+    });
     res.json({ url: session.url });
   } catch (err) {
     next(err);
@@ -407,10 +459,48 @@ async function billingPortal(req, res, next) {
 
     const session = await stripeService.createPortalSession(
       driver.stripe_customer_id,
-      `${APP_URL_ENV}/`,
+      // ?billing=portal-return → boot re-checks the subscription on arrival, so
+      // an immediate cancel lands on the lockout screen without a refresh.
+      `${APP_URL_ENV}/app/?billing=portal-return`,
     );
 
     res.json({ url: session.url });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ─── Resume a subscription scheduled to cancel at period end ──────────────────
+// The driver canceled but is still inside the grace window (subscription is
+// live, cancel_at is in the future) and tapped "Keep my subscription". Remove
+// the scheduled cancellation — no new charge, no new subscription. The Stripe
+// webhook (customer.subscription.updated) clears subscription_cancel_at; we also
+// clear it here so the banner disappears without waiting on webhook delivery.
+async function resumeSubscription(req, res, next) {
+  try {
+    const driver = await Driver.findByIdWithCredentials(req.driverId);
+    if (!driver) {
+      const err = new Error('Driver not found');
+      err.statusCode = 404;
+      throw err;
+    }
+    // Nothing scheduled to cancel, or no live subscription to resume → the grace
+    // window has already passed. Tell the client to re-check: if the sub is gone
+    // they belong on the resubscribe flow, not here.
+    if (!driver.subscription_cancel_at || !driver.stripe_subscription_id) {
+      const err = new Error('No scheduled cancellation to undo. Please refresh and try again.');
+      err.statusCode = 409;
+      throw err;
+    }
+
+    const sub = await stripeService.resumeSubscription(driver.stripe_subscription_id);
+    await Driver.update(driver.id, {
+      subscription_status:    sub.status,
+      subscription_cancel_at: null,
+    });
+
+    console.log(`[Auth] Driver ${driver.id} resumed subscription — cancellation removed (status ${sub.status})`);
+    res.json({ ok: true, subscription_status: sub.status });
   } catch (err) {
     next(err);
   }
@@ -432,5 +522,7 @@ module.exports = {
   verifyEmail,
   resendVerification,
   createCheckoutSession,
+  reactivateCheckout,
+  resumeSubscription,
   billingPortal,
 };

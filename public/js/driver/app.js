@@ -73,6 +73,27 @@ function routeDriver(profile) {
   showView('view-dashboard');
 }
 
+// ─── Mid-session subscription lapse ───────────────────────────────────────────
+// Called by the shared api() helper whenever any request returns 402. The
+// subscription ended while the app was open (Stripe cancellation / failed
+// payment landed after boot), so the routeDriver gate never re-ran. Re-fetch
+// the profile — intentionally NOT behind requireSubscription, so it can't 402
+// and loop — and re-route to the billing lockout screen.
+let reroutingSubscriptionLapse = false;
+window.onSubscriptionRequired = async () => {
+  if (reroutingSubscriptionLapse) return;
+  reroutingSubscriptionLapse = true;
+  try {
+    const profile = await api('/api/driver/profile');
+    routeDriver(profile);
+  } catch {
+    // Session itself is dead (401/403) — the existing auth handling applies
+    // on the next boot; nothing sensible to render from here.
+  } finally {
+    reroutingSubscriptionLapse = false;
+  }
+};
+
 // ─── Nav bar click wiring ─────────────────────────────────────────────────────
 document.querySelectorAll('.nav-item').forEach(btn => {
   btn.addEventListener('click', () => showView(btn.dataset.view));
@@ -198,6 +219,25 @@ window.__APP_CONFIG__ = { billingEnabled: true }; // safe default until fetched
       }
     } else if (billing === 'canceled') {
       showToast('Billing setup was canceled. You can try again any time.', 'error');
+    } else if (billing === 'portal-return') {
+      // Back from the Stripe Billing Portal. If they just canceled (the portal
+      // is configured to cancel immediately), the webhook may still be in
+      // flight — the profile fetched above can be a beat stale. Re-check in
+      // the background and re-route the moment the status flips, so the
+      // lockout screen appears without a manual refresh. Card updates and
+      // no-op portal visits leave the status unchanged and nothing happens.
+      (async () => {
+        for (let i = 0; i < 4; i++) {
+          await new Promise(r => setTimeout(r, 1500));
+          try {
+            const fresh = await api('/api/driver/profile');
+            if (fresh.subscription_status !== profile.subscription_status) {
+              routeDriver(fresh);
+              return;
+            }
+          } catch { return; }
+        }
+      })();
     }
 
     routeDriver(profile);

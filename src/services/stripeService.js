@@ -122,13 +122,92 @@ async function createCheckoutSession({ customerId, driverId, successUrl, cancelU
 }
 
 /**
+ * Create a hosted Checkout Session in `setup` mode — collects a card on Stripe's
+ * hosted page WITHOUT creating a new subscription. Used to re-collect a card for
+ * a driver whose existing subscription went `past_due` after a failed payment.
+ *
+ * The card never touches our servers (no PCI surface). On completion Stripe
+ * fires `checkout.session.completed` with `mode: 'setup'`; the webhook then
+ * attaches the card and settles the open invoice (see `reactivateFromSetupIntent`).
+ *
+ * `purpose: 'reactivate'` in metadata lets the webhook distinguish this from any
+ * other future setup-mode session.
+ */
+async function createSetupSession({ customerId, driverId, successUrl, cancelUrl }) {
+  return getStripe().checkout.sessions.create({
+    customer:             customerId,
+    payment_method_types: ['card'],
+    mode:                 'setup',
+    success_url:          successUrl || `${appUrl}/app/?billing=success`,
+    cancel_url:           cancelUrl  || `${appUrl}/app/?billing=canceled`,
+    metadata:             { driver_id: String(driverId), purpose: 'reactivate' },
+  });
+}
+
+/**
+ * Settle a past_due subscription using the card just collected via a setup-mode
+ * Checkout Session. Called from the webhook on `checkout.session.completed`.
+ *
+ * Steps:
+ *   1. Resolve the new payment method from the completed SetupIntent.
+ *   2. Make it the customer + subscription default (so future renewals use it).
+ *   3. Pay the subscription's open invoice IMMEDIATELY — we don't wait for
+ *      Stripe's dunning retries, the driver is charged the moment they add a card.
+ *
+ * Paying the open invoice transitions the subscription past_due → active, which
+ * fires `invoice.payment_succeeded` + `customer.subscription.updated` — both
+ * already handled to re-activate the driver. Throws on a declined charge so the
+ * caller can log it (the subscription simply stays past_due, as before).
+ *
+ * @returns {{ paymentMethodId: string, invoicePaid: boolean }}
+ */
+async function reactivateFromSetupIntent({ customerId, subscriptionId, setupIntentId }) {
+  const stripe = getStripe();
+
+  const si = await stripe.setupIntents.retrieve(setupIntentId);
+  const paymentMethodId = si.payment_method;
+  if (!paymentMethodId) throw new Error('Setup intent has no payment method attached');
+
+  // Make this card the default for all future charges on the customer.
+  await stripe.customers.update(customerId, {
+    invoice_settings: { default_payment_method: paymentMethodId },
+  });
+
+  if (!subscriptionId) return { paymentMethodId, invoicePaid: false };
+
+  await stripe.subscriptions.update(subscriptionId, {
+    default_payment_method: paymentMethodId,
+  });
+
+  // Settle the outstanding invoice now, on this card.
+  const sub     = await stripe.subscriptions.retrieve(subscriptionId, { expand: ['latest_invoice'] });
+  const invoice = sub.latest_invoice;
+  if (invoice && invoice.status === 'open') {
+    await stripe.invoices.pay(invoice.id, { payment_method: paymentMethodId });
+    return { paymentMethodId, invoicePaid: true };
+  }
+
+  return { paymentMethodId, invoicePaid: false };
+}
+
+/**
+ * Retrieve a Checkout Session (used by the webhook to read its setup_intent).
+ */
+async function retrieveCheckoutSession(sessionId) {
+  return getStripe().checkout.sessions.retrieve(sessionId);
+}
+
+/**
  * Open the Stripe Customer Portal for an existing subscriber.
  * Used for updating payment method, cancelling, or viewing invoices.
  */
 async function createPortalSession(customerId, returnUrl) {
   return getStripe().billingPortal.sessions.create({
     customer:   customerId,
-    return_url: returnUrl || `${appUrl}/`,
+    // ?billing=portal-return lets the app re-check the subscription on arrival
+    // so a just-scheduled cancellation (or a resubscribe) reflects without a
+    // manual refresh.
+    return_url: returnUrl || `${appUrl}/app/?billing=portal-return`,
   });
 }
 
@@ -137,6 +216,17 @@ async function createPortalSession(customerId, returnUrl) {
  */
 async function retrieveSubscription(subscriptionId) {
   return getStripe().subscriptions.retrieve(subscriptionId);
+}
+
+/**
+ * Remove a scheduled "cancel at period end" from a still-live subscription — the
+ * driver changed their mind during the grace window. No new charge: the existing
+ * subscription simply keeps running. Returns the updated subscription so the
+ * caller can read back its status. The resulting customer.subscription.updated
+ * webhook clears subscription_cancel_at.
+ */
+async function resumeSubscription(subscriptionId) {
+  return getStripe().subscriptions.update(subscriptionId, { cancel_at_period_end: false });
 }
 
 /**
@@ -150,8 +240,12 @@ function constructWebhookEvent(rawBody, signature, secret) {
 module.exports = {
   createCustomer,
   createCheckoutSession,
+  createSetupSession,
+  reactivateFromSetupIntent,
+  retrieveCheckoutSession,
   createPortalSession,
   retrieveSubscription,
+  resumeSubscription,
   constructWebhookEvent,
   // Exported for unit testing — not called by route handlers.
   _trialConfig:     trialConfig,

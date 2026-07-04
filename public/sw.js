@@ -8,7 +8,7 @@
 //   3. activate handler purges any caches not matching CACHE_NAME
 //   4. clients.claim() takes over open tabs immediately
 //   5. Next navigation (or app reopen) serves the new files
-const CACHE_VERSION = 'v34';
+const CACHE_VERSION = 'v38';
 const CACHE_NAME    = `san-queue-${CACHE_VERSION}`;
 
 // On localhost the service worker only gets in the way: cache-first serving of
@@ -19,9 +19,10 @@ const CACHE_NAME    = `san-queue-${CACHE_VERSION}`;
 const DEV = self.location.hostname === 'localhost' || self.location.hostname === '127.0.0.1';
 
 const PRECACHE = [
-  '/',
+  '/app',
   '/admin',
   '/manifest.json',
+  '/admin-manifest.json',
   '/js/utils.js',
   '/js/driver/app.js',
   '/js/driver/auth.controller.js',
@@ -120,18 +121,17 @@ self.addEventListener('push', (event) => {
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   const data = event.notification.data || {};
-  // dispatch + admin_message belong to the driver app (root); SOS to /admin.
+  // dispatch + admin_message belong to the driver app (/app); SOS to /admin.
   const isDriverSurface = data.type === 'dispatch' || data.type === 'admin_message';
-  const url  = data.url || (isDriverSurface ? '/' : '/admin');
-  const focusToken = isDriverSurface ? '/' : '/admin';
+  const url  = data.url || (isDriverSurface ? '/app' : '/admin');
+  const focusToken = isDriverSurface ? '/app' : '/admin';
 
   event.waitUntil((async () => {
     const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
     // Focus an existing tab on the matching surface if there is one.
-    // /admin match must be exact-ish to avoid matching the driver root '/'.
     for (const c of all) {
       const path = new URL(c.url).pathname;
-      if (focusToken === '/admin' ? path.startsWith('/admin') : !path.startsWith('/admin')) {
+      if (path.startsWith(focusToken)) {
         await c.focus();
         // Deep-link the driver app straight to the tapped message (open inbox,
         // highlight + mark read). A freshly opened window picks it up on boot.

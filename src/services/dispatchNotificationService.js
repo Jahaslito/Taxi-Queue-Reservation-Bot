@@ -90,7 +90,7 @@ function buildPushPayload({ driverName, vehicleNumber, terminal, etaText }) {
     tag:   `dispatch-${vehicleNumber}`,
     data: {
       type:           'dispatch',
-      url:            '/',
+      url:            '/app',
       driverName,
       vehicleNumber,
       terminal,

@@ -110,6 +110,66 @@ function renderLiveRow(r) {
     </tr>`;
 }
 
+// ─── Borrowed-driver rescue handler ──────────────────────────────────────────
+
+async function rescueBorrowed(driverId, vehicleNumber) {
+  if (!confirm(`Rescue #${vehicleNumber}? This force-removes them from SAN's queue, stops borrowing them today, and re-arms them for their real target.`)) return;
+  try {
+    const data = await api(`/api/admin/drivers/${driverId}/rescue-borrow`, { method: 'POST' });
+    if (!data) return;
+    showToast(`#${vehicleNumber} rescued & re-armed`, 'success');
+    await loadPosDiagnostics();
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+}
+
+// ─── Borrowed probe drivers table renderer ───────────────────────────────────
+
+function renderBorrowedRow(r) {
+  // Borrow status pill
+  let statusPill;
+  if (r.borrowedNow) {
+    statusPill = { label: '🔄 Borrowed now', color: 'var(--amber)', bg: 'rgba(245,166,35,0.15)' };
+  } else if (r.borrowRetiredAt) {
+    statusPill = { label: '↩︎ Retired & re-armed', color: 'var(--teal)', bg: 'rgba(0,209,178,0.10)' };
+  } else {
+    statusPill = { label: '⏳ Pending', color: 'var(--muted2)', bg: 'rgba(90,101,133,0.15)' };
+  }
+  if (r.borrowExcluded) statusPill = { label: '🛟 Rescued', color: 'var(--purple)', bg: 'rgba(167,139,250,0.12)' };
+
+  const fireCell = r.positionFiredToday
+    ? '<span style="color:var(--green);font-weight:600;">✅ Fired</span>'
+    : '<span style="color:var(--muted2);">— not yet</span>';
+
+  const landed = r.landedPosition != null ? `#${r.landedPosition}` : '—';
+
+  let onTarget;
+  if (r.landedOnTarget === true)  onTarget = '<span style="color:var(--green);font-weight:700;">✓ on target</span>';
+  else if (r.landedOnTarget === false) {
+    const delta = (r.landedPosition != null && r.todayTarget != null) ? (r.landedPosition - r.todayTarget) : null;
+    onTarget = `<span style="color:var(--red);font-weight:700;">✗ ${delta > 0 ? '+' : ''}${delta ?? '?'}</span>`;
+  } else onTarget = '<span style="color:var(--muted2);">—</span>';
+
+  // Rescue button only useful while still borrowed / not yet safely fired
+  const rescueBtn = (r.borrowedNow || (!r.positionFiredToday && r.borrowCycles > 0))
+    ? `<button class="btn btn-sm btn-trigger" onclick="rescueBorrowed(${r.driverId},'${esc(r.vehicleNumber)}')" title="Force-remove from SAN, stop borrowing today, re-arm for real target">🛟 Rescue</button>`
+    : '<span style="color:var(--muted);font-size:12px;">—</span>';
+
+  return `
+    <tr>
+      <td><span class="mono" style="font-weight:700;">${esc(r.vehicleNumber)}</span></td>
+      <td style="font-weight:500;">${esc(r.driverName)}</td>
+      <td style="color:var(--teal);font-weight:700;">${r.todayTarget ?? '—'}</td>
+      <td class="mono" style="color:var(--white);">${r.borrowCycles}×</td>
+      <td><span style="display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;color:${statusPill.color};background:${statusPill.bg};">${statusPill.label}</span></td>
+      <td>${fireCell}</td>
+      <td class="mono" style="color:var(--white);">${landed}</td>
+      <td>${onTarget}</td>
+      <td style="text-align:center;">${rescueBtn}</td>
+    </tr>`;
+}
+
 // ─── History table renderer ──────────────────────────────────────────────────
 
 function renderHistoryRow(r) {
@@ -197,6 +257,21 @@ async function loadPosDiagnostics() {
         </td></tr>`;
     } else {
       liveTbody.innerHTML = live.map(renderLiveRow).join('');
+    }
+
+    // ── Borrowed probe drivers table (only shown when any exist today) ──────
+    const borrowedWrap  = document.getElementById('diag-borrowed-wrap');
+    const borrowedTbody = document.getElementById('diag-borrowed-tbody');
+    const borrowed      = live.filter(r => r.borrowCycles > 0 || r.borrowedNow);
+    if (borrowedWrap && borrowedTbody) {
+      if (borrowed.length) {
+        borrowedWrap.style.display = '';
+        borrowedTbody.innerHTML = borrowed
+          .sort((a, b) => (b.todayTarget ?? 0) - (a.todayTarget ?? 0))
+          .map(renderBorrowedRow).join('');
+      } else {
+        borrowedWrap.style.display = 'none';
+      }
     }
 
     // ── History table ──────────────────────────────────────────────────────

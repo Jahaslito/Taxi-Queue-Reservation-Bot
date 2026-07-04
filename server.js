@@ -52,7 +52,10 @@ app.use('/api/webhook/stripe', require('./src/routes/webhook'));
 // ─── Body parsing + static files ──────────────────────────────────────────────
 app.use(express.json());
 app.use(cookieParser());
-app.use(express.static(path.join(__dirname, 'public')));
+// index:false so a bare "/" is NOT auto-served as public/index.html (the driver
+// app). The marketing landing page owns "/" now; the driver app lives at "/app".
+// Static assets (/js, /icons, /sw.js, /manifest.json, …) are still served here.
+app.use(express.static(path.join(__dirname, 'public'), { index: false }));
 
 // ─── Bot debug screenshots (admin only — local dev) ───────────────────────────
 const DEBUG_DIR = process.env.BOT_DEBUG_DIR ?? '/tmp/san-bot-debug';
@@ -138,12 +141,46 @@ app.get('/terms', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'terms.html'));
 });
 
+// ─── Marketing landing page (root) ───────────────────────────────────────────
+// "/" serves the public marketing site. The driver app moved to "/app".
+//
+// Backwards-compat shim: Stripe Checkout, email verification, and password-reset
+// emails historically send drivers back to "/?billing=…", "/?verified=…" and
+// "/?reset=…". Those legacy return URLs (including links already sitting in
+// drivers' inboxes and Stripe's saved redirect) must keep working, so we forward
+// exactly those query params into the app. Plain visits (and ad clicks carrying
+// ?utm_*) fall through to the marketing page.
+app.get('/', (req, res) => {
+  if (req.query.billing || req.query.verified || req.query.reset) {
+    const qs = req.originalUrl.includes('?')
+      ? req.originalUrl.slice(req.originalUrl.indexOf('?'))
+      : '';
+    return res.redirect(302, '/app/' + qs);
+  }
+  res.sendFile(path.join(__dirname, 'public', 'landing.html'));
+});
+
+// ─── Products page (static marketing) ─────────────────────────────────────────
+app.get('/products', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'products.html'));
+});
+
 // ─── SPA fallbacks ────────────────────────────────────────────────────────────
 app.get('/admin*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'admin.html'));
 });
-app.get('*', (req, res) => {
+// Admin lives at /admin, not under the driver app. Catch the natural mis-guess
+// "/app/admin" (which would otherwise match /app* and serve the driver SPA).
+app.get('/app/admin*', (req, res) => {
+  res.redirect(302, '/admin');
+});
+// Driver app SPA — served for /app and any /app/* deep link.
+app.get('/app*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+// Anything else falls back to the marketing site.
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'landing.html'));
 });
 
 // ─── Centralised error handler (must be last) ─────────────────────────────────

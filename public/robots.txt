@@ -1,0 +1,11 @@
+# SanQueue — https://sanqueue.com
+# Marketing site is open to crawlers; the app and admin/API surfaces are not.
+
+User-agent: *
+Allow: /$
+Allow: /icons/
+Disallow: /app
+Disallow: /admin
+Disallow: /api/
+
+Sitemap: https://sanqueue.com/sitemap.xml

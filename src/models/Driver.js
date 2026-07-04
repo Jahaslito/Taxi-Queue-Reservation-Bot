@@ -2,6 +2,17 @@ const db = require('../config/database');
 
 const TABLE = 'drivers';
 
+// When billing is enforced, the bot must only ever service drivers with a live
+// subscription — this mirrors requireSubscription so a driver whose payment
+// fails (status → past_due) is dropped from servicing the moment Stripe tells
+// us, not just blocked from the app UI. Bypassed entirely when
+// BILLING_ENABLED=false (soft-launch / staging), matching the other gates.
+const BILLING_ENABLED      = process.env.BILLING_ENABLED !== 'false';
+const SERVICEABLE_STATUSES = ['active', 'trialing'];
+function gateServiceableStatus(q) {
+  if (BILLING_ENABLED) q.whereIn('subscription_status', SERVICEABLE_STATUSES);
+}
+
 // Columns safe to return to API consumers (excludes credentials and tokens)
 const PUBLIC_FIELDS = [
   'id', 'name', 'phone', 'email', 'san_username',
@@ -11,6 +22,9 @@ const PUBLIC_FIELDS = [
   'manually_removed_at',
   // Subscription
   'stripe_customer_id', 'stripe_subscription_id', 'subscription_status', 'trial_ends_at',
+  // Scheduled cancellation date (set while cancel_at_period_end is true) — drives
+  // the "access ends on <date>" grace banner.
+  'subscription_cancel_at',
   // Card-on-file enforcement deadline (grandfathered cardless cohort)
   'card_required_by',
   // SMS opt-in (Telnyx toll-free compliance — must be an explicit per-driver choice)
@@ -38,19 +52,25 @@ class Driver {
 
   /** Used by the scheduler — returns all columns so san_password is available for decryption */
   static findActiveByScheduledTime(scheduledTime) {
-    return db(TABLE).where({ is_active: true, scheduled_time: scheduledTime });
+    return db(TABLE)
+      .where({ is_active: true, scheduled_time: scheduledTime })
+      .modify(gateServiceableStatus);
   }
 
   /** Returns all active drivers (all columns) for the new day_schedules-based scheduler */
   static findAllActive() {
-    return db(TABLE).select(PUBLIC_FIELDS.concat(['san_password'])).where({ is_active: true });
+    return db(TABLE)
+      .select(PUBLIC_FIELDS.concat(['san_password']))
+      .where({ is_active: true })
+      .modify(gateServiceableStatus);
   }
 
   /** Returns active drivers with monitor_enabled=true (includes san_password for re-queue) */
   static findAllMonitored() {
     return db(TABLE)
       .select(PUBLIC_FIELDS.concat(['san_password']))
-      .where({ is_active: true, monitor_enabled: true });
+      .where({ is_active: true, monitor_enabled: true })
+      .modify(gateServiceableStatus);
   }
 
   /**
@@ -188,6 +208,10 @@ class Driver {
     return db(TABLE)
       .select('id', 'name', 'phone', 'vehicle_number')
       .where({ is_active: true })
+      // Canceled / past_due drivers keep is_active=true so they can log in and
+      // resubscribe, but they must not receive broadcasts — even when
+      // explicitly targeted by ID.
+      .modify(gateServiceableStatus)
       .modify((q) => {
         if (driverIds && driverIds.length) q.whereIn('id', driverIds);
       });
@@ -199,6 +223,9 @@ class Driver {
       .select('scheduled_time')
       .count('* as count')
       .where('is_active', true)
+      // Only serviceable drivers — canceled/past_due drivers won't be run, so
+      // counting them would overstate scheduled capacity.
+      .modify(gateServiceableStatus)
       .groupBy('scheduled_time')
       .orderBy('scheduled_time', 'asc');
   }

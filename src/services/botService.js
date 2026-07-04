@@ -856,19 +856,87 @@ async function removeFromQueue(sanUsername, sanPassword, vehicleNumber) {
       };
     }
 
-    // ─── STEP 7: click Remove From Queue ─────────────────────────────────────
+    // ─── STEP 7: click Remove From Queue, then VERIFY against V Holding ───────
+    // SAN is a Blazor Server app — "Remove From Queue" is a SignalR WebSocket
+    // event the server processes asynchronously. The old code trusted a
+    // client-side DOM transition ("Remove From Queue" text gone) and then closed
+    // the browser, which dropped the WebSocket BEFORE the server committed — so
+    // it logged success while the driver stayed in V Holding. We now trust SAN's
+    // authoritative V Holding list: click, then poll verifyDriverInQueue until the
+    // vehicle is actually gone (re-clicking once if needed), keeping the page —
+    // and its WebSocket — open until removal is confirmed.
+
+    // Accept any native confirm() the button might raise — Playwright dismisses
+    // dialogs by default, which would silently CANCEL the remove.
+    page.on('dialog', (d) => d.accept().catch(() => {}));
+
+    const clickRemoveButton = async () => {
+      // STEP A — on the WAIT screen, click "Remove From Queue".
+      await page.waitForFunction(
+        () => document.body.innerText.includes('Remove From Queue'),
+        null, { timeout: 8000 },
+      ).catch(() => {});
+      await page.click('button:has-text("Remove From Queue")').catch(() => {});
+
+      // STEP B — SAN then shows a CONFIRMATION screen ("Remove vehicle from
+      // queue?" → Remove / Cancel) UNLESS the driver ticked "Don't ask this
+      // again". The actual removal only happens when the confirm "Remove" is
+      // clicked. `:text-is("Remove")` matches the exact-text confirm button, not
+      // the "Remove From Queue" button. Without this step the remove never fires
+      // and the driver stays queued (the original bug).
+      const onConfirm = await page.waitForFunction(
+        () => /remove vehicle from queue/i.test(document.body.innerText),
+        null, { timeout: 5000 },
+      ).then(() => true).catch(() => false);
+      if (onConfirm) {
+        await page.click('button:text-is("Remove")').catch(() => {});
+      }
+
+      // best-effort settle — NOT the source of truth (the V Holding poll is).
+      await page.waitForFunction(
+        () => document.querySelector('input[placeholder="Vehicle Dispatch Name"]') !== null
+           || !/remove from queue|remove vehicle from queue/i.test(document.body.innerText),
+        null, { timeout: 3000 },
+      ).catch(() => {});
+    };
+
     console.log(`[Bot] ${vehicleNumber} (remove) → clicking Remove From Queue…`);
-    await page.click('button:has-text("Remove From Queue")');
+    await clickRemoveButton();
 
-    // Wait for confirmation — page transitions back to the search/vehicle page
-    await page.waitForFunction(
-      () => document.querySelector('input[placeholder="Vehicle Dispatch Name"]') !== null
-         || !document.body.innerText.includes('Remove From Queue'),
-      null,
-      { timeout: TIMEOUT },
-    );
+    // Confirm via SAN's authoritative V Holding list — the only reliable signal.
+    const REMOVE_CONFIRM_TRIES = 6;       // ~1.5 s apart ⇒ up to ~9 s of polling
+    let confirmedGone = false;
+    for (let attempt = 1; attempt <= REMOVE_CONFIRM_TRIES; attempt++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const info = await verifyDriverInQueue(vehicleNumber).catch(() => null);
+      if (!info || !Number.isFinite(info.position)) { confirmedGone = true; break; }
+      if (info.location && /dispatch/i.test(info.location)) {
+        console.log(`[Bot] ${vehicleNumber} (remove) → dispatched during remove — cannot remove`);
+        return {
+          success: false, dispatched: true, durationMs: Date.now() - startTime,
+          error: 'Dispatched before removal completed — cannot remove',
+          message: 'You were dispatched before the removal completed.',
+        };
+      }
+      // Halfway through, re-issue the remove in case the first WS event was dropped.
+      if (attempt === Math.ceil(REMOVE_CONFIRM_TRIES / 2)) {
+        console.log(`[Bot] ${vehicleNumber} (remove) → still queued at #${info.position} — re-clicking Remove`);
+        await page.goto(SAN_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }).catch(() => {});
+        await clickRemoveButton();
+      }
+    }
 
-    console.log(`[Bot] ${vehicleNumber} (remove) → ✓ successfully removed from queue`);
+    if (!confirmedGone) {
+      console.warn(`[Bot] ${vehicleNumber} (remove) → ✗ SAN still shows the vehicle queued — remove NOT confirmed`);
+      return {
+        success: false, removed: false, notConfirmed: true,
+        durationMs: Date.now() - startTime,
+        error: 'Remove not confirmed — vehicle still in queue',
+        message: 'We could not confirm removal — you may still be in the queue. Please try again.',
+      };
+    }
+
+    console.log(`[Bot] ${vehicleNumber} (remove) → ✓ confirmed removed from V Holding`);
     return {
       success:    true,
       removed:    true,
@@ -1092,11 +1160,16 @@ async function verifyCredentials({ driverId, sanUsername, sanPassword, vehicleNu
 // Firing is then a single click + WAIT-screen confirmation (~1 s), and needs no
 // browser launch — so it also bypasses the launch-capped jobQueue entirely.
 //
-// SHAPE: one shared Chromium for ALL armed sessions (contexts are ~35 MB each
-// vs ~180 MB per browser; the droplet caps the app at 1536 MB) with one
-// context+page per driver. monitorService declares the desired set every poll
-// via syncFireSessions(wanted) and this module converges: arms the missing,
-// refreshes the stale, disarms the no-longer-wanted.
+// SHAPE: a small pool of shared Chromiums (BOT_ARMED_BROWSERS, ~180 MB each)
+// with one context+page per driver (~35 MB each), balanced by session count.
+// One browser was enough at 10 armed drivers, but same-tick fires serialise on
+// a single browser's event loop (2026-06-30: 9 clicks on one tick, 2.2–2.5 s
+// each vs the ~1 s a lone click takes) — spreading contexts across processes
+// cuts that contention roughly by the pool size. 40 armed + 3 browsers ≈ 2 GB
+// worst case, inside the 4096M container limit alongside the cold bots.
+// monitorService declares the desired set every poll via syncFireSessions
+// (wanted) and this module converges: arms the missing, refreshes the stale,
+// disarms the no-longer-wanted.
 //
 // FIRE-TIME HAND-OFF: the fire decision flips positionFiredToday, which drops
 // the driver from the wanted set on the very same tick — so the reconciler
@@ -1118,8 +1191,18 @@ async function verifyCredentials({ driverId, sanUsername, sanPassword, vehicleNu
 
 const credentialLockout = require('./credentialLockoutService');
 
-// Hard cap on simultaneously armed contexts (memory guard).
-const ARMED_MAX             = parseInt(process.env.BOT_ARMED_MAX             ?? '10', 10);
+// Hard cap on simultaneously armed contexts (memory guard). Must cover the
+// WHOLE day's position roster, not just the nearest fires: a chunk storm
+// collapses everyone's secsToFire to zero on one tick, and anyone unarmed at
+// that moment falls to the concurrency-3 cold path at peak burst (2026-06-30:
+// the old cap of 10 left 7 drivers cold → landings +46…+127 past target).
+// ~35 MB per context ⇒ 40 armed ≈ 1.4 GB, fits the 4096M container limit.
+const ARMED_MAX             = parseInt(process.env.BOT_ARMED_MAX             ?? '40', 10);
+// Number of shared Chromium processes armed contexts are spread across.
+// Same-tick armed clicks serialise per browser process (06-30: 9 clicks on
+// one tick took 2.2–2.5 s each on a single browser); 3 processes ≈ 3 fewer
+// clicks contending each, ~180 MB extra per process.
+const ARMED_BROWSERS        = Math.max(1, parseInt(process.env.BOT_ARMED_BROWSERS ?? '3', 10));
 // Re-validate a parked page when its last check is older than this.
 const ARM_REFRESH_MS        = parseInt(process.env.BOT_ARM_REFRESH_MS        ?? '90000', 10);
 // Skip the keep-alive refresh when the fire is expected within this many
@@ -1127,9 +1210,19 @@ const ARM_REFRESH_MS        = parseInt(process.env.BOT_ARM_REFRESH_MS        ?? 
 const ARM_REFRESH_SKIP_SECS = parseInt(process.env.BOT_ARM_REFRESH_SKIP_SECS ?? '45', 10);
 // After a failed arm attempt, don't retry this driver for this long.
 const ARM_RETRY_COOLDOWN_MS = parseInt(process.env.BOT_ARM_RETRY_COOLDOWN_MS ?? '180000', 10);
+// Persistent 'vehicle_not_available' is an ACCOUNT problem (the #142/#70/#4006
+// class), not a transient SAN state: on 2026-06-30 the 180 s cooldown alone
+// let #70 and #4006 burn 47 arm attempts (= 47 SAN logins) each in one day.
+// After this many consecutive not-available arms, suspend re-arming for
+// ARM_NOT_AVAIL_SUSPEND_MS (default 6 h — covers the rest of the morning
+// window; a genuine SAN-side fix gets retried the same afternoon).
+const ARM_NOT_AVAIL_MAX        = parseInt(process.env.BOT_ARM_NOT_AVAIL_MAX        ?? '3', 10);
+const ARM_NOT_AVAIL_SUSPEND_MS = parseInt(process.env.BOT_ARM_NOT_AVAIL_SUSPEND_MS ?? '21600000', 10);
 // Arm/refresh operations run through a small semaphore — arming is a full
-// login+search (~4 s) and happens off the critical path, so 2 wide is plenty.
-const ARM_OPS_CONCURRENCY   = parseInt(process.env.BOT_ARM_OPS_CONCURRENCY   ?? '2', 10);
+// login+search (~4 s) off the critical path. 4 wide: the pool must be able to
+// rebuild mid-storm (06-30: arms were completing DURING the burst at 2-wide,
+// ~4.5 s each, and lost the race for 7 drivers).
+const ARM_OPS_CONCURRENCY   = parseInt(process.env.BOT_ARM_OPS_CONCURRENCY   ?? '4', 10);
 // Ceiling for the fire click → WAIT-screen confirmation. Normal is < 2 s; if
 // SAN is slower than this the cold fallback wouldn't have been faster anyway,
 // and the fallback's already-queued detection makes a double-submit harmless.
@@ -1161,6 +1254,9 @@ const HTTP_FIRE_URL_MATCH   = process.env.BOT_HTTP_FIRE_URL_MATCH ?? 'gtcvms.com
 const armedSessions = new Map();
 // driverId → epoch ms until which arm attempts are suppressed (failure cooldown)
 const armCooldownUntil = new Map();
+// driverId → consecutive 'vehicle_not_available' arm outcomes. Cleared by a
+// successful arm; drives the ARM_NOT_AVAIL_MAX suspension.
+const notAvailableStreak = new Map();
 // driverIds with an arm operation currently in flight (dedup across sync ticks)
 const armingInFlight = new Set();
 // driverIds whose session has been CLAIMED for an in-flight fire (removed from
@@ -1168,8 +1264,9 @@ const armingInFlight = new Set();
 // close the shared browser under a click that hasn't happened yet.
 const claimedInFlight = new Set();
 
-let armedBrowser = null;          // shared Chromium — lazily launched, closed when idle
-let armedBrowserLaunching = null; // in-flight launch promise (dedup)
+// Pool of shared Chromiums — lazily launched per slot, all closed when idle.
+const armedBrowsers         = new Array(ARMED_BROWSERS).fill(null); // Browser | null
+const armedBrowserLaunching = new Array(ARMED_BROWSERS).fill(null); // in-flight launch promise (dedup)
 
 // Tiny semaphore for arm/refresh ops. Deliberately local — schedulerService's
 // BotSemaphore caps *browser launches*; this caps page work inside the one
@@ -1187,48 +1284,85 @@ function releaseArmOp() {
 }
 
 /**
- * Launch (or reuse) the shared browser for armed sessions.
+ * Launch (or reuse) one slot of the armed-browser pool.
  * No --single-process here: armed contexts all hit the same site, so default
  * Chromium shares one renderer across them anyway — and a renderer crash then
- * can't take the browser process down with it. 'disconnected' wipes the map:
- * every parked page died with the browser, and the next sync re-arms cleanly.
+ * can't take the browser process down with it. 'disconnected' drops only the
+ * sessions parked on THAT slot (their pages died with the process); the next
+ * sync re-arms them, on whichever slots are healthy.
  */
-async function ensureArmedBrowser() {
-  if (armedBrowser?.isConnected()) return armedBrowser;
-  if (armedBrowserLaunching) return armedBrowserLaunching;
+async function ensureArmedBrowser(slot) {
+  if (armedBrowsers[slot]?.isConnected()) return armedBrowsers[slot];
+  if (armedBrowserLaunching[slot]) return armedBrowserLaunching[slot];
 
-  armedBrowserLaunching = chromium.launch({
+  armedBrowserLaunching[slot] = chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
+      // Parked pages are exactly what Chromium's background throttling
+      // punishes: occluded, no focus, idle for minutes — then we need their
+      // JS to run a click handler NOW. Throttled timers/rAF delay the Blazor
+      // click dispatch and the WAIT-screen render, inflating fire latency.
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
+    ],
   }).then((browser) => {
     browser.on('disconnected', () => {
-      if (armedBrowser === browser) {
-        armedBrowser = null;
-        if (armedSessions.size > 0) {
-          console.warn(`[Arm] shared browser disconnected — dropping ${armedSessions.size} armed session(s); next sync re-arms`);
-          armedSessions.clear();
-        }
+      if (armedBrowsers[slot] !== browser) return;
+      armedBrowsers[slot] = null;
+      const lost = [...armedSessions.values()].filter((s) => s.browserSlot === slot);
+      if (lost.length > 0) {
+        console.warn(`[Arm] browser[${slot}] disconnected — dropping ${lost.length} armed session(s) parked on it; next sync re-arms`);
+        for (const s of lost) armedSessions.delete(s.driverId);
       }
     });
-    armedBrowser = browser;
-    console.log('[Arm] shared browser launched');
+    armedBrowsers[slot] = browser;
+    console.log(`[Arm] browser[${slot}/${ARMED_BROWSERS}] launched`);
     return browser;
-  }).finally(() => { armedBrowserLaunching = null; });
+  }).finally(() => { armedBrowserLaunching[slot] = null; });
 
-  return armedBrowserLaunching;
+  return armedBrowserLaunching[slot];
 }
 
-/** Close the shared browser once nothing is armed (memory back to baseline). */
+// driverId → slot chosen for an arm still in flight. pickArmedSlot must count
+// these too: arms run ARM_OPS_CONCURRENCY-wide, so counting only COMPLETED
+// sessions would send a whole concurrent batch to the same slot (from empty,
+// the first 4 arms would all pick slot 0 — one browser, no contention split).
+const armingSlotInFlight = new Map();
+
+/** Slot with the fewest armed/arming sessions — keeps same-tick fire clicks
+ *  spread across browser processes instead of serialising on one event loop. */
+function pickArmedSlot() {
+  const counts = new Array(ARMED_BROWSERS).fill(0);
+  for (const s of armedSessions.values()) {
+    if (Number.isInteger(s.browserSlot) && s.browserSlot < ARMED_BROWSERS) counts[s.browserSlot]++;
+  }
+  for (const slot of armingSlotInFlight.values()) {
+    if (Number.isInteger(slot) && slot < ARMED_BROWSERS) counts[slot]++;
+  }
+  let best = 0;
+  for (let i = 1; i < ARMED_BROWSERS; i++) if (counts[i] < counts[best]) best = i;
+  return best;
+}
+
+/** Close every pool browser once nothing is armed (memory back to baseline). */
 async function closeArmedBrowserIfIdle() {
   // armingInFlight guard: an arm op building its context holds no map entry
   // yet — closing the browser under it would kill the arm for nothing.
   // claimedInFlight guard: a claimed session is out of the map but its page
   // is about to be clicked — same hazard from the other direction.
-  if (armedSessions.size === 0 && armingInFlight.size === 0 && claimedInFlight.size === 0 && armedBrowser) {
-    const b = armedBrowser;
-    armedBrowser = null;
-    await b.close().catch(() => {});
-    console.log('[Arm] shared browser closed (no armed sessions)');
+  if (armedSessions.size !== 0 || armingInFlight.size !== 0 || claimedInFlight.size !== 0) return;
+  const closing = [];
+  for (let slot = 0; slot < ARMED_BROWSERS; slot++) {
+    const b = armedBrowsers[slot];
+    if (!b) continue;
+    armedBrowsers[slot] = null;
+    closing.push(b.close().catch(() => {}));
+  }
+  if (closing.length > 0) {
+    await Promise.all(closing);
+    console.log('[Arm] armed browsers closed (no armed sessions)');
   }
 }
 
@@ -1360,10 +1494,12 @@ function armedFireSessionStats() {
   return {
     armed:    armedSessions.size,
     arming:   armingInFlight.size,
-    browser:  !!armedBrowser?.isConnected(),
+    browser:  armedBrowsers.some((b) => b?.isConnected()),
+    browsers: armedBrowsers.filter((b) => b?.isConnected()).length,
     sessions: [...armedSessions.values()].map((s) => ({
       driverId:       s.driverId,
       vehicleNumber:  s.vehicleNumber,
+      browserSlot:    s.browserSlot,
       armedAt:        s.armedAt,
       lastVerifiedAt: s.lastVerifiedAt,
     })),
@@ -1389,7 +1525,9 @@ async function armFireSession({ driverId, vehicleNumber, getCredentials }) {
     if (!creds) throw new Error('credentials unavailable');
     const { sanUsername, sanPassword } = creds;
 
-    const browser      = await ensureArmedBrowser();
+    const slot         = pickArmedSlot();
+    armingSlotInFlight.set(driverId, slot);
+    const browser      = await ensureArmedBrowser(slot);
     const proxyConfig  = getProxyConfig();
     const savedSession = getStoredSession(sanUsername);
 
@@ -1414,19 +1552,32 @@ async function armFireSession({ driverId, vehicleNumber, getCredentials }) {
       // already_queued → monitor's next poll flips hasBeenSeen and drops the
       // driver from the wanted set; not_available/not_found can clear on SAN's
       // side, so the cooldown lets us re-try a few minutes later.
-      armCooldownUntil.set(driverId, Date.now() + ARM_RETRY_COOLDOWN_MS);
+      let cooldownMs = ARM_RETRY_COOLDOWN_MS;
+      if (outcome === 'vehicle_not_available') {
+        // Repeated not-available = broken account/vehicle data, not a queue
+        // state that will clear. Suspend instead of looping logins all morning.
+        const streak = (notAvailableStreak.get(driverId) ?? 0) + 1;
+        notAvailableStreak.set(driverId, streak);
+        if (streak >= ARM_NOT_AVAIL_MAX) {
+          cooldownMs = ARM_NOT_AVAIL_SUSPEND_MS;
+          console.warn(`[Arm] ⚠ #${vehicleNumber} vehicle_not_available ×${streak} — suspending re-arm for ${Math.round(cooldownMs / 60000)} min; SAN account/vehicle needs manual attention`);
+        }
+      }
+      armCooldownUntil.set(driverId, Date.now() + cooldownMs);
       await context.close().catch(() => {});
-      console.log(`[Arm] #${vehicleNumber} not armed (${outcome}) — cooldown ${ARM_RETRY_COOLDOWN_MS / 1000}s`);
+      console.log(`[Arm] #${vehicleNumber} not armed (${outcome}) — cooldown ${Math.round(cooldownMs / 1000)}s`);
       await closeArmedBrowserIfIdle();
       return;
     }
 
+    notAvailableStreak.delete(driverId);
     armedSessions.set(driverId, {
       driverId,
       vehicleNumber,
       sanUsername,
       context,
       page,
+      browserSlot:    slot,      // which pool browser the page lives in
       getCredentials,            // kept for the keep-alive re-drive (decrypted on use)
       armedAt:        Date.now(),
       lastVerifiedAt: Date.now(),
@@ -1443,6 +1594,7 @@ async function armFireSession({ driverId, vehicleNumber, getCredentials }) {
     await closeArmedBrowserIfIdle();
   } finally {
     armingInFlight.delete(driverId);
+    armingSlotInFlight.delete(driverId);
     releaseArmOp();
   }
 }
@@ -1645,7 +1797,22 @@ async function fireClaimedSession(session) {
 
   const cap = installFireCapture(page, vehicleNumber, 'armed');
   try {
-    await page.click(`button:has-text("${SAN_TEXT.ADD_TO_QUEUE_BUTTON}")`, { timeout: 2000 });
+    // Fast path: dispatch the click INSIDE the page — runs the button's own
+    // onclick (elementFunctions.prepareStatusPageElements → hidden Blazor
+    // button → SignalR frame) with none of Playwright's actionability
+    // pipeline (scroll-into-view, hit-testing, trial clicks), which is where
+    // a contended/just-unthrottled renderer spends its time. Falls back to
+    // the proven page.click when the button can't be found in-page.
+    const fastClicked = await page.evaluate((label) => {
+      const btn = [...document.querySelectorAll('button')]
+        .find((b) => b.textContent.trim().includes(label) && !b.disabled);
+      if (!btn) return false;
+      btn.click();
+      return true;
+    }, SAN_TEXT.ADD_TO_QUEUE_BUTTON).catch(() => false);
+    if (!fastClicked) {
+      await page.click(`button:has-text("${SAN_TEXT.ADD_TO_QUEUE_BUTTON}")`, { timeout: 2000 });
+    }
     await page.waitForFunction(
       (needles) => needles.some((s) => document.body.innerText.includes(s)),
       [SAN_TEXT.REMOVE_FROM_QUEUE, SAN_TEXT.VEHICLE_NOT_AVAILABLE],
@@ -1761,4 +1928,11 @@ module.exports = {
   _classifyFailure:               classifyFailure,
   _extractKnownErrorFromText:     extractKnownErrorFromText,
   _extractGenericErrorFromText:   extractGenericErrorFromText,
+  // Exposed for tailProbeService — same login/search/read flows the bot uses,
+  // so the probe can never drift from the proven page interactions.
+  _driveToAddButton:              driveToAddButton,
+  _extractQueueInfo:              extractQueueInfo,
+  _isWaitScreen:                  isWaitScreen,
+  _SAN_TEXT:                      SAN_TEXT,
+  verifyDriverInQueue,
 };

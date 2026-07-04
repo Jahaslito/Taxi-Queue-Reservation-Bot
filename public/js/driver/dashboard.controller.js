@@ -69,6 +69,10 @@ async function loadDashboard() {
     // (card_required_by is cleared by the Stripe webhook once that happens).
     if (window.renderCardBanner) window.renderCardBanner(driverProfile);
 
+    // Scheduled-cancellation grace banner — shows "access ends on <date>" while
+    // a canceled-but-still-live subscription counts down to its cutoff.
+    if (window.renderCancelBanner) window.renderCancelBanner(driverProfile);
+
     const statusData = await api('/api/driver/status/today');
     renderTodayStatus(statusData);
 

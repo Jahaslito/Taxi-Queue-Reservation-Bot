@@ -93,6 +93,25 @@ const CARRYOVER_REMOVE_ENABLED = (process.env.MONITOR_CARRYOVER_REMOVE_ENABLED ?
 // missed poll wrongly flips a still-queued leftover to "fresh today" (the
 // 00:01:44 mislabel that started #0187's chain). 3 polls confirms a real exit.
 const CARRYOVER_CLEAR_POLLS    = parseInt(process.env.MONITOR_CARRYOVER_CLEAR_POLLS ?? '3', 10);
+// ─── Forced drop of stuck leftovers at the position-window open (3 AM) ─────────
+// SAN's overnight purge clears most leftovers by ~02:00, but NOT all of them.
+// Log analysis (2026-06-26…30) shows 1–6 of our drivers per day stay in V Holding
+// past 3 AM — SAN finally drops them as late as 05:22 / 09:55 / even 19:42, by
+// which point the morning tail has grown past their max acceptable position, so
+// the first real fire decision is "too late, skipping" and they miss target for
+// the day (e.g. #1965 target 118, dropped 19:42 at tail 394; #0920 target 130,
+// dropped 09:55 at tail 456). The passive carryover machinery correctly avoids
+// firing onto the stale spot, but it can only wait — it can't rescue them.
+//
+// Now that removeFromQueue VERIFIES removal against SAN's V Holding list (no more
+// false "success"), we proactively pull these leftovers when the position window
+// opens — while the tail is still small (~30–40) — and arm them to fire fresh at
+// target. Safe-by-construction: a driver is only re-armed when removeFromQueue
+// CONFIRMS the vehicle is gone; on anything less (not confirmed / dispatched /
+// error) every carryover flag is left untouched, so the existing passive
+// machinery covers the driver exactly as before — a failed drop can't strand it.
+// Kill switch: set MONITOR_CARRYOVER_DROP_ENABLED=false to disable without deploy.
+const CARRYOVER_DROP_ENABLED   = (process.env.MONITOR_CARRYOVER_DROP_ENABLED ?? 'true') === 'true';
 
 // ─── Operating hours (Pacific Time) ──────────────────────────────────────────
 // Auto-requeue fires between REQUEUE_START and REQUEUE_END (8 AM–11 PM PT).
@@ -131,6 +150,36 @@ const POS_MAX_LEAD     = parseInt(process.env.MONITOR_POS_MAX_LEAD     ?? '10', 
 // pre-armed regardless (the queue can jump 30+ positions in seconds).
 const PREARM_ENABLED    = (process.env.MONITOR_PREARM_ENABLED ?? 'true') !== 'false';
 const PREARM_AHEAD_SECS = parseInt(process.env.MONITOR_PREARM_AHEAD_SECS ?? '240', 10);
+// Position-proximity arming: bursts are POSITION-locked, not time-locked —
+// storm onset lands at queue 60–85 every morning (May–Jun logs: median 71)
+// while its clock time swings 42 minutes. secondsUntilFire is a rate-based
+// GUESS that a chunk storm invalidates in one tick, so once the queue nears
+// the storm zone every waiting driver gets armed regardless of how far away
+// their fire looks. 45 leaves ~2 min of runway before the earliest onset.
+const PREARM_QUEUE_POS  = parseInt(process.env.MONITOR_PREARM_QUEUE_POS ?? '45', 10);
+// Sacrificial tail probe (default OFF) — dedicated vehicle add→read→remove
+// cycles during the storm feed exact true-tail samples to the fleet probe.
+// See tailProbeService.js for the full rationale and safety rails.
+const TAIL_PROBE_ENABLED = process.env.MONITOR_TAIL_PROBE === '1';
+// Only probe while a fire is actually imminent. Without this, any morning —
+// calm ones included — would probe continuously from queue 45 until the last
+// (highest) target fired, burning the daily cycle cap on days that already
+// land 89–100% within ±10. Storm days are unaffected: inside the burst zone
+// secsToFire collapses to seconds, so the probe stays continuously active
+// exactly where the chunk-straddle misses live. Calm days get short probe
+// windows just ahead of each fire cluster — where the samples still sharpen
+// the landing — instead of hours of add/remove churn.
+const TAIL_PROBE_AHEAD_SECS = parseInt(process.env.MONITOR_TAIL_PROBE_AHEAD_SECS ?? '90', 10);
+// Borrowed tail probe (MONITOR_BORROW_PROBE=1, default OFF): when no dedicated
+// probe account exists, lend the probe the highest-target watched drivers —
+// their real fire is many minutes away, so their account is idle now. See
+// tailProbeService "BORROWED probes" for the safety model. A driver is only
+// borrowable while target − currentQueue ≥ BORROW_MARGIN, and is handed back
+// (retired, force-removed if needed) the instant the tail closes to within it,
+// leaving BORROW_MARGIN positions of runway for a clean, accurate real fire.
+const BORROW_PROBE_ENABLED = process.env.MONITOR_BORROW_PROBE === '1';
+const BORROW_PROBE_MAX     = parseInt(process.env.MONITOR_BORROW_PROBE_MAX    ?? '2', 10);
+const BORROW_PROBE_MARGIN  = parseInt(process.env.MONITOR_BORROW_PROBE_MARGIN ?? '60', 10);
 // Fallback estimate for Playwright bot execution time (ms) before we have real
 // data. Used to project how many positions will be added between the fire decision
 // and when SAN assigns the queue slot. The actual estimate is the rolling median
@@ -173,6 +222,22 @@ const POLL_BURST_MS          = parseInt(process.env.MONITOR_BURST_POLL_MS   ?? '
 // The uncapped rate still drives the fire-timing decision (secsToFire).
 // 3.0/s ≈ the observed sustained plateau rate; tune via env if needed.
 const BURST_DRIFT_RATE_CAP   = parseFloat(process.env.MONITOR_BURST_DRIFT_RATE_CAP ?? '3.0');
+// ─── Fleet-landing true-tail probe (de-lag SAN's stale V-Holding count) ───────
+// SAN's displayed queue lags the real tail by a median +6 (up to +56, analysis
+// 2026-06-25). But every time one of OUR drivers lands, SAN tells us their exact
+// position = the true tail at that instant. Because the morning queue is
+// append-only, that landing is a valid LOWER BOUND on the tail forever after. So
+// `effectiveQueue = max(displayedQueue, freshestLanding−1)` is a strictly better
+// (never-over) estimate of the real queue. Firing on it catches the band instead
+// of firing late on the stale display — cutting OVERSHOOT without ever firing
+// early in true-position terms (undershoot stays ≥ −9 by construction, since
+// effectiveQueue ≤ true tail). It only ever ADDS a fire, never a skip. Default OFF.
+const FLEET_PROBE_ENABLED  = process.env.MONITOR_FLEET_PROBE === '1';
+// Only trust a landing this fresh as the live tail (older ⇒ the display has caught up).
+const FLEET_PROBE_FRESH_MS = parseInt(process.env.MONITOR_FLEET_PROBE_FRESH_MS ?? '8000', 10);
+// Hard cap on how far the probe may lead the displayed queue — belt against a
+// contaminated landing (re-add / dispatched / misread) firing a driver too early.
+const FLEET_PROBE_MAX_LEAD = parseInt(process.env.MONITOR_FLEET_PROBE_MAX_LEAD ?? '40', 10);
 // How many recent queue observations to keep for the short-window rate calculation.
 const SHORT_WINDOW_POLLS   = 3;
 
@@ -400,6 +465,23 @@ let lastPollStats = {
 
 let pollTimer    = null;
 let refreshTimer = null;
+// Event-driven poll nudge (fleet-probe): a fresh fleet landing re-evaluates
+// the scheduler immediately instead of waiting out the current poll delay.
+// scheduleFn is the active chain's scheduler (set by startMonitor); pollInFlight
+// prevents a nudge from overlapping a running poll — if one is in flight, the
+// pending flag makes the chain's own reschedule fire at 0 delay instead.
+let scheduleFn   = null;
+let pollInFlight = false;
+let nudgePending = false;
+function nudgePoll() {
+  if (!scheduleFn) return;
+  nudgePending = true;
+  if (!pollInFlight && pollTimer) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+    scheduleFn();
+  }
+}
 
 // ─── Queue growth-rate tracking (for dynamic position-schedule lead) ──────────
 // All rates are in drivers/second so they stay accurate even if poll intervals drift.
@@ -417,6 +499,139 @@ let prevObservationAt  = null;    // ms timestamp of previous observation
 let biasCorrection     = 0;       // positions — loaded from position_tracking history
 let biasPollCount      = 0;
 const BIAS_REFRESH_EVERY = 20;    // recalculate bias every N poll ticks
+// Freshest genuine landing of ANY fleet driver — the true-tail probe input
+// (see FLEET_PROBE_ENABLED). Updated only from confirmed tail-joins so it can't
+// be poisoned by re-adds / already-queued / failed rows.
+let lastFleetLanding   = { position: 0, atMs: 0 };
+function recordFleetLanding(position) {
+  if (Number.isFinite(position) && position > 0) {
+    lastFleetLanding = { position, atMs: Date.now() };
+    // Event-driven decision: a fresh landing is a true-tail observation that
+    // the NEXT poll (up to 1 s away at burst cadence — a 20–40-position hole
+    // in a storm) would act on. Re-evaluate now instead. Only meaningful when
+    // the probe feeds decisions; without it the immediate poll would just
+    // re-read the same stale display.
+    if (FLEET_PROBE_ENABLED) nudgePoll();
+  }
+}
+
+// ─── Borrowed-probe roster (MONITOR_BORROW_PROBE) ─────────────────────────────
+// Decrypted creds for borrowed drivers, cached so we don't hit the DB every
+// tick (the roster is stable for long stretches). borrowRosterInFlight makes
+// the async reconcile self-throttling — one in flight at a time; the next tick
+// converges anyway.
+const borrowCredsCache    = new Map(); // driverId → { username, password }
+let   borrowRosterInFlight = false;
+// Per-driver borrow audit (for the admin "Borrowed Drivers" table): proves a
+// lent driver was cycled, retired, re-armed, and still landed on target.
+//   driverId → { cycles, adds, firstBorrowedAt, lastBorrowedAt, retiredAt }
+const borrowHistory       = new Map();
+// Drivers an admin rescued this session — never borrow them again today, but
+// they STILL get their normal real placement (rescue only stops the probing).
+const borrowExcluded      = new Set();
+
+/**
+ * Reconcile the borrowed-probe roster with tailProbeService. Picks the
+ * highest-target candidates (their real fire is furthest off), resolves creds,
+ * hands the roster to the probe, then sets each watched driver's borrowedAsProbe
+ * flag from the probe's ACTUAL held set — a retiring driver stays flagged until
+ * truly removed, so the observation loop never sees a probe cycle.
+ */
+async function updateBorrowRoster(candidates, todayDayKey, active) {
+  if (borrowRosterInFlight) return; // declarative — next tick reconciles
+  borrowRosterInFlight = true;
+  try {
+    const tp       = require('./tailProbeService');
+    const disabled = new Set(tp.disabledBorrowedIds()); // self-disabled → leave alone
+    const chosen   = active
+      ? candidates.sort((a, b) => b.target - a.target)
+          .filter((c) => !disabled.has(c.driverId) && !borrowExcluded.has(c.driverId))
+          .slice(0, BORROW_PROBE_MAX)
+      : [];
+
+    const roster = [];
+    for (const c of chosen) {
+      let creds = borrowCredsCache.get(c.driverId);
+      if (!creds) {
+        const d = await Driver.findByIdWithCredentials(c.driverId);
+        if (!d?.san_username || !d?.san_password) continue;
+        creds = { username: d.san_username, password: decrypt(d.san_password) };
+        borrowCredsCache.set(c.driverId, creds);
+      }
+      roster.push({ driverId: c.driverId, vehicle: c.vehicle, username: creds.username, password: creds.password });
+    }
+
+    tp.syncRoster({
+      active,
+      roster,
+      dayKey:       todayDayKey,
+      onTailSample: (pos) => recordFleetLanding(pos),
+    });
+
+    // Reconcile flags from what the probe actually holds now (retiring records
+    // remain until their force-remove completes → driver stays checked-out).
+    const borrowedNow = tp.tailProbeStats().borrowed;
+    const held        = new Set(borrowedNow.map((b) => b.driverId));
+    for (const [driverId, st] of watches) {
+      st.borrowedAsProbe = held.has(driverId);
+    }
+
+    // Audit trail: accumulate per-driver borrow stats so the admin can confirm
+    // a lent driver was cycled, retired, and still placed on target.
+    const now = new Date();
+    for (const b of borrowedNow) {
+      const h = borrowHistory.get(b.driverId) ?? { cycles: 0, adds: 0, firstBorrowedAt: now, lastBorrowedAt: now, retiredAt: null };
+      h.cycles         = Math.max(h.cycles, b.cycles || 0); // cycle = one add+remove
+      h.adds           = h.cycles;
+      h.lastBorrowedAt = now;
+      h.retiredAt      = null; // still active
+      borrowHistory.set(b.driverId, h);
+    }
+    // Mark retirement for anyone with history who is no longer held.
+    for (const [driverId, h] of borrowHistory) {
+      if (!held.has(driverId) && !h.retiredAt) h.retiredAt = now;
+    }
+  } finally {
+    borrowRosterInFlight = false;
+  }
+}
+
+/**
+ * Admin/CLI rescue for a borrowed driver that appears stuck: force-retire the
+ * probe (which force-removes the vehicle from SAN), exclude them from any
+ * further borrowing today, and RE-ARM the position scheduler so they still get
+ * their real target placement. Returns a status object. Never throws.
+ */
+async function rescueBorrowedDriver(driverId) {
+  borrowExcluded.add(driverId);
+  const state = watches.get(driverId);
+  let retired = false;
+  try {
+    await require('./tailProbeService').retireBorrowed(driverId); // targeted: stop + force-remove this one
+    retired = true;
+  } catch (err) {
+    console.error(`[Borrow] rescue retire failed for ${driverId}: ${err.message}`);
+  }
+  if (state) {
+    state.borrowedAsProbe    = false;
+    state.positionFiredToday = false; // let the scheduler fire their REAL target
+    state.hasBeenSeen        = false;
+    state.earlyJoinDetectedAt = null;
+    state.earlyJoinAtPosition = null;
+    const h = borrowHistory.get(driverId);
+    if (h && !h.retiredAt) h.retiredAt = new Date();
+    console.log(`[Borrow] 🛟 #${state.vehicleNumber} rescued — retired from probing, excluded for today, re-armed for real target`);
+    broadcast('driver_state', { driverId, state: snap(state) });
+  }
+  return {
+    ok:            !!state,
+    driverId,
+    vehicleNumber: state?.vehicleNumber ?? null,
+    retired,
+    rearmed:       !!state,
+    excludedForToday: true,
+  };
+}
 // Maximum |bias| we'll apply. Belt to medianRecentError's outlier filter (the
 // braces) — bounds the worst-case prediction damage if a contamination path
 // we haven't found yet pulls the median to an unhelpful value. 10 positions is
@@ -835,6 +1050,7 @@ async function _runBot(driverId, state, triggerType = 'monitor_requeue', botOpts
   if (state.pendingTrackingId && safeToRecord) {
     const trackingId = state.pendingTrackingId;
     state.pendingTrackingId = null;
+    recordFleetLanding(result.position); // feed the true-tail probe (genuine join only)
     PositionTracking.updateActualPosition(trackingId, result.position)
       .then(() => console.log(`[PosTracking] #${state.vehicleNumber} landed at ${result.position} (from bot result)`))
       .catch((err) => console.error('[PosTracking] Failed to update actual position from bot result:', err.message));
@@ -960,6 +1176,74 @@ async function removeCarryoverLeftover(driverId, vehicleNumber) {
   } catch (err) {
     console.warn(`[Monitor] carryover cleanup for #${vehicleNumber} errored: ${err.message} — leaving in queue, SAN will clear it`);
   }
+}
+
+// ─── Forced drop + re-arm of one stuck overnight leftover (position-window open) ─
+// Removes a driver SAN failed to purge overnight, then — ONLY on a confirmed
+// removal — arms them to fire fresh at today's target. See CARRYOVER_DROP_ENABLED.
+//
+// The flag handling is deliberately asymmetric:
+//   • Confirmed gone  → clear inQueueFromCarryover + hasBeenSeen + positionFired
+//     Today so the position scheduler stops waiting and fires at target. We KEEP
+//     wasCarryoverToday=true as a safety net: if SAN unexpectedly re-lists the
+//     driver before they fire, the poll-loop re-protect path holds them instead
+//     of mislabelling them "already in queue". It's cleared naturally on the fire.
+//   • Not confirmed / dispatched / error → touch NOTHING. The passive machinery
+//     (debounced clear + re-protect) keeps protecting the driver as it does today.
+async function dropAndArmLeftover(driverId, vehicleNumber) {
+  const pre = watches.get(driverId);
+  // Only act on a driver we still believe is a leftover sitting in V Holding.
+  if (!pre || !pre.inQueueFromCarryover || pre.state !== 'in_queue') return;
+
+  try {
+    const driver = await Driver.findByIdWithCredentials(driverId);
+    if (!driver || driver.is_active === false || !driver.san_username || !driver.san_password) return;
+
+    const { runRemoveBotForDriver } = require('./schedulerService');
+    const result = await runRemoveBotForDriver(driver, 'carryover_drop');
+
+    // Re-fetch — state may have changed (dispatch, manual action) while the bot ran.
+    const s = watches.get(driverId);
+    if (!s) return;
+
+    if (result?.success) {
+      s.inQueueFromCarryover = false;
+      s.hasBeenSeen          = false;
+      s.positionFiredToday   = false;
+      s.carryoverAbsentPolls = 0;
+      if (s.state !== 'requeuing') s.state = 'watching';
+      console.log(`[Monitor] #${vehicleNumber} — forced overnight drop CONFIRMED, armed to fire fresh at target`);
+      broadcast('driver_state', { driverId, state: snap(s) });
+    } else if (result?.dispatched) {
+      console.log(`[Monitor] #${vehicleNumber} — forced drop skipped: driver is dispatched (on a trip), not a stuck leftover`);
+    } else {
+      console.warn(`[Monitor] #${vehicleNumber} — forced drop NOT confirmed (${result?.error || 'unknown'}) — protection left intact, SAN will clear it`);
+    }
+  } catch (err) {
+    console.warn(`[Monitor] #${vehicleNumber} — forced drop errored: ${err.message} — protection left intact`);
+  }
+}
+
+// Enqueue a forced drop for every leftover SAN didn't purge overnight. Called
+// once per day right after the 3 AM position-window arm, when inQueueFromCarryover
+// has just been (re)computed for every watched driver. Fire-and-forget via the
+// concurrency-capped jobQueue so it never blocks the poll loop. Returns how many
+// drops were enqueued. No-op (and no bot runs) when CARRYOVER_DROP_ENABLED=false.
+function dropAndArmCarryoverLeftovers(dayKey = todayPT) {
+  if (!CARRYOVER_DROP_ENABLED) return 0;
+  // Only drop leftovers we can actually RE-ARM — i.e. drivers with a position
+  // target to fire at. A pure manual driver (no schedule) has no target, so a
+  // drop would just evict them with no re-add; leaving them in the draining
+  // overnight queue is better for them. They're handled by the passive machinery.
+  const leftovers = [...watches.values()].filter(
+    (s) => s.inQueueFromCarryover && s.state === 'in_queue' && (s.scheduledPosition || s.dayPositions),
+  );
+  if (!leftovers.length) return 0;
+  console.log(`[Monitor] Position window — forcing drop of ${leftovers.length} stuck overnight leftover(s) SAN didn't purge (day ${dayKey})`);
+  for (const s of leftovers) {
+    jobQueue.enqueue(() => dropAndArmLeftover(s.driverId, s.vehicleNumber)).catch(() => {});
+  }
+  return leftovers.length;
 }
 
 // ─── Position-schedule trigger ───────────────────────────────────────────────
@@ -1095,6 +1379,14 @@ function disposeClaimedFireSession(session, reason) {
 // ─── Fetch with retry ─────────────────────────────────────────────────────────
 // Each attempt gets a fresh AbortSignal so a timed-out attempt doesn't cancel
 // the next one. Waits RETRY_DELAYS[attempt] ms before each retry.
+//
+// MONITOR_POLL_CACHE_BUST=1: append a unique query param + no-cache headers to
+// every poll fetch. The spacezone page's waiting count only CHANGES every ~5 s
+// even at 1 s polling — if that step is an intermediary/output cache keyed by
+// URL (rather than SAN's own render cadence), busting it gives the scheduler
+// 1 s-granularity queue truth and shrinks the burst observation hole for free.
+// Read-side only; default off so prod behaviour is unchanged until compared.
+const POLL_CACHE_BUST = process.env.MONITOR_POLL_CACHE_BUST === '1';
 async function fetchPage(url) {
   let lastErr;
   for (let attempt = 0; attempt < RETRY_COUNT; attempt++) {
@@ -1105,8 +1397,15 @@ async function fetchPage(url) {
     const proxyAttempt  = dispatcher !== undefined;
 
     try {
-      const res = await ufetch(url, {
-        headers:    { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml' },
+      const fetchUrl = POLL_CACHE_BUST
+        ? `${url}${url.includes('?') ? '&' : '?'}_cb=${Date.now()}`
+        : url;
+      const res = await ufetch(fetchUrl, {
+        headers:    {
+          'User-Agent': UA,
+          Accept:       'text/html,application/xhtml+xml',
+          ...(POLL_CACHE_BUST ? { 'Cache-Control': 'no-cache', Pragma: 'no-cache' } : {}),
+        },
         signal:     AbortSignal.timeout(FETCH_TIMEOUT),
         dispatcher,
       });
@@ -1301,8 +1600,29 @@ function evaluatePositionScheduler(state, ctx) {
   const rawLead          = estimatedDrift + biasCorrection;
   const lead             = Math.min(rawLead, maxLeadPositions);
   const leadClamped      = lead !== rawLead;
-  const projectedLanding = waitingCount + lead;
-  const leadNote         = leadClamped
+
+  // Fleet-landing true-tail probe (FLEET_PROBE_ENABLED): if a FRESH genuine
+  // landing shows the real tail is above SAN's (stale) displayed count, fire on
+  // that instead. effectiveQueue ≥ waitingCount (a max) ⇒ never fires LATER than
+  // today; effectiveQueue ≤ true tail (a landing is a valid lower bound) ⇒ never
+  // fires early in true-position terms, so undershoot stays ≥ −9. Capped against
+  // a contaminated landing. The past-max rail below stays on the DISPLAYED
+  // projection, so the probe can only bring a fire forward, never cause a skip.
+  let effectiveQueue = waitingCount;
+  let probeNote      = '';
+  if (FLEET_PROBE_ENABLED) {
+    const ageMs      = Date.now() - lastFleetLanding.atMs;
+    const probeFloor = lastFleetLanding.position - 1;
+    if (ageMs <= FLEET_PROBE_FRESH_MS && probeFloor > waitingCount) {
+      effectiveQueue = Math.min(probeFloor, waitingCount + FLEET_PROBE_MAX_LEAD);
+      probeNote      = ` [fleet-probe ${waitingCount}→${effectiveQueue} ` +
+                       `(landing ${lastFleetLanding.position}, ${(ageMs / 1000).toFixed(1)}s ago)]`;
+    }
+  }
+
+  const displayedProjection = waitingCount + lead;   // SAN's stale view — drives the past-max rail
+  const projectedLanding    = effectiveQueue + lead; // probe-aware — drives the fire decision
+  const leadNote            = leadClamped
     ? ` (lead clamped ${rawLead.toFixed(1)} → ${lead})`
     : '';
 
@@ -1314,11 +1634,11 @@ function evaluatePositionScheduler(state, ctx) {
   // The earlier `waitingCount > maxAcceptable` rail still catches the case
   // where the queue is already past max; this one covers "still below max
   // right now, but the projected landing is past max."
-  if (projectedLanding > maxAcceptable) {
+  if (displayedProjection > maxAcceptable) {
     return {
       action:  'missed_impossible',
       reason:  'projection_exceeds_max',
-      logLine: `[Pos] ${veh} — ✗ projection ${projectedLanding.toFixed(1)} > max ${maxAcceptable} ` +
+      logLine: `[Pos] ${veh} — ✗ projection ${displayedProjection.toFixed(1)} > max ${maxAcceptable} ` +
                `(queue ${waitingCount} + lead ${Number.isInteger(lead) ? lead : lead.toFixed(1)}${leadNote}, ` +
                `target ${effectivePosition}) — too late, skipping`,
       metrics: {
@@ -1326,7 +1646,7 @@ function evaluatePositionScheduler(state, ctx) {
         queueSize:        waitingCount,
         growthRate:       effectiveGrowthRate,
         estimatedDrift,
-        predictedLanding: Math.round(projectedLanding),
+        predictedLanding: Math.round(displayedProjection),
       },
     };
   }
@@ -1347,7 +1667,7 @@ function evaluatePositionScheduler(state, ctx) {
       effectivePosition,
       maxAcceptable,
       secondsUntilFire,
-      logLine: `[Pos] ${veh} — ✓ queue ${waitingCount} + lead ${Number.isInteger(lead) ? lead : lead.toFixed(1)}` +
+      logLine: `[Pos] ${veh} — ✓ queue ${effectiveQueue}${probeNote} + lead ${Number.isInteger(lead) ? lead : lead.toFixed(1)}` +
                `${leadNote ? leadNote : ` (drift ${estimatedDrift}${biasCorrection !== 0 ? ` + bias ${biasCorrection.toFixed(1)}` : ''})`} ` +
                `= ${projectedLanding.toFixed(1)} ≥ target ${effectivePosition} ` +
                `(max ${maxAcceptable}, rate ${effectiveGrowthRate.toFixed(2)}/s, ` +
@@ -1367,7 +1687,7 @@ function evaluatePositionScheduler(state, ctx) {
     action:  'wait',
     reason:  'projected_below_target',
     secondsUntilFire,
-    logLine: `[Pos] ${veh} — waiting (queue: ${waitingCount}, drift: ${estimatedDrift}, ` +
+    logLine: `[Pos] ${veh} — waiting (queue: ${effectiveQueue}${probeNote}, drift: ${estimatedDrift}, ` +
              `bias: ${biasCorrection.toFixed(1)}, projected: ${projectedLanding.toFixed(1)}${leadNote}, ` +
              `target: ${effectivePosition}, max: ${maxAcceptable}, ` +
              `secsToFire: ${Number.isFinite(secondsUntilFire) ? secondsUntilFire.toFixed(0) : '∞'})`,
@@ -1477,6 +1797,11 @@ async function poll() {
   if (isWithinPositionHours() && positionWindowArmedForDate !== currentDayPT) {
     positionWindowArmedForDate = currentDayPT;
     armPositionWindowForToday(currentDayPT);
+    // Proactively pull any leftover SAN didn't purge overnight (still in V Holding
+    // at the window open) and arm it to fire fresh at target — instead of waiting
+    // hours for SAN's drop, by which point the tail has grown past max. Confirmed
+    // removals only; a failed/unconfirmed drop leaves carryover protection intact.
+    dropAndArmCarryoverLeftovers(currentDayPT);
   }
 
   const t0 = Date.now();
@@ -1620,6 +1945,14 @@ async function poll() {
     state._lastQueueSize = waitingCount; // keep fresh for logging
 
     if (state.state === 'requeuing') continue; // bot in-flight — skip this driver
+
+    // Borrowed as a tail probe: this driver's account is being cycled
+    // (add→sample→remove) by tailProbeService right now. Their transient
+    // presence in V Holding is OURS, not a real placement — ignore it entirely
+    // so we never record a probe position, mark them seen, or emit a
+    // driver-facing event. They resume normal observation the instant they're
+    // retired (borrowedAsProbe cleared), and only their real fire is ever shown.
+    if (state.borrowedAsProbe) continue;
 
     const vn              = state.vehicleNorm;
     const inDispatched    = dispatched.has(vn);
@@ -2046,7 +2379,34 @@ async function poll() {
   // decisions below, reconciled with botService after the loop).
   const prearmWanted = [];
 
+  // Fire decisions collected across the loop and launched together, sorted by
+  // target ascending. SAN assigns slots in click-arrival order, so within a
+  // same-tick batch of k fires OUR OWN adds spread landings +1…+k across our
+  // drivers — in whatever order the watches Map happens to iterate. Sorting by
+  // target hands the earliest slots to the lowest (most-overdue) targets — the
+  // assignment that minimizes total |landing − target| (rearrangement
+  // inequality). No stagger: initiation order alone orders the WS frames, and
+  // any deliberate delay would cost real positions during a 20+/s burst.
+  const fireBatch = [];
+
+  // Borrowed-probe candidates: waiting drivers whose target is still far above
+  // the tail (safe to lend as probes). Collected here, reconciled after the loop.
+  const borrowCandidates = [];
+
   for (const [driverId, state] of watches) {
+    // A driver currently lent to the tail probe is "checked out": don't fire,
+    // prearm, or time them. They resume normal scheduling the instant they're
+    // retired (borrowedAsProbe cleared, with BORROW_MARGIN positions of runway
+    // before their real fire point — see MONITOR_BORROW_PROBE).
+    if (state.borrowedAsProbe) continue;
+
+    // Per-driver guard: one driver's evaluation throwing must never affect the
+    // others. Critical since fires are BATCHED (fireBatch launches after this
+    // loop): an unguarded throw here would strand already-collected fires with
+    // positionFiredToday=true — those drivers would never fire that day.
+    // (Pre-batching, a throw "only" skipped the remaining drivers' evaluations
+    // — also wrong, just less catastrophic.)
+    try {
     const decision = evaluatePositionScheduler(state, decisionCtx);
 
     if (Number.isFinite(decision.secondsUntilFire) && decision.secondsUntilFire < minSecondsUntilFire) {
@@ -2086,10 +2446,17 @@ async function poll() {
         // (NOT carryovers — they're still inside V Holding, so arming would
         // just park on the WAIT screen). queue_shrinking waiters are included:
         // the purge settles within a poll or two and they fire right after.
+        // Three triggers, any one suffices: inside the burst window; projected
+        // fire is near; or the queue has reached the position-locked storm
+        // zone (PREARM_QUEUE_POS) — the last one covers storms that drift
+        // outside the 4:00–5:30 window and drivers whose rate-based
+        // secondsUntilFire estimate a chunk storm would invalidate.
         if (
           decision.action === 'wait' &&
           decision.reason !== 'awaiting_overnight_purge' &&
-          (inBurstWindow || decision.secondsUntilFire <= PREARM_AHEAD_SECS)
+          (inBurstWindow ||
+            decision.secondsUntilFire <= PREARM_AHEAD_SECS ||
+            waitingCount >= PREARM_QUEUE_POS)
         ) {
           prearmWanted.push({
             driverId,
@@ -2103,6 +2470,22 @@ async function poll() {
               return { sanUsername: d.san_username, sanPassword: decrypt(d.san_password) };
             },
           });
+        }
+
+        // Borrowed-probe candidate: a genuinely-waiting driver whose target is
+        // still ≥ BORROW_PROBE_MARGIN above the current tail — their real fire
+        // is far off, so their idle account can safely serve as a probe until
+        // the tail closes in. Never carryovers (already in V Holding).
+        if (BORROW_PROBE_ENABLED) {
+          const target = decision.metrics?.targetPosition ?? null;
+          if (
+            target !== null &&
+            decision.reason !== 'awaiting_overnight_purge' &&
+            !state.hasBeenSeen &&
+            (target - waitingCount) >= BORROW_PROBE_MARGIN
+          ) {
+            borrowCandidates.push({ driverId, vehicle: state.vehicleNumber, target });
+          }
         }
         break;
 
@@ -2164,8 +2547,9 @@ async function poll() {
       case 'fire':
         console.log(decision.logLine);
         state.positionFiredToday = true; // mark before enqueuing — prevents double-trigger
-        triggerPositionSchedule(driverId, state, decision.effectivePosition, decision.fireOpts)
-          .catch(console.error);
+        // Collected, not triggered: same-tick fires are launched together after
+        // the loop, sorted by target (see fireBatch below).
+        fireBatch.push({ driverId, state, decision });
         break;
 
       case 'missed_impossible':
@@ -2180,6 +2564,23 @@ async function poll() {
 
       default:
         console.warn(`[Pos] Unknown decision action: ${decision.action}`);
+    }
+    } catch (err) {
+      console.error(`[Pos] evaluation failed for #${state.vehicleNumber}: ${err.message} — other drivers unaffected`);
+    }
+  }
+
+  // ─── Launch this tick's fires, most-overdue target first ──────────────────
+  // triggerPositionSchedule claims the armed session in its first synchronous
+  // slice (before any await), so every claim below still lands ahead of this
+  // tick's syncFireSessions call — the disarm-race guarantee is unchanged;
+  // only the initiation ORDER within the batch is new.
+  if (fireBatch.length > 0) {
+    fireBatch.sort((a, b) =>
+      (a.decision.effectivePosition ?? Infinity) - (b.decision.effectivePosition ?? Infinity));
+    for (const { driverId, state, decision } of fireBatch) {
+      triggerPositionSchedule(driverId, state, decision.effectivePosition, decision.fireOpts)
+        .catch(console.error);
     }
   }
 
@@ -2196,6 +2597,48 @@ async function poll() {
     } catch (err) {
       console.error('[Arm] botService unavailable:', err.message);
     }
+  }
+
+  // ─── Sacrificial tail probe (MONITOR_TAIL_PROBE=1, default off) ────────────
+  // Declarative, same pattern as the pre-armer: tell the probe every tick
+  // whether it should be running. Active only in the storm zone (burst window,
+  // queue at/past the position-locked onset, position fires still pending) —
+  // its exact tail samples feed recordFleetLanding → the fleet-probe effective
+  // queue + event-driven nudge, giving the scheduler intra-chunk observations
+  // the ~5 s stepped display can never show. See tailProbeService for rails.
+  if (TAIL_PROBE_ENABLED) {
+    try {
+      require('./tailProbeService').sync({
+        active: inBurstWindow
+          && waitingCount >= PREARM_QUEUE_POS
+          && prearmWanted.length > 0
+          // imminence gate: some pending fire within TAIL_PROBE_AHEAD_SECS —
+          // keeps calm mornings from burning the cycle cap (see const above)
+          && Number.isFinite(minSecondsUntilFire)
+          && minSecondsUntilFire <= TAIL_PROBE_AHEAD_SECS,
+        dayKey:          todayDayKey,
+        watchedVehicles: new Set([...watches.values()].map((s) => String(s.vehicleNumber))),
+        onTailSample:    (pos) => recordFleetLanding(pos),
+      });
+    } catch (err) {
+      console.error('[TailProbe] unavailable:', err.message);
+    }
+  }
+
+  // ─── Borrowed tail probe (MONITOR_BORROW_PROBE=1, default off) ─────────────
+  // No dedicated account? Lend the probe the highest-target waiting drivers.
+  // Same activation gate as the dedicated probe. Fire-and-forget: creds are
+  // fetched/decrypted for the ≤BORROW_PROBE_MAX chosen drivers, the roster is
+  // handed to tailProbeService (which converges — starts new, retires dropped),
+  // and each driver's borrowedAsProbe flag is reconciled from the probe's ACTUAL
+  // held set so a retiring driver stays checked-out until truly removed.
+  if (BORROW_PROBE_ENABLED) {
+    const borrowActive = inBurstWindow
+      && waitingCount >= PREARM_QUEUE_POS
+      && Number.isFinite(minSecondsUntilFire)
+      && minSecondsUntilFire <= TAIL_PROBE_AHEAD_SECS;
+    updateBorrowRoster(borrowCandidates, todayDayKey, borrowActive)
+      .catch((err) => console.error('[Borrow] roster sync failed:', err.message));
   }
 
   // Set the adaptive interval for the next scheduled poll.
@@ -2337,6 +2780,7 @@ async function addWatch(driverId, { isAuto = false, _ctx = null } = {}) {
     dispatchNotifyPending: false, // armed on entering 'dispatched'; fires when DEST is known
     _lastBroadcastPos:  null,  // internal: avoids redundant SSE on same position
     _lastQueueSize:     null,  // internal: queue size at last poll (for logging)
+    borrowedAsProbe:    false, // true while lent to the tail probe (MONITOR_BORROW_PROBE)
   };
 
   watches.set(driverId, state);
@@ -2722,17 +3166,22 @@ async function startMonitor() {
   // change between ticks. .finally() guarantees we wait for the in-flight poll
   // to finish before scheduling the next one — no overlap, no piling up.
   const schedule = () => {
+    const delay = nudgePending ? 0 : currentPollDelayMs;
+    nudgePending = false;
     pollTimer = setTimeout(() => {
+      pollInFlight = true;
       poll()
         .catch(console.error)
-        .finally(() => { if (pollTimer !== null) schedule(); });
-    }, currentPollDelayMs);
+        .finally(() => { pollInFlight = false; if (pollTimer !== null) schedule(); });
+    }, delay);
   };
+  scheduleFn = schedule;
   schedule();
 
   refreshTimer = setInterval(() => refreshAutoWatches().catch(console.error), AUTO_REFRESH_MS);
 
-  poll().catch(console.error); // immediate first tick — doesn't block the chain
+  pollInFlight = true;
+  poll().catch(console.error).finally(() => { pollInFlight = false; }); // immediate first tick — doesn't block the chain
 
   console.log(
     `[Monitor] Started — poll cadence ${POLL_INTERVAL_MS / 1000}s idle / ` +
@@ -2747,6 +3196,19 @@ async function startMonitor() {
 function stopMonitor() {
   if (pollTimer)    { clearTimeout(pollTimer);     pollTimer    = null; }
   if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+  scheduleFn   = null;   // a stopped monitor can't be nudged back to life
+  nudgePending = false;
+  pollInFlight = false;
+  // Retire any borrowed probes so no real driver is left mid-cycle in the live
+  // queue (syncRoster with active:false stops every loop and force-removes).
+  if (BORROW_PROBE_ENABLED) {
+    try { require('./tailProbeService').syncRoster({ active: false, roster: [] }); }
+    catch (err) { console.error('[Borrow] stop cleanup failed:', err.message); }
+  }
+  borrowCredsCache.clear();
+  borrowHistory.clear();
+  borrowExcluded.clear();
+  borrowRosterInFlight = false;
   watches.clear();
   autoDriverIds.clear();
   manualWatchIds.clear();
@@ -2889,6 +3351,12 @@ function getPositionDiagnostics() {
       ? todayTarget - state.earlyJoinAtPosition
       : null;
 
+    // Borrowed-probe audit for this driver (if ever lent today).
+    const bh = borrowHistory.get(driverId) ?? null;
+    const landedOnTarget = (state.positionFiredToday && todayTarget != null && state.currentPosition != null)
+      ? Math.abs(state.currentPosition - todayTarget) <= 10
+      : null;
+
     rows.push({
       driverId,
       vehicleNumber:        state.vehicleNumber,
@@ -2907,6 +3375,14 @@ function getPositionDiagnostics() {
       earlyJoinAtPosition:  state.earlyJoinAtPosition,
       earlyJoinGap:         gap,
       lastPosDecision:      state.lastPosDecision,
+      // Borrowed-probe fields (null/false when never borrowed):
+      borrowedNow:          !!state.borrowedAsProbe,
+      borrowCycles:         bh?.cycles ?? 0,
+      borrowFirstAt:        bh?.firstBorrowedAt ?? null,
+      borrowRetiredAt:      bh?.retiredAt ?? null,
+      borrowExcluded:       borrowExcluded.has(driverId),
+      landedPosition:       state.positionFiredToday ? state.currentPosition : null,
+      landedOnTarget,
     });
   }
 
@@ -2930,6 +3406,7 @@ module.exports = {
   markManuallyRemoved,
   syncDriverSchedule,
   allowRefireToday,
+  rescueBorrowedDriver,
   armPositionWindowForToday,
   // Test-only: returns the live in-memory state object for a driver so tests
   // can mutate flags directly. Do NOT use from production code paths —
@@ -2953,6 +3430,8 @@ module.exports = {
   _evaluatePositionScheduler: evaluatePositionScheduler,
   _carryoverClearStep:        carryoverClearStep,
   _removeCarryoverLeftover:   removeCarryoverLeftover,
+  _dropAndArmLeftover:        dropAndArmLeftover,
+  _dropAndArmCarryoverLeftovers: dropAndArmCarryoverLeftovers,
   _setWatch:                  (driverId, state) => watches.set(driverId, state),
   _expectedNextPollMs:        expectedNextPollMs,
   _botExecutionEstimateMs:    botExecutionEstimateMs,
@@ -2960,4 +3439,6 @@ module.exports = {
   _computeMedian:             computeMedian,
   _normaliseLatencySample:    normaliseLatencySample,
   _resetLatencySamples:       () => { botLatencySamples.length = 0; },
+  _recordFleetLanding:        recordFleetLanding,
+  _setFleetLanding:           (position, atMs) => { lastFleetLanding = { position, atMs: atMs ?? Date.now() }; },
 };

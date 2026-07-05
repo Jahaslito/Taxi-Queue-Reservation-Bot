@@ -230,6 +230,19 @@ async function resumeSubscription(subscriptionId) {
 }
 
 /**
+ * Schedule a subscription to stop at the end of the current paid period.
+ * No further charge is attempted after the period ends, and the driver keeps
+ * the time they already paid for. Idempotent — safe to call on a subscription
+ * that is already scheduled to cancel. Returns the updated subscription.
+ *
+ * Used when an admin deactivates or deletes a driver so we stop billing an
+ * account that will no longer be serviced.
+ */
+async function scheduleCancelAtPeriodEnd(subscriptionId) {
+  return getStripe().subscriptions.update(subscriptionId, { cancel_at_period_end: true });
+}
+
+/**
  * Verify the Stripe-Signature header and reconstruct the event.
  * Throws if the signature is invalid.
  */
@@ -246,6 +259,7 @@ module.exports = {
   createPortalSession,
   retrieveSubscription,
   resumeSubscription,
+  scheduleCancelAtPeriodEnd,
   constructWebhookEvent,
   // Exported for unit testing — not called by route handlers.
   _trialConfig:     trialConfig,

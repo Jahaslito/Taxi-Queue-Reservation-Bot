@@ -44,6 +44,7 @@ const { EventEmitter }    = require('events');
 const Driver              = require('../models/Driver');
 const Log                 = require('../models/Log');
 const PositionTracking    = require('../models/PositionTracking');
+const TerminalMetric      = require('../models/TerminalMetric');
 const QueueSnapshot       = require('../models/QueueSnapshot');
 const proxyHealth         = require('./proxyHealthService');
 const credentialLockout   = require('./credentialLockoutService');
@@ -171,15 +172,33 @@ const TAIL_PROBE_ENABLED = process.env.MONITOR_TAIL_PROBE === '1';
 // the landing — instead of hours of add/remove churn.
 const TAIL_PROBE_AHEAD_SECS = parseInt(process.env.MONITOR_TAIL_PROBE_AHEAD_SECS ?? '90', 10);
 // Borrowed tail probe (MONITOR_BORROW_PROBE=1, default OFF): when no dedicated
-// probe account exists, lend the probe the highest-target watched drivers —
-// their real fire is many minutes away, so their account is idle now. See
-// tailProbeService "BORROWED probes" for the safety model. A driver is only
-// borrowable while target − currentQueue ≥ BORROW_MARGIN, and is handed back
-// (retired, force-removed if needed) the instant the tail closes to within it,
-// leaving BORROW_MARGIN positions of runway for a clean, accurate real fire.
+// probe account exists, lend the probe the highest-target watched drivers.
+//
+// ⚠ 2026-07-04 PRODUCTION FAILURE — the original design was UNSAFE and is now
+// hard-gated to CALM-ONLY. That morning borrowing ran DURING the burst; the
+// queue rocketed 40+/s and the retire (a slow add→remove under SAN storm load,
+// seconds each, seen churning 10× on one driver) could NOT hand drivers back
+// before the queue blew past their targets. Every borrowed driver near the
+// storm fired BORN-OVER and COLD (no armed session ready): #0911 +61, #1237
+// +72, #1965 +85, and 4 past-max misses (#093/#696/#0034/#0387). ROOT CAUSE:
+// a real scheduled driver is only SAFE to borrow while the storm is far away,
+// but the probe is only USEFUL during the storm — mutually exclusive. So
+// borrowing is now confined to deep calm and the whole roster is mass-retired
+// the instant the storm approaches (queue nears onset OR the rate rises), which
+// leaves the retire to finish in calm and the armed pool to arm the driver for
+// a normal on-time fire. Intra-STORM samples must come from the fleet probe
+// (our own real landings — safe) or a DEDICATED probe account, never a paying
+// driver held into the burst.
 const BORROW_PROBE_ENABLED = process.env.MONITOR_BORROW_PROBE === '1';
 const BORROW_PROBE_MAX     = parseInt(process.env.MONITOR_BORROW_PROBE_MAX    ?? '2', 10);
 const BORROW_PROBE_MARGIN  = parseInt(process.env.MONITOR_BORROW_PROBE_MARGIN ?? '60', 10);
+// Calm-only safety rails (mass-retire the whole borrow roster when tripped):
+//   STOP_QUEUE — stop borrowing once the queue reaches this (well below the
+//     60–85 onset) so every borrowed driver is handed back while still calm.
+//   STORM_RATE — any growth at/above this (drivers/s) means the storm is
+//     starting → mass-retire NOW, don't wait for the queue threshold.
+const BORROW_STOP_QUEUE    = parseInt(process.env.MONITOR_BORROW_STOP_QUEUE  ?? '45', 10);
+const BORROW_STORM_RATE    = parseFloat(process.env.MONITOR_BORROW_STORM_RATE ?? '2');
 // Fallback estimate for Playwright bot execution time (ms) before we have real
 // data. Used to project how many positions will be added between the fire decision
 // and when SAN assigns the queue slot. The actual estimate is the rolling median
@@ -504,13 +523,23 @@ const BIAS_REFRESH_EVERY = 20;    // recalculate bias every N poll ticks
 // be poisoned by re-adds / already-queued / failed rows.
 let lastFleetLanding   = { position: 0, atMs: 0 };
 function recordFleetLanding(position) {
-  if (Number.isFinite(position) && position > 0) {
-    lastFleetLanding = { position, atMs: Date.now() };
-    // Event-driven decision: a fresh landing is a true-tail observation that
-    // the NEXT poll (up to 1 s away at burst cadence — a 20–40-position hole
-    // in a storm) would act on. Re-evaluate now instead. Only meaningful when
-    // the probe feeds decisions; without it the immediate poll would just
-    // re-read the same stale display.
+  if (!Number.isFinite(position) || position <= 0) return;
+  const now   = Date.now();
+  const stale = (now - lastFleetLanding.atMs) > FLEET_PROBE_FRESH_MS;
+  // Keep the HIGHEST landing within the fresh window, not the latest-by-time.
+  // The morning queue is append-only, so the true tail only rises; a landing
+  // BELOW a recent one is a straggler from a driver who fired earlier at a
+  // smaller queue (slow armed click under storm load), NOT a shrinking tail.
+  // 2026-07-04 proof: at the 77→103 chunk step, landings arrived 96,95,93 then
+  // 73,71,70 in the same second — latest-wins left the probe anchored at 72 and
+  // BLIND, so targets 89–102 all fired at the stale 103 display (+25…+28). The
+  // max is still ≤ the true current tail, so undershoot ≥ −9 is preserved.
+  if (stale || position > lastFleetLanding.position) {
+    lastFleetLanding = { position, atMs: now };
+    // Event-driven decision: a fresh, HIGHER true-tail observation that the
+    // next poll (up to 1 s away at burst cadence — a 20–40-position hole in a
+    // storm) would act on. Re-evaluate now instead. Nudging only on an improved
+    // estimate also avoids churning the poll on stale stragglers.
     if (FLEET_PROBE_ENABLED) nudgePoll();
   }
 }
@@ -522,6 +551,18 @@ function recordFleetLanding(position) {
 // converges anyway.
 const borrowCredsCache    = new Map(); // driverId → { username, password }
 let   borrowRosterInFlight = false;
+let   _borrowRetireLogged  = false;    // one-shot log guard for the mass-retire message
+
+/**
+ * Calm-only borrow gate (pure — the 2026-07-04 safety rail). Borrowing is
+ * ONLY allowed while the morning is genuinely calm; the instant the queue
+ * nears onset OR the rate rises, this returns false and the whole roster is
+ * mass-retired so every lent driver is handed back to the armed pool and fires
+ * on time. A real driver must NEVER be held into the burst.
+ */
+function borrowAllowedInCalm(waitingCount, growthRate) {
+  return waitingCount < BORROW_STOP_QUEUE && growthRate < BORROW_STORM_RATE;
+}
 // Per-driver borrow audit (for the admin "Borrowed Drivers" table): proves a
 // lent driver was cycled, retired, re-armed, and still landed on target.
 //   driverId → { cycles, adds, firstBorrowedAt, lastBorrowedAt, retiredAt }
@@ -615,6 +656,7 @@ async function rescueBorrowedDriver(driverId) {
   if (state) {
     state.borrowedAsProbe    = false;
     state.positionFiredToday = false; // let the scheduler fire their REAL target
+    state.landedPositionToday = null; // stale probe-era landing must not label the fresh fire
     state.hasBeenSeen        = false;
     state.earlyJoinDetectedAt = null;
     state.earlyJoinAtPosition = null;
@@ -1050,6 +1092,11 @@ async function _runBot(driverId, state, triggerType = 'monitor_requeue', botOpts
   if (state.pendingTrackingId && safeToRecord) {
     const trackingId = state.pendingTrackingId;
     state.pendingTrackingId = null;
+    // Freeze the landing on the watch state. The queue position only DECAYS
+    // after landing (drivers ahead get dispatched), so anything derived from
+    // state.currentPosition later reports a phantom undershoot — the admin
+    // borrowed table showed #4004 as ✗ −19 when the real landing was −6.
+    state.landedPositionToday = result.position;
     recordFleetLanding(result.position); // feed the true-tail probe (genuine join only)
     PositionTracking.updateActualPosition(trackingId, result.position)
       .then(() => console.log(`[PosTracking] #${state.vehicleNumber} landed at ${result.position} (from bot result)`))
@@ -1097,6 +1144,44 @@ async function _runBot(driverId, state, triggerType = 'monitor_requeue', botOpts
   const tag       = triggerType === 'position_schedule' ? '[Pos]' : '[Monitor]';
   const logSuffix = result?.success ? `pos #${result.position}` : `failed — ${result?.error || result?.message || 'unknown'}`;
   console.log(`${tag} ✓ #${state.vehicleNumber} → ${logSuffix}`);
+}
+
+// Record one terminal-trip metric (dwell + detection lag) at the moment we
+// auto-requeue a driver after a terminal trip. Best-effort and non-blocking —
+// a DB error must never stop the requeue. Resets the per-trip capture fields.
+function recordTerminalMetric(state, requeuePath) {
+  // Wrapped whole-body: this runs in the hot poll loop right before the requeue
+  // fires, so it must never throw (e.g. if the code deploys before the migration
+  // runs). Any failure is logged and swallowed.
+  try {
+    const atSince = state.atTerminalSince;
+    if (!atSince) return; // not a terminal trip — nothing to record
+    const now = new Date();
+    const terminal = state.terminalName || state.dispatchTerminal || null;
+    const dwellSeconds = Math.max(0, Math.round((now - atSince) / 1000));
+    const detectionLagSeconds = state.terminalLastSeenAt
+      ? Math.max(0, Math.round((now - state.terminalLastSeenAt) / 1000))
+      : null;
+
+    TerminalMetric.record({
+      driverId:            state.driverId,
+      vehicleNumber:       state.vehicleNumber,
+      terminal,
+      requeuePath,
+      atTerminalSince:     atSince,
+      terminalLastSeenAt:  state.terminalLastSeenAt || null,
+      requeuedAt:          now,
+      dwellSeconds,
+      detectionLagSeconds,
+      terminalPosition:    state.terminalPosition ?? null,
+    }).catch((err) => console.error(`[TerminalMetric] record failed for #${state.vehicleNumber}: ${err.message}`));
+
+    // Fresh slate for the next trip.
+    state.dispatchTerminal   = null;
+    state.terminalLastSeenAt = null;
+  } catch (err) {
+    console.error(`[TerminalMetric] skipped for #${state.vehicleNumber}: ${err.message}`);
+  }
 }
 
 async function triggerRequeue(driverId, state, { delayMs = 0 } = {}) {
@@ -1712,6 +1797,7 @@ async function poll() {
     for (const s of watches.values()) {
       s.requeueCountToday  = 0;
       s.positionFiredToday = false;
+      s.landedPositionToday = null; // yesterday's landing must not feed today's diagnostics
       s.lastPosDecision    = null; // new day → next decision will write a fresh row
       s.pendingTrackingId  = null;
       s.consecutiveAlreadyQueued = 0;
@@ -2003,6 +2089,9 @@ async function poll() {
       // DEST column. A notification without a terminal isn't actionable —
       // the driver wouldn't know where to go, defeating the 25-min window.
       const terminal = dispatchedDest.get(vn) ?? null;
+      // Remember the DEST so a later requeue can be attributed to a terminal even
+      // if the driver is never spotted on the T1/T2 page (the 'timeout' path).
+      if (terminal) state.dispatchTerminal = terminal;
       if (state.dispatchNotifyPending && terminal) {
         state.dispatchNotifyPending = false;
         Driver.findById(driverId)
@@ -2034,6 +2123,7 @@ async function poll() {
       if (state.pendingTrackingId && livePosition) {
         const trackingId = state.pendingTrackingId;
         state.pendingTrackingId = null;
+        state.landedPositionToday = livePosition; // freeze — currentPosition decays after landing
         PositionTracking.updateActualPosition(trackingId, livePosition)
           .then(() => console.log(`[PosTracking] #${state.vehicleNumber} landed at ${livePosition} (target was recorded)`))
           .catch((err) => console.error('[PosTracking] Failed to update actual position:', err.message));
@@ -2148,6 +2238,7 @@ async function poll() {
         `[Monitor] #${state.vehicleNumber} at_terminal → in_queue (SAN auto-returned, ` +
         `pos #${state.currentPosition}) — firing requeue`,
       );
+      recordTerminalMetric(state, 'san_auto_returned');
       triggerRequeue(driverId, state).catch(console.error);
     }
   }
@@ -2193,9 +2284,10 @@ async function poll() {
           || state.terminalName !== which
           || state.terminalPosition !== termPos;
 
-        state.terminalSeen     = true;
-        state.terminalName     = which;
-        state.terminalPosition = termPos;
+        state.terminalSeen      = true;
+        state.terminalName      = which;
+        state.terminalPosition  = termPos;
+        state.terminalLastSeenAt = new Date(); // for detection-lag metric
 
         if (changed) {
           console.log(`[Monitor] #${state.vehicleNumber} → at ${which} terminal (pos #${termPos})`);
@@ -2268,6 +2360,7 @@ async function poll() {
               ? 'left terminal list'
               : `not seen on terminals after ${MAX_TERMINAL_CHECKS} checks`;
             console.log(`[Monitor] #${state.vehicleNumber} → ${reason} — requeueing now`);
+            recordTerminalMetric(state, clearedAfterSeen ? 'left_terminal' : 'timeout');
             // No delay: driver has fully cleared both V Holding and terminal
             triggerRequeue(driverId, state).catch(console.error);
           }
@@ -2633,10 +2726,18 @@ async function poll() {
   // and each driver's borrowedAsProbe flag is reconciled from the probe's ACTUAL
   // held set so a retiring driver stays checked-out until truly removed.
   if (BORROW_PROBE_ENABLED) {
-    const borrowActive = inBurstWindow
-      && waitingCount >= PREARM_QUEUE_POS
-      && Number.isFinite(minSecondsUntilFire)
-      && minSecondsUntilFire <= TAIL_PROBE_AHEAD_SECS;
+    // CALM-ONLY (see the 2026-07-04 failure note on the constants above): the
+    // instant the queue nears onset OR the rate rises, force the roster empty
+    // → tailProbeService mass-retires every borrowed driver and the armed pool
+    // arms them for a normal fire. Borrowing only ever runs in deep calm, so a
+    // driver is never held into the burst. This inverts the original (unsafe)
+    // gate that ran borrowing DURING the burst.
+    const borrowActive = borrowAllowedInCalm(waitingCount, effectiveGrowthRate);
+    if (!borrowActive && borrowHistory.size > 0 && !_borrowRetireLogged) {
+      _borrowRetireLogged = true;
+      console.log(`[Borrow] storm approaching (queue ${waitingCount}, rate ${effectiveGrowthRate.toFixed(1)}/s) — mass-retiring all borrowed drivers so they fire armed & on-time`);
+    }
+    if (borrowActive) _borrowRetireLogged = false;
     updateBorrowRoster(borrowCandidates, todayDayKey, borrowActive)
       .catch((err) => console.error('[Borrow] roster sync failed:', err.message));
   }
@@ -2775,6 +2876,8 @@ async function addWatch(driverId, { isAuto = false, _ctx = null } = {}) {
     terminalCheckCount: 0,
     terminalName:       null,
     terminalPosition:   null,
+    dispatchTerminal:   null,  // DEST (T1/T2) captured at dispatch — attributes timeout requeues
+    terminalLastSeenAt: null,  // last poll this driver was seen on a terminal page
     earlyJoinDetectedAt: null, // first time we detected driver in queue far ahead of target
     earlyJoinAtPosition: null, // their queue position at that first detection
     dispatchNotifyPending: false, // armed on entering 'dispatched'; fires when DEST is known
@@ -3129,6 +3232,40 @@ function subscribe(callback) {
  *   3. Start the auto-refresh interval (picks up new drivers every 5 min).
  *   4. Fire one immediate poll so the UI has data right away.
  */
+// Reconcile the in-memory "position window armed" flag after a restart.
+//
+// positionWindowArmedForDate is in-memory and lost on restart, so the next poll
+// would re-run armPositionWindowForToday() — which wipes positionFiredToday/
+// hasBeenSeen and re-tags any driver currently in queue as inQueueFromCarryover.
+// Drivers dispatched on a trip after that get routed through the carryover-cleared
+// path with no requeue (the 2026-06-09 #0187 incident: fired at 04:37, restart at
+// 08:29 re-tagged as carryover, dispatch at 10:34 logged "SAN cleared overnight
+// carryover" with no triggerRequeue, driver had to manually re-add ~1h 53m later).
+// So a restart AFTER the window has opened treats DB-restored positionFiredToday/
+// hasBeenSeen/inQueueFromCarryover as evidence the window already armed today and
+// preserves the flag (skips the re-arm that would wipe reconstructed state).
+//
+// CLOCK GATE (2026-07-04 fix): a restart BEFORE the window opens must NOT set the
+// flag. Carryover markers are stamped at the midnight reset — hours before the
+// 3 AM arm — so without this gate an early-morning restart (deploys land in the
+// 11:30 PM–2:30 AM window) wrongly concludes "already armed" and skips the 3 AM
+// arm AND its forced carryover drop for the whole day. On 2026-07-04 three
+// restarts at 00:57–01:15 did exactly that, stranding #0030/#0187/#0305/#0387 on
+// SAN's slow passive drop. Before position hours the arm cannot have run yet, so
+// we leave the flag untouched and let the real 3 AM arm (and drop) fire.
+function reconcileArmStateOnRestart() {
+  if (!isWithinPositionHours()) return; // pre-window restart: let the 3 AM arm run
+
+  const todayKey = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+  const dayAlreadyInProgress = [...watches.values()].some(
+    (s) => s.positionFiredToday || s.hasBeenSeen || s.inQueueFromCarryover,
+  );
+  if (dayAlreadyInProgress) {
+    positionWindowArmedForDate = todayKey;
+    console.log(`[Monitor] Position window already armed today (${todayKey}) — restart during position hours, preserving driver state`);
+  }
+}
+
 async function startMonitor() {
   // Auto-watch all active drivers first
   try {
@@ -3138,26 +3275,10 @@ async function startMonitor() {
     console.warn('[Monitor] Initial auto-watch failed:', e.message);
   }
 
-  // Mid-day restart guard: positionWindowArmedForDate is in-memory and lost on
-  // restart, so the next poll would re-run armPositionWindowForToday() — which
-  // wipes positionFiredToday/hasBeenSeen and re-tags any driver currently in
-  // queue as inQueueFromCarryover. Drivers dispatched on a trip after that get
-  // routed through the carryover-cleared path with no requeue (the 2026-06-09
-  // #0187 incident: fired at 04:37, restart at 08:29 re-tagged as carryover,
-  // dispatch at 10:34 logged "SAN cleared overnight carryover" with no
-  // triggerRequeue, driver had to manually re-add at the terminal ~1h 53m
-  // later). DB-restored positionFiredToday/hasBeenSeen/inQueueFromCarryover on
-  // any watched driver is durable evidence the window already armed today —
-  // skip the re-arm so it can't wipe the state addWatch just reconstructed
-  // (including carryover protection rebuilt from the midnight marker).
-  const todayKey = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
-  const dayAlreadyInProgress = [...watches.values()].some(
-    (s) => s.positionFiredToday || s.hasBeenSeen || s.inQueueFromCarryover,
-  );
-  if (dayAlreadyInProgress) {
-    positionWindowArmedForDate = todayKey;
-    console.log(`[Monitor] Position window already armed today (${todayKey}) — restart detected, preserving driver state`);
-  }
+  // Reconcile the "position window armed" flag after a restart. Clock-gated so a
+  // pre-3 AM restart can't skip that day's arm + forced carryover drop — see the
+  // reconcileArmStateOnRestart() comment for the 2026-07-04 incident it fixes.
+  reconcileArmStateOnRestart();
 
   if (pollTimer)    { clearTimeout(pollTimer);    pollTimer    = null; }
   if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
@@ -3353,8 +3474,12 @@ function getPositionDiagnostics() {
 
     // Borrowed-probe audit for this driver (if ever lent today).
     const bh = borrowHistory.get(driverId) ?? null;
-    const landedOnTarget = (state.positionFiredToday && todayTarget != null && state.currentPosition != null)
-      ? Math.abs(state.currentPosition - todayTarget) <= 10
+    // Judge on the FROZEN landing, never currentPosition: a held position only
+    // decays after landing (front of queue dispatches), so the live value drifts
+    // below target and paints a phantom undershoot (#4004: landed 295/−6 ✓,
+    // shown as 282/−19 ✗ within minutes).
+    const landedOnTarget = (state.positionFiredToday && todayTarget != null && state.landedPositionToday != null)
+      ? Math.abs(state.landedPositionToday - todayTarget) <= 10
       : null;
 
     rows.push({
@@ -3381,7 +3506,7 @@ function getPositionDiagnostics() {
       borrowFirstAt:        bh?.firstBorrowedAt ?? null,
       borrowRetiredAt:      bh?.retiredAt ?? null,
       borrowExcluded:       borrowExcluded.has(driverId),
-      landedPosition:       state.positionFiredToday ? state.currentPosition : null,
+      landedPosition:       state.positionFiredToday ? (state.landedPositionToday ?? null) : null,
       landedOnTarget,
     });
   }
@@ -3415,6 +3540,9 @@ module.exports = {
   // Test-only: exposes the in-memory armed-for-date flag so restart-guard
   // tests can confirm the guard prevented re-arming.
   _getPositionWindowArmedForDate: () => positionWindowArmedForDate,
+  _setPositionWindowArmedForDate: (v) => { positionWindowArmedForDate = v; },
+  // Test-only: the clock-gated restart guard extracted from startMonitor().
+  _reconcileArmStateOnRestart: reconcileArmStateOnRestart,
   getPositionDiagnostics,
   watchAllActive,
   refreshAutoWatches,
@@ -3440,5 +3568,7 @@ module.exports = {
   _normaliseLatencySample:    normaliseLatencySample,
   _resetLatencySamples:       () => { botLatencySamples.length = 0; },
   _recordFleetLanding:        recordFleetLanding,
+  _borrowAllowedInCalm:       borrowAllowedInCalm,
   _setFleetLanding:           (position, atMs) => { lastFleetLanding = { position, atMs: atMs ?? Date.now() }; },
+  _getFleetLanding:           () => ({ ...lastFleetLanding }),
 };

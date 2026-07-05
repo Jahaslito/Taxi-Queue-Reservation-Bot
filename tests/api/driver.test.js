@@ -258,7 +258,7 @@ describe('GET /api/driver/status/today', () => {
 
 // ─── 32 — Position claim exclusivity ─────────────────────────────────────────
 
-describe('PUT /api/driver/profile — position claim exclusivity', () => {
+describe('PUT /api/driver/profile — position claims (shared slots allowed)', () => {
   test('driver can save a day_positions schedule when the slot is free', async () => {
     const res = await request(app)
       .put('/api/driver/profile')
@@ -269,14 +269,16 @@ describe('PUT /api/driver/profile — position claim exclusivity', () => {
     expect(res.body.day_positions).toBeTruthy();
   });
 
-  test('second driver claiming the same (day, position) gets 409', async () => {
+  test('multiple drivers can claim the SAME (day, position) — no conflict', async () => {
     // Driver A claims Friday position 300
-    await request(app)
+    const resA = await request(app)
       .put('/api/driver/profile')
       .set('Cookie', dCookie)
       .send({ dayPositions: JSON.stringify({ '5': 300 }) });
+    expect(resA.status).toBe(200);
 
-    // Driver B tries to claim the same slot
+    // Driver B claims the SAME slot — positions are no longer exclusive, so this
+    // succeeds instead of returning the old 409.
     const driverB = await createDriver();
     const cookieB = driverCookie(driverB.id);
     const res = await request(app)
@@ -284,9 +286,16 @@ describe('PUT /api/driver/profile — position claim exclusivity', () => {
       .set('Cookie', cookieB)
       .send({ dayPositions: JSON.stringify({ '5': 300 }) });
 
-    expect(res.status).toBe(409);
-    expect(res.body.error).toMatch(/300/);
-    expect(res.body.error).toMatch(/Friday/i);
+    expect(res.status).toBe(200);
+    expect(res.body.day_positions).toBeTruthy();
+
+    // Both drivers hold a claim on Friday/300 — proves the exclusivity gate is gone.
+    // Scoped to the two drivers we created so no cross-test data can perturb it.
+    const claims = await db('position_claims')
+      .whereIn('driver_id', [driver.id, driverB.id])
+      .andWhere({ day_of_week: 5, position: 300 })
+      .select('driver_id');
+    expect(claims.map((c) => c.driver_id).sort()).toEqual([driver.id, driverB.id].sort());
   });
 
   test('driver can re-save their own existing position without conflict', async () => {
@@ -323,28 +332,22 @@ describe('PUT /api/driver/profile — position claim exclusivity', () => {
     expect(res.status).toBe(200);
   });
 
-  test('switching to time-based schedule releases position claims', async () => {
-    // Driver A claims Friday 400
+  test('switching to time-based schedule clears the driver\'s own position claims', async () => {
+    // Driver claims Friday 400
     await request(app)
       .put('/api/driver/profile')
       .set('Cookie', dCookie)
       .send({ dayPositions: JSON.stringify({ '5': 400 }) });
+    expect(await db('position_claims').where({ driver_id: driver.id })).toHaveLength(1);
 
-    // Driver A switches to time-based — releases the claim
-    await request(app)
+    // Switching to a time-based schedule removes their position claims.
+    const res = await request(app)
       .put('/api/driver/profile')
       .set('Cookie', dCookie)
       .send({ daySchedules: JSON.stringify({ '5': '06:00' }) });
 
-    // Driver B can now claim Friday 400
-    const driverB = await createDriver();
-    const cookieB = driverCookie(driverB.id);
-    const res = await request(app)
-      .put('/api/driver/profile')
-      .set('Cookie', cookieB)
-      .send({ dayPositions: JSON.stringify({ '5': 400 }) });
-
     expect(res.status).toBe(200);
+    expect(await db('position_claims').where({ driver_id: driver.id })).toHaveLength(0);
   });
 });
 

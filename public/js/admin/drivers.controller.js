@@ -42,13 +42,14 @@ async function loadDrivers(page) {
   if (page !== undefined) driversPage = page;
   const offset = (driversPage - 1) * DRIVERS_PER;
   const search = document.getElementById('driver-search').value;
+  const status = document.getElementById('driver-status-filter')?.value || '';
   const tbody  = document.getElementById('drivers-table-body');
 
   tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted2);padding:24px;"><span class="spinner"></span></td></tr>';
   document.getElementById('drivers-pagination').style.display = 'none';
 
   try {
-    const data = await api(`/api/admin/drivers?limit=${DRIVERS_PER}&offset=${offset}&search=${encodeURIComponent(search)}`);
+    const data = await api(`/api/admin/drivers?limit=${DRIVERS_PER}&offset=${offset}&search=${encodeURIComponent(search)}&status=${encodeURIComponent(status)}`);
     if (!data) return; // 401 already handled by api()
 
     if (!data.drivers.length) {
@@ -627,6 +628,9 @@ document.getElementById('driver-search').addEventListener('input', () => {
   clearTimeout(searchTimeout);
   searchTimeout = setTimeout(() => loadDrivers(1), 300);
 });
+
+// Status filter (server-side, cross-page) — reload from page 1 on change
+document.getElementById('driver-status-filter')?.addEventListener('change', () => loadDrivers(1));
 
 // Static buttons
 document.getElementById('btn-add-driver').addEventListener('click', openAddDriverModal);

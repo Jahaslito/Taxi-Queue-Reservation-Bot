@@ -81,6 +81,37 @@ describe('fleet-landing true-tail probe', () => {
 });
 
 /**
+ * recordFleetLanding must keep the HIGHEST landing in the fresh window, not
+ * the latest-by-time. Regression for the 2026-07-04 chunk-step blinding: at
+ * the 77→103 step, landings arrived 96,95,93 then straggler 73,71,70 in the
+ * same second; latest-wins anchored the probe at 72 and it went blind.
+ */
+describe('recordFleetLanding — keeps the max true-tail in the fresh window', () => {
+  const { _recordFleetLanding, _getFleetLanding, _setFleetLanding } = monitor;
+  beforeEach(() => _setFleetLanding(0, 0));
+
+  test('a lower straggler landing does NOT overwrite a fresh higher one', () => {
+    _recordFleetLanding(96);            // real tail
+    _recordFleetLanding(95);
+    _recordFleetLanding(73);            // straggler from an earlier, smaller-queue fire
+    _recordFleetLanding(70);
+    expect(_getFleetLanding().position).toBe(96); // stays anchored at the tail
+  });
+
+  test('a higher landing DOES advance the estimate (tail grew)', () => {
+    _recordFleetLanding(96);
+    _recordFleetLanding(120);
+    expect(_getFleetLanding().position).toBe(120);
+  });
+
+  test('once the previous estimate goes stale, a lower landing re-anchors', () => {
+    _setFleetLanding(96, Date.now() - 60000); // 60 s old → stale
+    _recordFleetLanding(80);
+    expect(_getFleetLanding().position).toBe(80); // re-anchors to current reality
+  });
+});
+
+/**
  * Storm replay through the REAL scheduler — the 2026-06-30 04:36 shape.
  *
  * That morning the displayed queue stepped 62 → 114 in ONE observation (+52),

@@ -20,6 +20,59 @@ process.env.TAIL_PROBE_STAGGER_MS     = '1';
 
 const probe = require('../../src/services/tailProbeService');
 
+// Calm-only borrow gate (2026-07-04 safety rail). Defaults: STOP_QUEUE=45,
+// STORM_RATE=2/s. Borrowing must be OFF the instant the storm approaches, so a
+// lent driver is never held into the burst (the +61/+72/+85 failure).
+describe('calm-only borrow gate (borrowAllowedInCalm)', () => {
+  const { _borrowAllowedInCalm } = require('../../src/services/monitorService');
+
+  test('deep calm → borrowing allowed', () => {
+    expect(_borrowAllowedInCalm(20, 0.5)).toBe(true);
+  });
+  test('queue at/over onset threshold → mass-retire (no borrowing)', () => {
+    expect(_borrowAllowedInCalm(45, 0.5)).toBe(false);
+    expect(_borrowAllowedInCalm(77, 0.5)).toBe(false); // the 07-04 storm zone
+  });
+  test('rate rising (storm onset) → mass-retire even at low queue', () => {
+    expect(_borrowAllowedInCalm(30, 2)).toBe(false);
+    expect(_borrowAllowedInCalm(30, 21.3)).toBe(false); // the 07-04 spike
+  });
+});
+
+// Frozen-landing diagnostics (2026-07-04 display bug): after a fire the live
+// queue position only DECAYS (drivers ahead get dispatched), so judging
+// on-target from currentPosition paints a phantom undershoot that worsens by
+// the minute. #4004 landed 295 vs target 301 (−6, in-band ✓) but the borrowed
+// table read the decayed live position 282 and showed ✗ −19.
+describe('borrowed-table landing fields use the frozen landing, not the live position', () => {
+  const monitor = require('../../src/services/monitorService');
+
+  test('landedPosition / landedOnTarget come from landedPositionToday', () => {
+    monitor._setWatch(9001, {
+      driverId: 9001, vehicleNumber: '4004', driverName: 'Mushing Nur',
+      state: 'in_queue', scheduledPosition: 301,
+      positionFiredToday:  true,
+      landedPositionToday: 295, // frozen at the bot result
+      currentPosition:     282, // live position after front-of-queue dispatches
+    });
+    const row = monitor.getPositionDiagnostics().find((r) => r.driverId === 9001);
+    expect(row.landedPosition).toBe(295);
+    expect(row.landedOnTarget).toBe(true); // −6 in-band; the live 282 would say −19 ✗
+  });
+
+  test('no frozen landing recorded → fields stay null, never the live position', () => {
+    monitor._setWatch(9002, {
+      driverId: 9002, vehicleNumber: '9002', driverName: 'x',
+      state: 'in_queue', scheduledPosition: 100,
+      positionFiredToday: true,
+      currentPosition:    60, // decayed — pre-fix this leaked out as landed −40
+    });
+    const row = monitor.getPositionDiagnostics().find((r) => r.driverId === 9002);
+    expect(row.landedPosition).toBe(null);
+    expect(row.landedOnTarget).toBe(null);
+  });
+});
+
 function fakePage(ledger) {
   return {
     evaluate:        jest.fn().mockResolvedValue(true),  // Add click succeeds

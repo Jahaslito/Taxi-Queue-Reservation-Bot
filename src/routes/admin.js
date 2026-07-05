@@ -193,6 +193,17 @@ router.get(
   adminController.getPositionTracking,
 );
 
+// Per-terminal dwell & requeue-latency metrics (T1 vs T2 diagnostics).
+router.get(
+  '/terminal-metrics',
+  [
+    query('limit').optional().isInt({ min: 1, max: 200 }).toInt(),
+    query('offset').optional().isInt({ min: 0 }).toInt(),
+  ],
+  validate,
+  adminController.getTerminalMetrics,
+);
+
 // Daily position-scheduler report — defaults to today PT, accepts 'today',
 // 'yesterday', or any YYYY-MM-DD. Returns rows + summary in one response.
 router.get(

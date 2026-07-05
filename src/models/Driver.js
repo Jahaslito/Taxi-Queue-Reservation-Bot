@@ -120,7 +120,7 @@ class Driver {
    * Full-text search across drivers with their latest log status joined.
    * Used by the admin drivers list endpoint.
    */
-  static search({ search, activeOnly = false, limit = 25, offset = 0 } = {}) {
+  static search({ search, activeOnly = false, status, limit = 25, offset = 0 } = {}) {
     const latestLogSubquery = db('logs')
       .select('id')
       .whereRaw('driver_id = d.id')
@@ -152,7 +152,9 @@ class Driver {
               .orWhereILike('d.san_username',   `%${search}%`);
           });
         }
-        if (activeOnly) q.where('d.is_active', true);
+        // status: 'active' | 'inactive' filters on is_active; activeOnly kept for back-compat.
+        if (status === 'active'   || activeOnly) q.where('d.is_active', true);
+        else if (status === 'inactive')          q.where('d.is_active', false);
       })
       .orderBy('d.scheduled_time', 'asc')
       .orderBy('d.name',           'asc')
@@ -161,7 +163,7 @@ class Driver {
   }
 
   /** Count matching drivers — mirrors the filters from search() for pagination totals */
-  static searchCount({ search, activeOnly = false } = {}) {
+  static searchCount({ search, activeOnly = false, status } = {}) {
     return db('drivers as d')
       .modify((q) => {
         if (search) {
@@ -173,7 +175,8 @@ class Driver {
               .orWhereILike('d.san_username',   `%${search}%`);
           });
         }
-        if (activeOnly) q.where('d.is_active', true);
+        if (status === 'active'   || activeOnly) q.where('d.is_active', true);
+        else if (status === 'inactive')          q.where('d.is_active', false);
       })
       .count('* as count')
       .first();

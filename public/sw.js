@@ -8,7 +8,7 @@
 //   3. activate handler purges any caches not matching CACHE_NAME
 //   4. clients.claim() takes over open tabs immediately
 //   5. Next navigation (or app reopen) serves the new files
-const CACHE_VERSION = 'v38';
+const CACHE_VERSION = 'v39';
 const CACHE_NAME    = `san-queue-${CACHE_VERSION}`;
 
 // On localhost the service worker only gets in the way: cache-first serving of
@@ -43,6 +43,8 @@ const PRECACHE = [
   '/js/admin/sos.controller.js',
   '/js/admin/messages.controller.js',
   '/js/admin/watchlist.controller.js',
+  '/js/admin/tableFilter.js',
+  '/js/admin/terminalMetrics.controller.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png',
   '/icons/apple-touch-icon.png',

@@ -232,7 +232,7 @@ function renderTodayStatus(statusData) {
       <div style="display:flex;gap:20px;">
         <div>
           <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;">Position</div>
-          <div style="font-family:'Syne',sans-serif;font-size:28px;font-weight:700;color:var(--teal);">${esc(log.queue_position)}</div>
+          <div style="font-family:'DM Sans',sans-serif;font-size:28px;font-weight:700;color:var(--teal);">${esc(log.queue_position)}</div>
         </div>
         <div>
           <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;">Location</div>
@@ -262,7 +262,7 @@ function renderLiveLocation(live) {
   const tile = (label, value, color) => `
     <div style="flex:1;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:12px;padding:14px;">
       <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;">${label}</div>
-      <div style="font-family:'Syne',sans-serif;font-size:24px;font-weight:700;color:${color};margin-top:4px;">${value}</div>
+      <div style="font-family:'DM Sans',sans-serif;font-size:24px;font-weight:700;color:${color};margin-top:4px;">${value}</div>
     </div>`;
 
   let label, value, color;

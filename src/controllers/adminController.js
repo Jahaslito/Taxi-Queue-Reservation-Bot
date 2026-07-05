@@ -5,7 +5,9 @@ const Driver                  = require('../models/Driver');
 const Log                     = require('../models/Log');
 const PositionClaim           = require('../models/PositionClaim');
 const PositionTracking        = require('../models/PositionTracking');
+const TerminalMetric          = require('../models/TerminalMetric');
 const { encrypt, decrypt }    = require('../services/cryptoService');
+const stripeService           = require('../services/stripeService');
 const { runBotForDriver }     = require('../services/schedulerService');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/emailService');
 const { derivePaymentStatus } = require('../services/paymentStatus');
@@ -106,10 +108,12 @@ async function getStats(req, res, next) {
 
 async function listDrivers(req, res, next) {
   try {
-    const { search, active } = req.query;
+    const { search, active, status } = req.query;
     const limit  = Math.min(parseInt(req.query.limit,  10) || 25, 100);
     const offset = parseInt(req.query.offset, 10) || 0;
-    const filters = { search, activeOnly: active === 'true' };
+    // status = 'active' | 'inactive' | undefined (all). `active=true` kept for back-compat.
+    const normalizedStatus = status === 'active' || status === 'inactive' ? status : undefined;
+    const filters = { search, activeOnly: active === 'true', status: normalizedStatus };
 
     const [drivers, countResult] = await Promise.all([
       Driver.search({ ...filters, limit, offset }),
@@ -307,6 +311,12 @@ async function updateDriver(req, res, next) {
       throw err;
     }
 
+    // Deactivating via the edit form stops billing too (same as the dedicated
+    // Deactivate action) — cancel the subscription at period end.
+    if (isDeactivating) {
+      await cancelDriverBillingAtPeriodEnd(driver);
+    }
+
     // Immediately propagate schedule changes to the monitor's in-memory state
     // so that position-scheduler decisions reflect the new dayPositions without
     // waiting for the next auto-refresh tick (up to 5 minutes). Mirrors the
@@ -389,6 +399,20 @@ async function updateDriver(req, res, next) {
   }
 }
 
+// Stop billing a driver who is being deactivated or deleted: schedule their
+// Stripe subscription to cancel at period end (they keep the time already paid
+// for; no further charge). Best-effort — a Stripe error must never block the
+// deactivation/deletion itself, so failures are logged and swallowed.
+async function cancelDriverBillingAtPeriodEnd(driver) {
+  if (!driver || !driver.stripe_subscription_id) return;
+  try {
+    await stripeService.scheduleCancelAtPeriodEnd(driver.stripe_subscription_id);
+    console.log(`[Admin] Scheduled subscription ${driver.stripe_subscription_id} to cancel at period end (driver id=${driver.id}, #${driver.vehicle_number})`);
+  } catch (e) {
+    console.warn(`[Admin] Could not schedule cancel for subscription ${driver.stripe_subscription_id} (driver id=${driver.id}): ${e.message}`);
+  }
+}
+
 async function deactivateDriver(req, res, next) {
   try {
     const driver = await Driver.findById(req.params.id);
@@ -401,6 +425,8 @@ async function deactivateDriver(req, res, next) {
     await Driver.deactivate(req.params.id);
     // Release position slots so other drivers can claim them immediately
     await PositionClaim.clearForDriver(req.params.id);
+    // Stop billing — an inactive driver should not keep getting charged.
+    await cancelDriverBillingAtPeriodEnd(driver);
 
     // Immediately mark the driver inactive in the monitor's in-memory state so
     // auto-requeue stops right now rather than after the next 5-min refresh.
@@ -435,6 +461,10 @@ async function deleteDriver(req, res, next) {
       err.statusCode = 404;
       throw err;
     }
+
+    // Cancel billing BEFORE the row is gone — once deleted we lose the link to
+    // the Stripe subscription, which would otherwise keep charging the card.
+    await cancelDriverBillingAtPeriodEnd(driver);
 
     await db.transaction(async (trx) => {
       await trx('push_subscriptions')
@@ -544,6 +574,28 @@ async function getPositionTracking(req, res, next) {
     // instead of a blanket "pending".
     const records = rows.map((r) => ({ ...r, outcome: PositionTracking.describeOutcome(r) }));
     res.json({ records, total: Number(countRow.count) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/admin/terminal-metrics
+ *
+ * Per-terminal dwell & requeue-latency records (one per completed terminal trip)
+ * plus a 7-day summary by terminal. Powers the diagnostics table that lets an
+ * admin confirm/deny "T1 requeues slower than T2" with data.
+ */
+async function getTerminalMetrics(req, res, next) {
+  try {
+    const limit  = req.query.limit  ?? 50;
+    const offset = req.query.offset ?? 0;
+    const [records, total, summary] = await Promise.all([
+      TerminalMetric.recent({ limit, offset }),
+      TerminalMetric.recentCount(),
+      TerminalMetric.summaryByTerminal({ days: 7 }),
+    ]);
+    res.json({ records, total, summary });
   } catch (err) {
     next(err);
   }
@@ -867,6 +919,7 @@ module.exports = {
   checkPositions,
   getLogs,
   getPositionTracking,
+  getTerminalMetrics,
   getDailyReport,
   getPositionDiagnostics,
   rearmPositionScheduler,

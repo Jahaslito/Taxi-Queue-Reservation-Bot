@@ -64,7 +64,7 @@ function showPage(pageId) {
   if (pageId === 'page-monitor')      { if (typeof onMonitorPageShow   === 'function') onMonitorPageShow();   }
   if (pageId === 'page-watchlist')    { if (typeof onWatchlistPageShow === 'function') onWatchlistPageShow(); }
   if (pageId === 'page-pos-tracking')    { loadPosTracking(); if (typeof loadCarryoverReport === 'function') loadCarryoverReport(); }
-  if (pageId === 'page-pos-diagnostics') loadPosDiagnostics();
+  if (pageId === 'page-pos-diagnostics') { loadPosDiagnostics(); if (typeof loadTerminalMetrics === 'function') loadTerminalMetrics(); }
   if (pageId === 'page-sos')             { if (typeof onSosPageShow       === 'function') onSosPageShow();       }
   if (pageId === 'page-messages')        { if (typeof onMessagesPageShow  === 'function') onMessagesPageShow();  }
 }

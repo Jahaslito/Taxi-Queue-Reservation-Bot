@@ -195,19 +195,18 @@ services:
       # probe runs continuously there. Calm days: short probe windows just
       # before each fire cluster instead of burning the cycle cap all morning.
       MONITOR_TAIL_PROBE_AHEAD_SECS: ${MONITOR_TAIL_PROBE_AHEAD_SECS:-90}
-      # Borrowed tail probe (default OFF) — use when NO dedicated probe account
-      # exists. Lends the probe the highest-target watched drivers (their real
-      # fire is minutes away); each is force-removed and handed back the instant
-      # the tail closes to within BORROW_PROBE_MARGIN of their target, leaving
-      # that many positions of runway for a clean, accurate real placement. The
-      # driver only ever sees their one real placement, never the probe cycles.
-      # NOTE: this cycles a paying driver's SAN account for fleet-wide benefit —
-      # disclose it in your terms of service before enabling. Runs on
-      # MONITOR_BORROW_PROBE=1 ALONE (independent of MONITOR_TAIL_PROBE, which is
-      # only for dedicated accounts). REQUIRES MONITOR_FLEET_PROBE=1 to be
-      # useful — that flag is what consumes the probe's tail samples; without it
-      # the borrowed adds/removes feed nothing and are pure risk.
+      # Borrowed tail probe (default OFF, and RECOMMENDED OFF after the
+      # 2026-07-04 failure). Lending paying drivers to the probe caused +61/+72/
+      # +85 overshoots and 4 past-max misses: a real driver can't be retired
+      # fast enough once the storm accelerates, so it fires born-over and cold.
+      # Now hard-gated to CALM-ONLY — the whole roster is mass-retired the
+      # instant the queue reaches MONITOR_BORROW_STOP_QUEUE or the rate reaches
+      # MONITOR_BORROW_STORM_RATE, so no driver is ever held into the burst.
+      # Even so, intra-STORM samples should come from MONITOR_FLEET_PROBE (our
+      # own real landings — safe) or a dedicated account, NOT borrowing.
       MONITOR_BORROW_PROBE:        ${MONITOR_BORROW_PROBE:-0}
+      MONITOR_BORROW_STOP_QUEUE:   ${MONITOR_BORROW_STOP_QUEUE:-45}
+      MONITOR_BORROW_STORM_RATE:   ${MONITOR_BORROW_STORM_RATE:-2}
       MONITOR_BORROW_PROBE_MAX:    ${MONITOR_BORROW_PROBE_MAX:-2}
       MONITOR_BORROW_PROBE_MARGIN: ${MONITOR_BORROW_PROBE_MARGIN:-60}
       # Poll cache-buster — TESTED 2026-07-03, DON'T BOTHER: spacezone already

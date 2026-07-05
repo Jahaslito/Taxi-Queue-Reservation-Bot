@@ -369,6 +369,70 @@ describe('armPositionWindowForToday() — fleet-wide 3 AM re-arm', () => {
   });
 });
 
+// ─── reconcileArmStateOnRestart() — clock-gated restart guard ─────────────────
+// Regression cover for the 2026-07-04 miss: three restarts at 00:57–01:15 (before
+// the 3 AM position window) tripped the old guard because midnight carryover
+// markers were mistaken for "window already armed". That set positionWindowArmed
+// ForDate=today, so the real 3 AM arm + forced carryover drop were skipped and
+// #0030/#0187/#0305/#0387 were stranded on SAN's slow passive drop. The clock gate
+// makes a pre-window restart leave the flag untouched so the arm still fires, while
+// a restart DURING position hours still preserves state (the #0187 mid-day guard).
+describe('reconcileArmStateOnRestart() — clock-gated restart guard', () => {
+  const CARRYOVER_DRIVER = 777;
+
+  beforeEach(() => {
+    stopMonitor();                                   // clears the watches map
+    monitor._setPositionWindowArmedForDate(null);    // fresh in-memory flag (as after a restart)
+  });
+
+  afterEach(() => {
+    stopMonitor();
+    monitor._setPositionWindowArmedForDate(null);
+  });
+
+  test('restart BEFORE the 3 AM window with carryover leftovers → flag left null (arm still runs)', () => {
+    // 1 AM PT — a deploy/restart in the 11:30 PM–2:30 AM window.
+    jest.useFakeTimers({ now: ptHour(1) });
+    // Midnight reset already tagged this leftover as carryover.
+    monitor._setWatch(CARRYOVER_DRIVER, {
+      driverId: CARRYOVER_DRIVER, vehicleNumber: '0187',
+      state: 'in_queue', inQueueFromCarryover: true, hasBeenSeen: true, positionFiredToday: false,
+    });
+
+    monitor._reconcileArmStateOnRestart();
+
+    // The bug was setting this to today's date; the fix leaves it null so the
+    // real 3 AM arm (and its dropAndArmCarryoverLeftovers) can still fire.
+    expect(monitor._getPositionWindowArmedForDate()).toBeNull();
+  });
+
+  test('restart DURING position hours with a day already in progress → flag preserved (no re-arm wipe)', () => {
+    // 8 AM PT — the 2026-06-09 #0187 mid-day restart scenario.
+    jest.useFakeTimers({ now: ptHour(8) });
+    monitor._setWatch(CARRYOVER_DRIVER, {
+      driverId: CARRYOVER_DRIVER, vehicleNumber: '0187',
+      state: 'in_queue', inQueueFromCarryover: false, hasBeenSeen: false, positionFiredToday: true,
+    });
+
+    monitor._reconcileArmStateOnRestart();
+
+    // ptHour(8) is 2026-01-15 08:00 PT → today key is that calendar date.
+    expect(monitor._getPositionWindowArmedForDate()).toBe('2026-01-15');
+  });
+
+  test('restart DURING position hours but no day-in-progress evidence → flag left null', () => {
+    jest.useFakeTimers({ now: ptHour(8) });
+    monitor._setWatch(CARRYOVER_DRIVER, {
+      driverId: CARRYOVER_DRIVER, vehicleNumber: '0187',
+      state: 'watching', inQueueFromCarryover: false, hasBeenSeen: false, positionFiredToday: false,
+    });
+
+    monitor._reconcileArmStateOnRestart();
+
+    expect(monitor._getPositionWindowArmedForDate()).toBeNull();
+  });
+});
+
 // ─── Position scheduler decision logic ────────────────────────────────────────
 // Tests for the safety rails added after the 5/24-5/26 over-/under-shoot
 // incidents: hard skip when queue already past max, pause when queue is being

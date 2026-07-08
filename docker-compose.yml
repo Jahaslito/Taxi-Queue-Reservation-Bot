@@ -161,8 +161,23 @@ services:
       MONITOR_FLEET_PROBE_FRESH_MS: ${MONITOR_FLEET_PROBE_FRESH_MS:-8000}
       MONITOR_FLEET_PROBE_MAX_LEAD: ${MONITOR_FLEET_PROBE_MAX_LEAD:-40}
       BOT_ARMED_MAX:             ${BOT_ARMED_MAX:-40}
-      BOT_ARMED_BROWSERS:        ${BOT_ARMED_BROWSERS:-3}
+      # Roster-scaled armed pool: BOT_ARMED_BROWSERS is the FLOOR; one extra
+      # browser opens per BOT_ARMED_SESSIONS_PER_BROWSER armed sessions, up to
+      # BOT_ARMED_BROWSERS_MAX (07-06: 12 same-tick claims on 3 browsers = 4
+      # serialized clicks each → 9.7 s per fire; ~36 armed now get 6 browsers
+      # → ~2 clicks per browser in the same batch). Each extra browser costs
+      # ~180 MB; MAX past 8 needs a matching pm2 max_memory_restart bump.
+      BOT_ARMED_BROWSERS:             ${BOT_ARMED_BROWSERS:-3}
+      BOT_ARMED_BROWSERS_MAX:         ${BOT_ARMED_BROWSERS_MAX:-8}
+      BOT_ARMED_SESSIONS_PER_BROWSER: ${BOT_ARMED_SESSIONS_PER_BROWSER:-6}
       BOT_ARM_OPS_CONCURRENCY:   ${BOT_ARM_OPS_CONCURRENCY:-4}
+      # Adaptive fire-confirmation timeout: floor .. max, driven by 2 × rolling
+      # p95 of armed-fire durations. A timeout is verified against V Holding
+      # before falling back cold — the Blazor add commits when SAN processes
+      # the click, so a slow confirmation is almost never a failed add
+      # (07-06: 17 committed adds misread as failures → "already in queue" wall).
+      BOT_ARM_FIRE_TIMEOUT_MS:     ${BOT_ARM_FIRE_TIMEOUT_MS:-12000}
+      BOT_ARM_FIRE_TIMEOUT_MAX_MS: ${BOT_ARM_FIRE_TIMEOUT_MAX_MS:-45000}
       # Persistent vehicle_not_available = broken SAN account/vehicle data
       # (the #142/#70/#4006 class): after N consecutive not-available arm
       # attempts, suspend re-arming that driver for the suspend window instead

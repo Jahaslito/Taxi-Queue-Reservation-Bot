@@ -1,0 +1,191 @@
+/**
+ * Adaptive fire timeout + verify-on-timeout recovery + roster-scaled pool.
+ *
+ * Pins the 2026-07-06 storm fixes:
+ *   1. adaptiveFireTimeoutMs — 2 × rolling p95 of armed-fire durations,
+ *      clamped [BOT_ARM_FIRE_TIMEOUT_MS, BOT_ARM_FIRE_TIMEOUT_MAX_MS], with a
+ *      15-min freshness window (yesterday's storm must not inflate today).
+ *   2. fireClaimedSession timeout → verify against V Holding BEFORE the cold
+ *      fallback: a slow confirmation is a COMMITTED add (Blazor commits on
+ *      click processing), so the recovered result must be a genuine landing —
+ *      not the "already in queue" wall of 07-06. Absent vehicle still falls
+ *      back cold (null) exactly as before.
+ *   3. desiredArmedSlots — pool grows one browser per
+ *      BOT_ARMED_SESSIONS_PER_BROWSER sessions between the floor and max, so
+ *      same-tick click batches stop serialising 4-deep per browser.
+ *
+ * Run: npx jest tests/services/armedFireRecovery.test.js
+ */
+
+process.env.BOT_ARMED_BROWSERS             = '3';
+process.env.BOT_ARMED_BROWSERS_MAX         = '8';
+process.env.BOT_ARMED_SESSIONS_PER_BROWSER = '6';
+process.env.BOT_ARM_FIRE_TIMEOUT_MS        = '12000';
+process.env.BOT_ARM_FIRE_TIMEOUT_MAX_MS    = '45000';
+process.env.BOT_ARM_VERIFY_ATTEMPTS        = '3';
+process.env.BOT_ARM_VERIFY_PAUSE_MS        = '5';
+process.env.BOT_ARM_OPS_CONCURRENCY        = '4';
+process.env.BOT_SESSION_PERSIST_PATH       = '/tmp/armed-recovery-test-sessions.json';
+
+jest.mock('playwright', () => ({ chromium: { launch: jest.fn() } }));
+const { chromium } = require('playwright');
+
+// verifyDriverInQueue lazily requires undici + monitorService's parser — mock
+// both so the tests control the V Holding read without network or DB.
+let mockWaiting = new Map(); // normalized vehicle → position
+jest.mock('undici', () => ({
+  fetch: jest.fn(async () => ({ ok: true, text: async () => '<html>' })),
+}));
+jest.mock('../../src/services/monitorService', () => ({
+  _parseQueue: () => ({
+    waiting:        mockWaiting,
+    dispatched:     new Map(),
+    dispatchedDest: new Map(),
+    notAuthorized:  new Set(),
+  }),
+  _norm: (v) => String(v).trim().toUpperCase(),
+}));
+const { fetch: mockFetch } = require('undici');
+
+const launched = [];
+function makePage() {
+  return {
+    goto:            async () => {},
+    waitForURL:      async () => {},
+    url:             () => 'https://san.gtcvms.com/gsidispatch.edispatch/requestTrip',
+    waitForFunction: async () => {},
+    fill:            async () => {},
+    click:           async () => {},
+    evaluate:        async () => false,
+    textContent:     async () => '',
+    isVisible:       async () => true,
+    route:           async () => {},
+    context:         () => ({ storageState: async () => ({}) }),
+  };
+}
+function makeBrowser() {
+  const b = {
+    _handlers:  {},
+    _connected: true,
+    on:          (ev, fn) => { b._handlers[ev] = fn; },
+    isConnected: () => b._connected,
+    close:       jest.fn(async () => { b._connected = false; }),
+    newContext:  jest.fn(async () => ({
+      storageState: async () => ({}),
+      close:        jest.fn(async () => {}),
+      newPage:      async () => makePage(),
+    })),
+  };
+  launched.push(b);
+  return b;
+}
+chromium.launch.mockImplementation(async () => makeBrowser());
+
+const bot = require('../../src/services/botService');
+
+/** Claimed-session stand-in whose confirmation wait always times out. */
+function makeTimedOutSession(vehicleNumber) {
+  return {
+    driverId:      700,
+    vehicleNumber,
+    context:       { close: async () => {} },
+    page: {
+      evaluate:        async () => true, // fast-path click dispatched in-page
+      click:           async () => {},
+      waitForFunction: async () => { throw new Error('page.waitForFunction: Timeout 12000ms exceeded.'); },
+      textContent:     async () => '',
+      screenshot:      async () => { throw new Error('no screenshots in tests'); },
+      context:         () => ({ storageState: async () => ({}) }),
+      on:  () => {},
+      off: () => {},
+    },
+  };
+}
+
+describe('adaptive fire timeout', () => {
+  // Far-future base so latencies recorded by other tests are pruned away.
+  const base = Date.now() + 3600_000;
+
+  test('no samples → floor', () => {
+    expect(bot._adaptiveFireTimeoutMs(base)).toBe(12000);
+  });
+
+  test('calm-day samples stay on the floor', () => {
+    for (const ms of [3000, 3500, 4200, 5000]) bot._recordArmedFireDuration(ms, base);
+    expect(bot._adaptiveFireTimeoutMs(base)).toBe(12000); // 2 × p95 = 10 s < floor
+  });
+
+  test('storm escalation raises the ceiling to 2 × p95', () => {
+    for (const ms of [9000, 9700, 9800, 9800]) bot._recordArmedFireDuration(ms, base + 1000);
+    // p95 of [3000,3500,4200,5000,9000,9700,9800,9800] = 9800
+    expect(bot._adaptiveFireTimeoutMs(base + 1000)).toBe(19600);
+  });
+
+  test('clamped at the max', () => {
+    bot._recordArmedFireDuration(40000, base + 2000);
+    expect(bot._adaptiveFireTimeoutMs(base + 2000)).toBe(45000);
+  });
+
+  test('stale samples pruned → back to the floor', () => {
+    expect(bot._adaptiveFireTimeoutMs(base + 2000 + 16 * 60_000)).toBe(12000);
+  });
+});
+
+describe('verify-on-timeout recovery', () => {
+  test('timeout + vehicle present in V Holding → recovered genuine landing', async () => {
+    mockWaiting = new Map([['9999', 57]]);
+    mockFetch.mockClear();
+
+    const result = await bot.fireClaimedSession(makeTimedOutSession('9999'));
+
+    expect(result).not.toBeNull();
+    expect(result.success).toBe(true);
+    expect(result.recoveredFromTimeout).toBe(true); // same flag as the cold-path recovery
+    expect(result.viaArmedSession).toBe(true);
+    expect(result.alreadyQueued).toBe(false);      // genuine landing, not the 07-06 wall
+    expect(result.position).toBe(57);
+    expect(result.location).toBe('V Holding');
+    expect(mockFetch).toHaveBeenCalledTimes(1);    // found on the first read
+  });
+
+  test('timeout + vehicle absent → null (cold fallback preserved)', async () => {
+    mockWaiting = new Map();
+    mockFetch.mockClear();
+
+    const result = await bot.fireClaimedSession(makeTimedOutSession('4444'));
+
+    expect(result).toBeNull();
+    expect(mockFetch).toHaveBeenCalledTimes(3);    // every verify attempt exhausted
+  });
+});
+
+describe('roster-scaled armed pool', () => {
+  test('desiredArmedSlots: floor, scaling, cap', () => {
+    expect(bot._desiredArmedSlots(1)).toBe(3);     // floor (BOT_ARMED_BROWSERS)
+    expect(bot._desiredArmedSlots(18)).toBe(3);    // 18/6 = exactly the floor
+    expect(bot._desiredArmedSlots(19)).toBe(4);    // first growth step
+    expect(bot._desiredArmedSlots(36)).toBe(6);    // 07-06 roster size
+    expect(bot._desiredArmedSlots(1000)).toBe(8);  // BOT_ARMED_BROWSERS_MAX cap
+  });
+
+  test('36 armed sessions open 6 browsers, none over-packed', async () => {
+    const wanted = Array.from({ length: 36 }, (_, i) => ({
+      driverId:         100 + i,
+      vehicleNumber:    `V${i}`,
+      secondsUntilFire: 60 + i,
+      getCredentials:   async () => ({ sanUsername: `u${i}`, sanPassword: 'p' }),
+    }));
+    await bot.syncFireSessions(wanted);
+
+    const stats = bot.armedFireSessionStats();
+    expect(stats.armed).toBe(36);
+    expect(stats.browsers).toBe(6);                // ceil(36/6), not the old 3
+    const perSlot = {};
+    for (const s of stats.sessions) perSlot[s.browserSlot] = (perSlot[s.browserSlot] ?? 0) + 1;
+    expect(Object.keys(perSlot).length).toBe(6);
+    for (const n of Object.values(perSlot)) expect(n).toBeLessThanOrEqual(8);
+
+    await bot.syncFireSessions([]);                // cleanup: close the pool
+    expect(bot.armedFireSessionStats().browsers).toBe(0);
+  });
+});

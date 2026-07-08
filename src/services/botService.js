@@ -697,6 +697,25 @@ async function verifyDriverInQueue(vehicleNumber) {
   return null;
 }
 
+/**
+ * Post-fire landing verification: polls the authoritative V Holding list a few
+ * times, because a confirmation TIMEOUT is not a failed add — the Blazor add is
+ * a fire-and-forget SignalR event that SAN commits when its server processes
+ * the click; the WAIT screen streaming back is the slow part (2026-07-06: all
+ * 17 "timed out" storm fires were already in the queue). The parked armed page
+ * proved the driver was NOT queued at arm time, so presence here is OUR add —
+ * the same justification the HTTP-fire path uses — which makes the returned
+ * position a genuine landing, safe for position tracking and the fleet probe.
+ */
+async function verifyAddLanded(vehicleNumber) {
+  for (let attempt = 0; attempt < ARM_VERIFY_ATTEMPTS; attempt++) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, ARM_VERIFY_PAUSE_MS));
+    const info = await verifyDriverInQueue(vehicleNumber).catch(() => null);
+    if (info && Number.isFinite(info.position)) return info;
+  }
+  return null;
+}
+
 /** Returns true if the WAIT confirmation screen is currently visible. */
 async function isWaitScreen(page) {
   return page.evaluate(() => {
@@ -1198,11 +1217,28 @@ const credentialLockout = require('./credentialLockoutService');
 // the old cap of 10 left 7 drivers cold → landings +46…+127 past target).
 // ~35 MB per context ⇒ 40 armed ≈ 1.4 GB, fits the 4096M container limit.
 const ARMED_MAX             = parseInt(process.env.BOT_ARMED_MAX             ?? '40', 10);
-// Number of shared Chromium processes armed contexts are spread across.
-// Same-tick armed clicks serialise per browser process (06-30: 9 clicks on
-// one tick took 2.2–2.5 s each on a single browser); 3 processes ≈ 3 fewer
-// clicks contending each, ~180 MB extra per process.
-const ARMED_BROWSERS        = Math.max(1, parseInt(process.env.BOT_ARMED_BROWSERS ?? '3', 10));
+// Shared Chromium processes armed contexts are spread across. Same-tick armed
+// clicks serialise per browser process (06-30: 9 clicks on one tick took
+// 2.2–2.5 s each on a single browser; 07-06: 12 claims across 3 browsers = 4
+// serialized clicks each → 9.7 s per fire). The pool therefore scales WITH the
+// armed-session count instead of sitting on a constant: BOT_ARMED_BROWSERS is
+// the floor (back-compat — small fleets behave exactly as before), and one
+// extra browser is opened per BOT_ARMED_SESSIONS_PER_BROWSER sessions up to
+// BOT_ARMED_BROWSERS_MAX. Memory: each browser process ≈ 180 MB on top of the
+// ~35 MB/context; measured baseline is ~2–2.5 GB RSS at 3 browsers/40 armed,
+// so the max-8 worst case ≈ +0.9 GB ≈ 3.2 GB — under pm2's 3584M restart
+// limit. Raising MAX past 8 needs a matching pm2 max_memory_restart bump.
+const ARMED_BROWSERS_MIN         = Math.max(1, parseInt(process.env.BOT_ARMED_BROWSERS ?? '3', 10));
+const ARMED_BROWSERS_MAX         = Math.max(ARMED_BROWSERS_MIN, parseInt(process.env.BOT_ARMED_BROWSERS_MAX ?? '8', 10));
+const ARMED_SESSIONS_PER_BROWSER = Math.max(1, parseInt(process.env.BOT_ARMED_SESSIONS_PER_BROWSER ?? '6', 10));
+
+/** Pool slots the current session count deserves — roster-scaled, clamped. */
+function desiredArmedSlots(sessionCount) {
+  return Math.min(
+    ARMED_BROWSERS_MAX,
+    Math.max(ARMED_BROWSERS_MIN, Math.ceil(sessionCount / ARMED_SESSIONS_PER_BROWSER)),
+  );
+}
 // Re-validate a parked page when its last check is older than this.
 const ARM_REFRESH_MS        = parseInt(process.env.BOT_ARM_REFRESH_MS        ?? '90000', 10);
 // Skip the keep-alive refresh when the fire is expected within this many
@@ -1223,10 +1259,49 @@ const ARM_NOT_AVAIL_SUSPEND_MS = parseInt(process.env.BOT_ARM_NOT_AVAIL_SUSPEND_
 // rebuild mid-storm (06-30: arms were completing DURING the burst at 2-wide,
 // ~4.5 s each, and lost the race for 7 drivers).
 const ARM_OPS_CONCURRENCY   = parseInt(process.env.BOT_ARM_OPS_CONCURRENCY   ?? '4', 10);
-// Ceiling for the fire click → WAIT-screen confirmation. Normal is < 2 s; if
-// SAN is slower than this the cold fallback wouldn't have been faster anyway,
-// and the fallback's already-queued detection makes a double-submit harmless.
-const ARM_FIRE_TIMEOUT_MS   = parseInt(process.env.BOT_ARM_FIRE_TIMEOUT_MS   ?? '12000', 10);
+// Fire click → WAIT-screen confirmation wait. The Blazor add COMMITS when
+// SAN's server processes the click event; this wait only covers the WAIT
+// screen streaming back, so its expiry means "SAN is slow", almost never
+// "the add failed" (2026-07-06: 17 fires blew a fixed 12 s ceiling in one
+// storm — every one of them was already committed, and the cold fallback
+// "discovered" them as already-in-queue). The timeout is therefore ADAPTIVE:
+// 2 × the rolling p95 of recent armed-fire durations, clamped between
+// BOT_ARM_FIRE_TIMEOUT_MS (floor — calm-day behaviour unchanged) and
+// BOT_ARM_FIRE_TIMEOUT_MAX_MS. Timeouts themselves are recorded, so repeated
+// slow confirmations escalate the ceiling instead of thrashing against it.
+const ARM_FIRE_TIMEOUT_MS        = parseInt(process.env.BOT_ARM_FIRE_TIMEOUT_MS        ?? '12000', 10);
+const ARM_FIRE_TIMEOUT_MAX_MS    = Math.max(ARM_FIRE_TIMEOUT_MS,
+  parseInt(process.env.BOT_ARM_FIRE_TIMEOUT_MAX_MS ?? '45000', 10));
+// Durations older than this no longer describe SAN's current mood — a storm
+// is minutes long, and yesterday's latencies must not inflate today's floor.
+const ARM_FIRE_LATENCY_WINDOW_MS = parseInt(process.env.BOT_ARM_FIRE_LATENCY_WINDOW_MS ?? '900000', 10);
+// Post-timeout verification against the authoritative V Holding list: how many
+// reads, how far apart. Covers an add that SAN is still processing when the
+// confirmation wait expired.
+const ARM_VERIFY_ATTEMPTS        = Math.max(1, parseInt(process.env.BOT_ARM_VERIFY_ATTEMPTS ?? '4', 10));
+const ARM_VERIFY_PAUSE_MS        = parseInt(process.env.BOT_ARM_VERIFY_PAUSE_MS ?? '1500', 10);
+
+// Rolling window of armed-fire durations (successes, rejections, timeouts —
+// every round-trip that measures SAN's confirmation latency).
+const armedFireLatencies = []; // { t, ms }
+
+function recordArmedFireDuration(ms, now = Date.now()) {
+  armedFireLatencies.push({ t: now, ms });
+  // Prune opportunistically so the array can't grow unbounded on busy days.
+  while (armedFireLatencies.length > 0 && now - armedFireLatencies[0].t > ARM_FIRE_LATENCY_WINDOW_MS) {
+    armedFireLatencies.shift();
+  }
+}
+
+function adaptiveFireTimeoutMs(now = Date.now()) {
+  while (armedFireLatencies.length > 0 && now - armedFireLatencies[0].t > ARM_FIRE_LATENCY_WINDOW_MS) {
+    armedFireLatencies.shift();
+  }
+  if (armedFireLatencies.length === 0) return ARM_FIRE_TIMEOUT_MS;
+  const sorted = armedFireLatencies.map((e) => e.ms).sort((a, b) => a - b);
+  const p95 = sorted[Math.min(sorted.length - 1, Math.floor(0.95 * sorted.length))];
+  return Math.min(ARM_FIRE_TIMEOUT_MAX_MS, Math.max(ARM_FIRE_TIMEOUT_MS, 2 * p95));
+}
 
 // ─── HTTP-fire latency cut (overshoot fix — see ±10 accuracy notes) ───────────
 // The armed *click* serialises on the shared Chromium: 8 simultaneous fires on
@@ -1265,8 +1340,10 @@ const armingInFlight = new Set();
 const claimedInFlight = new Set();
 
 // Pool of shared Chromiums — lazily launched per slot, all closed when idle.
-const armedBrowsers         = new Array(ARMED_BROWSERS).fill(null); // Browser | null
-const armedBrowserLaunching = new Array(ARMED_BROWSERS).fill(null); // in-flight launch promise (dedup)
+// Sized to the MAX; how many slots are actually used follows the session
+// count via desiredArmedSlots (roster-scaled — see the constant block above).
+const armedBrowsers         = new Array(ARMED_BROWSERS_MAX).fill(null); // Browser | null
+const armedBrowserLaunching = new Array(ARMED_BROWSERS_MAX).fill(null); // in-flight launch promise (dedup)
 
 // Tiny semaphore for arm/refresh ops. Deliberately local — schedulerService's
 // BotSemaphore caps *browser launches*; this caps page work inside the one
@@ -1318,7 +1395,8 @@ async function ensureArmedBrowser(slot) {
       }
     });
     armedBrowsers[slot] = browser;
-    console.log(`[Arm] browser[${slot}/${ARMED_BROWSERS}] launched`);
+    const active = armedBrowsers.filter((b) => b?.isConnected()).length;
+    console.log(`[Arm] browser[${slot}] launched (${active} active, pool max ${ARMED_BROWSERS_MAX})`);
     return browser;
   }).finally(() => { armedBrowserLaunching[slot] = null; });
 
@@ -1332,17 +1410,22 @@ async function ensureArmedBrowser(slot) {
 const armingSlotInFlight = new Map();
 
 /** Slot with the fewest armed/arming sessions — keeps same-tick fire clicks
- *  spread across browser processes instead of serialising on one event loop. */
+ *  spread across browser processes instead of serialising on one event loop.
+ *  The slot count is roster-scaled: it grows one browser per
+ *  ARMED_SESSIONS_PER_BROWSER sessions (counting this one and the arms in
+ *  flight), so a 36-driver storm roster gets ~9 browsers instead of packing
+ *  12 clicks onto 3. */
 function pickArmedSlot() {
-  const counts = new Array(ARMED_BROWSERS).fill(0);
+  const slots = desiredArmedSlots(armedSessions.size + armingSlotInFlight.size + 1);
+  const counts = new Array(slots).fill(0);
   for (const s of armedSessions.values()) {
-    if (Number.isInteger(s.browserSlot) && s.browserSlot < ARMED_BROWSERS) counts[s.browserSlot]++;
+    if (Number.isInteger(s.browserSlot) && s.browserSlot < slots) counts[s.browserSlot]++;
   }
   for (const slot of armingSlotInFlight.values()) {
-    if (Number.isInteger(slot) && slot < ARMED_BROWSERS) counts[slot]++;
+    if (Number.isInteger(slot) && slot < slots) counts[slot]++;
   }
   let best = 0;
-  for (let i = 1; i < ARMED_BROWSERS; i++) if (counts[i] < counts[best]) best = i;
+  for (let i = 1; i < slots; i++) if (counts[i] < counts[best]) best = i;
   return best;
 }
 
@@ -1354,7 +1437,7 @@ async function closeArmedBrowserIfIdle() {
   // is about to be clicked — same hazard from the other direction.
   if (armedSessions.size !== 0 || armingInFlight.size !== 0 || claimedInFlight.size !== 0) return;
   const closing = [];
-  for (let slot = 0; slot < ARMED_BROWSERS; slot++) {
+  for (let slot = 0; slot < ARMED_BROWSERS_MAX; slot++) {
     const b = armedBrowsers[slot];
     if (!b) continue;
     armedBrowsers[slot] = null;
@@ -1816,11 +1899,12 @@ async function fireClaimedSession(session) {
     await page.waitForFunction(
       (needles) => needles.some((s) => document.body.innerText.includes(s)),
       [SAN_TEXT.REMOVE_FROM_QUEUE, SAN_TEXT.VEHICLE_NOT_AVAILABLE],
-      { timeout: ARM_FIRE_TIMEOUT_MS },
+      { timeout: adaptiveFireTimeoutMs() },
     );
 
     const bodyText = await page.textContent('body').catch(() => '');
     if (bodyText.includes(SAN_TEXT.VEHICLE_NOT_AVAILABLE)) {
+      recordArmedFireDuration(Date.now() - startTime);
       console.log(`[Arm] #${vehicleNumber} → ${SAN_TEXT.VEHICLE_NOT_AVAILABLE} (SAN business-rule rejection)`);
       return {
         success:             false,
@@ -1833,6 +1917,7 @@ async function fireClaimedSession(session) {
     }
 
     const info = await extractQueueInfo(page);
+    recordArmedFireDuration(Date.now() - startTime);
     console.log(`[Arm] ⚡ #${vehicleNumber} fired via armed session in ${Date.now() - startTime} ms → position ${info.position}`);
     return {
       success:         true,
@@ -1843,10 +1928,36 @@ async function fireClaimedSession(session) {
       message:         `Added to queue — Position: ${info.position}, Location: ${info.location}`,
     };
   } catch (err) {
-    // Click/confirm failed — return null so the cold bot takes over. If our
-    // click actually landed despite the error, the fallback finds the WAIT
-    // screen and reports alreadyQueued with the real position (idempotent).
-    console.warn(`[Arm] ✗ #${vehicleNumber} armed fire failed (${err.message}) — falling back to cold bot`);
+    // A confirmation error is NOT a failed add: the click is a fire-and-forget
+    // SignalR event, committed when SAN's server processes it. Record the
+    // elapsed time (escalates the adaptive timeout for the fires behind us),
+    // then check the authoritative V Holding list before conceding — the
+    // 2026-07-06 storm turned 17 committed adds into cold fallbacks and a wall
+    // of "already in queue" rows precisely because this path assumed failure.
+    const elapsedMs = Date.now() - startTime;
+    recordArmedFireDuration(elapsedMs);
+    const landed = await verifyAddLanded(vehicleNumber);
+    if (landed) {
+      console.log(`[Arm] ⚡ #${vehicleNumber} confirmation timed out at ${elapsedMs} ms but add COMMITTED → position ${landed.position} (verified)`);
+      return {
+        success:         true,
+        // alreadyQueued stays false: the parked page proved the driver was NOT
+        // queued at arm time, so this is OUR add — a genuine landing (unlike
+        // the cold path's recovery, which can't rule out a pre-existing entry).
+        alreadyQueued:   false,
+        viaArmedSession: true,
+        // Same flag the cold addToQueue recovery uses (see its catch handler),
+        // so downstream consumers treat both timeout-recoveries uniformly.
+        recoveredFromTimeout: true,
+        ...landed,
+        durationMs:      Date.now() - startTime,
+        message:         `Added to queue — Position: ${landed.position}, Location: ${landed.location}`,
+      };
+    }
+    // Genuinely not in the queue — the cold bot takes over. If the add lands
+    // even later, the fallback finds the WAIT screen and reports alreadyQueued
+    // with the real position (idempotent).
+    console.warn(`[Arm] ✗ #${vehicleNumber} armed fire failed after ${elapsedMs} ms (${err.message}) — not in V Holding, falling back to cold bot`);
     await debugCapture(page, vehicleNumber, 'armed_fire_error').catch(() => {});
     return null;
   } finally {
@@ -1928,6 +2039,11 @@ module.exports = {
   _classifyFailure:               classifyFailure,
   _extractKnownErrorFromText:     extractKnownErrorFromText,
   _extractGenericErrorFromText:   extractGenericErrorFromText,
+  // Exposed for unit tests — adaptive fire timeout + roster-scaled pool.
+  _adaptiveFireTimeoutMs:         adaptiveFireTimeoutMs,
+  _recordArmedFireDuration:       recordArmedFireDuration,
+  _desiredArmedSlots:             desiredArmedSlots,
+  _verifyAddLanded:               verifyAddLanded,
   // Exposed for tailProbeService — same login/search/read flows the bot uses,
   // so the probe can never drift from the proven page interactions.
   _driveToAddButton:              driveToAddButton,

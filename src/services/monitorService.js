@@ -158,6 +158,34 @@ const PREARM_AHEAD_SECS = parseInt(process.env.MONITOR_PREARM_AHEAD_SECS ?? '240
 // the storm zone every waiting driver gets armed regardless of how far away
 // their fire looks. 45 leaves ~2 min of runway before the earliest onset.
 const PREARM_QUEUE_POS  = parseInt(process.env.MONITOR_PREARM_QUEUE_POS ?? '45', 10);
+// ─── Storm-onset early fire (MONITOR_ONSET_FIRE, default OFF) ────────────────
+// SAN's display renders on a hard 5 s server tick (WS-verified 2026-07-08), so
+// a competitor batch-add can jump the queue +39 inside ONE tick (07-08:
+// 66→105) — every target inside the jumped gap fires born-over and lands +30…
+// +50 late. No level-triggered rule ("fire when the number reaches target−10")
+// can beat that: the number that says "fire" is already stale. This lever
+// instead fires drivers BEFORE the chunk, the moment the storm-onset signature
+// appears — spending bounded, opted-in undershoot to eliminate unbounded
+// overshoot. All quantities are POSITIONS (never time): X is how many
+// positions early a driver may be placed, enforced against effectiveQueue —
+// a PROVEN lower bound of the true tail (display ∪ fleet landings) — so the
+// worst case (storm dies the instant we click) lands the driver at the
+// estimate itself: undershoot ≤ ONSET_CAP by construction.
+//   MONITOR_ONSET_FIRE:  '0' off (default) | 'shadow' log-only | '1' live
+//   Onset signature: queue inside [ZONE_MIN, ZONE_MAX] (storms are position-
+//   locked: onset 60–85 every observed morning) AND (sustained rate ≥
+//   ONSET_RATE or a single-tick step ≥ ONSET_STEP — 07-08 pre-step read
+//   45→50→57→66, ~1.4/s, one full tick before the +39).
+//   ONSET_QUIET_TICKS calm ticks in a row disarm it (false-alarm cutoff).
+const ONSET_FIRE_MODE   = String(process.env.MONITOR_ONSET_FIRE ?? '0').toLowerCase();
+const ONSET_FIRE_LIVE   = ONSET_FIRE_MODE === '1';
+const ONSET_FIRE_SHADOW = ONSET_FIRE_MODE === 'shadow';
+const ONSET_ZONE_MIN    = parseInt(process.env.MONITOR_ONSET_ZONE_MIN ?? '55', 10);
+const ONSET_ZONE_MAX    = parseInt(process.env.MONITOR_ONSET_ZONE_MAX ?? '90', 10);
+const ONSET_RATE        = parseFloat(process.env.MONITOR_ONSET_RATE   ?? '1.2');
+const ONSET_STEP        = parseInt(process.env.MONITOR_ONSET_STEP     ?? '8', 10);
+const ONSET_CAP         = parseInt(process.env.MONITOR_ONSET_CAP      ?? '25', 10);
+const ONSET_QUIET_TICKS = parseInt(process.env.MONITOR_ONSET_QUIET_TICKS ?? '6', 10);
 // Sacrificial tail probe (default OFF) — dedicated vehicle add→read→remove
 // cycles during the storm feed exact true-tail samples to the fleet probe.
 // See tailProbeService.js for the full rationale and safety rails.
@@ -522,6 +550,31 @@ const BIAS_REFRESH_EVERY = 20;    // recalculate bias every N poll ticks
 // (see FLEET_PROBE_ENABLED). Updated only from confirmed tail-joins so it can't
 // be poisoned by re-adds / already-queued / failed rows.
 let lastFleetLanding   = { position: 0, atMs: 0 };
+
+// ─── Storm-onset tracker (MONITOR_ONSET_FIRE) ────────────────────────────────
+// One instance per process, advanced once per poll tick with that tick's queue
+// count and smoothed growth rate. Pure step function (exported for tests):
+// arms when the onset signature appears inside the onset zone, stays armed
+// while the storm keeps moving, disarms after ONSET_QUIET_TICKS calm ticks.
+let onsetState = { active: false, quietTicks: 0, prevQueue: null, stepSeen: 0 };
+
+function onsetStep(st, { queue, rate }) {
+  const step     = st.prevQueue !== null ? Math.max(0, queue - st.prevQueue) : 0;
+  const storming = rate >= ONSET_RATE || step >= ONSET_STEP;
+  let { active, quietTicks } = st;
+  if (!active) {
+    if (queue >= ONSET_ZONE_MIN && queue <= ONSET_ZONE_MAX && storming) {
+      active     = true;
+      quietTicks = 0;
+    }
+  } else if (storming) {
+    quietTicks = 0;
+  } else {
+    quietTicks += 1;
+    if (quietTicks >= ONSET_QUIET_TICKS) { active = false; quietTicks = 0; }
+  }
+  return { active, quietTicks, prevQueue: queue, stepSeen: step };
+}
 function recordFleetLanding(position) {
   if (!Number.isFinite(position) || position <= 0) return;
   const now   = Date.now();
@@ -1551,6 +1604,7 @@ function evaluatePositionScheduler(state, ctx) {
     isLockedOut             = () => false,
     inBurstWindow           = false,
     maxLeadPositions        = POS_MAX_LEAD,
+    onsetActive             = false,
   } = ctx;
 
   // Inactive drivers have no business being scheduled. isActive is synced to the
@@ -1736,7 +1790,20 @@ function evaluatePositionScheduler(state, ctx) {
     };
   }
 
-  const shouldFire = projectedLanding >= effectivePosition;
+  // ─── Storm-onset early fire (MONITOR_ONSET_FIRE — see the constant block) ──
+  // POSITION-only rule, no time anywhere: gap = target − effectiveQueue. Since
+  // effectiveQueue is a proven LOWER bound of the true tail, firing while
+  // gap ≤ ONSET_CAP bounds the worst-case landing at target − ONSET_CAP even
+  // if the storm dies on the click (landing ≥ effectiveQueue + 1). Drivers
+  // whose gap is still wider than the cap are HELD — the storm's own
+  // processing raises the tail toward them within seconds, so they become
+  // eligible before the display step ever shows it.
+  const onsetGap      = effectivePosition - effectiveQueue;
+  const onsetEligible = (ONSET_FIRE_LIVE || ONSET_FIRE_SHADOW)
+    && onsetActive && onsetGap > 0 && onsetGap <= ONSET_CAP;
+
+  const projectionReached = projectedLanding >= effectivePosition;
+  const shouldFire        = projectionReached || (ONSET_FIRE_LIVE && onsetEligible);
 
   // secondsUntilFire drives adaptive polling — how soon do we expect to fire?
   // Negative projection (already past target) → 0; no growth → Infinity.
@@ -1746,28 +1813,37 @@ function evaluatePositionScheduler(state, ctx) {
     : (positionsUntilFire <= 0 ? 0 : Infinity);
 
   if (shouldFire) {
+    const onsetOnly = !projectionReached; // fired by the onset rule alone
     return {
       action:  'fire',
-      reason:  'projection_reached_target',
+      reason:  onsetOnly ? 'onset_early_fire' : 'projection_reached_target',
       effectivePosition,
       maxAcceptable,
-      secondsUntilFire,
-      logLine: `[Pos] ${veh} — ✓ queue ${effectiveQueue}${probeNote} + lead ${Number.isInteger(lead) ? lead : lead.toFixed(1)}` +
-               `${leadNote ? leadNote : ` (drift ${estimatedDrift}${biasCorrection !== 0 ? ` + bias ${biasCorrection.toFixed(1)}` : ''})`} ` +
-               `= ${projectedLanding.toFixed(1)} ≥ target ${effectivePosition} ` +
-               `(max ${maxAcceptable}, rate ${effectiveGrowthRate.toFixed(2)}/s, ` +
-               `horizon ${horizonSeconds.toFixed(0)}s, botEst ${(botExecMs/1000).toFixed(1)}s, ` +
-               `samples ${botSamplesCount}) — firing bot`,
+      secondsUntilFire: onsetOnly ? 0 : secondsUntilFire,
+      logLine: onsetOnly
+        ? `[Pos] ${veh} — ⚡ ONSET early fire: queue ${effectiveQueue}${probeNote}, target ${effectivePosition} ` +
+          `(early by ${onsetGap} ≤ cap ${ONSET_CAP}, rate ${effectiveGrowthRate.toFixed(2)}/s) — firing before the chunk`
+        : `[Pos] ${veh} — ✓ queue ${effectiveQueue}${probeNote} + lead ${Number.isInteger(lead) ? lead : lead.toFixed(1)}` +
+          `${leadNote ? leadNote : ` (drift ${estimatedDrift}${biasCorrection !== 0 ? ` + bias ${biasCorrection.toFixed(1)}` : ''})`} ` +
+          `= ${projectedLanding.toFixed(1)} ≥ target ${effectivePosition} ` +
+          `(max ${maxAcceptable}, rate ${effectiveGrowthRate.toFixed(2)}/s, ` +
+          `horizon ${horizonSeconds.toFixed(0)}s, botEst ${(botExecMs/1000).toFixed(1)}s, ` +
+          `samples ${botSamplesCount}) — firing bot`,
       fireOpts: {
         growthRate:            effectiveGrowthRate,
         estimatedDrift,
-        predictedLanding:      Math.round(projectedLanding),
+        predictedLanding:      onsetOnly ? effectiveQueue + 1 : Math.round(projectedLanding),
         maxAcceptablePosition: maxAcceptable,
       },
     };
   }
 
   // ─── Wait ─────────────────────────────────────────────────────────────────
+  // Shadow mode: the onset rule WOULD have fired here — log it so a shadow
+  // morning can be replayed against actual landings before going live.
+  const shadowNote = ONSET_FIRE_SHADOW && onsetEligible
+    ? ` [ONSET-SHADOW: would fire early by ${onsetGap} ≤ cap ${ONSET_CAP}]`
+    : '';
   return {
     action:  'wait',
     reason:  'projected_below_target',
@@ -1775,7 +1851,7 @@ function evaluatePositionScheduler(state, ctx) {
     logLine: `[Pos] ${veh} — waiting (queue: ${effectiveQueue}${probeNote}, drift: ${estimatedDrift}, ` +
              `bias: ${biasCorrection.toFixed(1)}, projected: ${projectedLanding.toFixed(1)}${leadNote}, ` +
              `target: ${effectivePosition}, max: ${maxAcceptable}, ` +
-             `secsToFire: ${Number.isFinite(secondsUntilFire) ? secondsUntilFire.toFixed(0) : '∞'})`,
+             `secsToFire: ${Number.isFinite(secondsUntilFire) ? secondsUntilFire.toFixed(0) : '∞'})${shadowNote}`,
     metrics: {
       ...baseMetrics,
       queueSize:        waitingCount,
@@ -1832,6 +1908,8 @@ async function poll() {
       s.earlyJoinAtPosition = null;
       s.dispatchNotifyPending = false;
     }
+    // New day → fresh storm tracking (yesterday's onset must not leak forward).
+    onsetState = { active: false, quietTicks: 0, prevQueue: null, stepSeen: 0 };
     console.log('[Monitor] Daily reset — counters and visibility state cleared');
     broadcast('daily_reset', { date: currentDayPT });
 
@@ -2448,6 +2526,19 @@ async function poll() {
     : effectiveGrowthRate;
   const estimatedDrift = Math.max(POS_DRIFT_FLOOR, Math.ceil(driftRate * horizonSeconds));
 
+  // Storm-onset tracker — advanced exactly once per tick, shared by every
+  // per-driver decision below. Transition logs make shadow mornings auditable.
+  if (ONSET_FIRE_LIVE || ONSET_FIRE_SHADOW) {
+    const wasActive = onsetState.active;
+    onsetState = onsetStep(onsetState, { queue: waitingCount, rate: effectiveGrowthRate });
+    if (onsetState.active !== wasActive) {
+      console.log(onsetState.active
+        ? `[Pos] ⚡ storm ONSET detected (queue ${waitingCount}, rate ${effectiveGrowthRate.toFixed(2)}/s, ` +
+          `step +${onsetState.stepSeen}) — early fire ${ONSET_FIRE_LIVE ? 'ACTIVE' : 'SHADOW (log-only)'}, cap ${ONSET_CAP}`
+        : `[Pos] storm onset cleared (queue ${waitingCount}, rate ${effectiveGrowthRate.toFixed(2)}/s) — early fire disarmed`);
+    }
+  }
+
   // Context shared by every per-driver decision. Pure data — no module state.
   // isLockedOut is injected so evaluatePositionScheduler stays a pure function
   // (no singleton coupling) — tests can pass their own predicate.
@@ -2463,6 +2554,7 @@ async function poll() {
     queueShrinkageDetected,
     isLockedOut:             credentialLockout.isLockedOut,
     inBurstWindow,
+    onsetActive:             onsetState.active,
   };
 
   // Track the soonest fire across all armed drivers — drives adaptive polling.
@@ -3320,6 +3412,7 @@ function stopMonitor() {
   scheduleFn   = null;   // a stopped monitor can't be nudged back to life
   nudgePending = false;
   pollInFlight = false;
+  onsetState   = { active: false, quietTicks: 0, prevQueue: null, stepSeen: 0 };
   // Retire any borrowed probes so no real driver is left mid-cycle in the live
   // queue (syncRoster with active:false stops every loop and force-removes).
   if (BORROW_PROBE_ENABLED) {
@@ -3556,6 +3649,7 @@ module.exports = {
   _norm:                      norm,
   _isWithinOperatingHours:    isWithinOperatingHours,
   _evaluatePositionScheduler: evaluatePositionScheduler,
+  _onsetStep:                 onsetStep,
   _carryoverClearStep:        carryoverClearStep,
   _removeCarryoverLeftover:   removeCarryoverLeftover,
   _dropAndArmLeftover:        dropAndArmLeftover,

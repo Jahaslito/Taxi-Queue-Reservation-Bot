@@ -160,6 +160,20 @@ services:
       MONITOR_FLEET_PROBE:          ${MONITOR_FLEET_PROBE:-0}
       MONITOR_FLEET_PROBE_FRESH_MS: ${MONITOR_FLEET_PROBE_FRESH_MS:-8000}
       MONITOR_FLEET_PROBE_MAX_LEAD: ${MONITOR_FLEET_PROBE_MAX_LEAD:-40}
+      # Storm-onset early fire (07-08: competitor batch jumped 66→105 in one
+      # 5s render tick — every target in the gap fired born-over, +32…+50).
+      # Fires corridor drivers BEFORE the chunk when the onset signature shows
+      # (queue in zone + rate/step), spending bounded undershoot (≤ ONSET_CAP
+      # positions, enforced against a proven tail lower bound) to kill the
+      # unbounded overshoot. '0' off | 'shadow' log-only (run a morning first,
+      # grep ONSET-SHADOW) | '1' live.
+      MONITOR_ONSET_FIRE:        ${MONITOR_ONSET_FIRE:-0}
+      MONITOR_ONSET_ZONE_MIN:    ${MONITOR_ONSET_ZONE_MIN:-55}
+      MONITOR_ONSET_ZONE_MAX:    ${MONITOR_ONSET_ZONE_MAX:-90}
+      MONITOR_ONSET_RATE:        ${MONITOR_ONSET_RATE:-1.2}
+      MONITOR_ONSET_STEP:        ${MONITOR_ONSET_STEP:-8}
+      MONITOR_ONSET_CAP:         ${MONITOR_ONSET_CAP:-25}
+      MONITOR_ONSET_QUIET_TICKS: ${MONITOR_ONSET_QUIET_TICKS:-6}
       BOT_ARMED_MAX:             ${BOT_ARMED_MAX:-40}
       # Roster-scaled armed pool: BOT_ARMED_BROWSERS is the FLOOR; one extra
       # browser opens per BOT_ARMED_SESSIONS_PER_BROWSER armed sessions, up to

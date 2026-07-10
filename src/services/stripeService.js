@@ -145,21 +145,61 @@ async function createSetupSession({ customerId, driverId, successUrl, cancelUrl 
 }
 
 /**
+ * Pay EVERY open (finalized, awaiting-payment) invoice for a customer, on the
+ * given card. This is the single money-recovery primitive shared by both
+ * card-add paths (in-app reactivate + Billing-Portal card swap).
+ *
+ * Why "all open" and not just the subscription's latest_invoice: a driver can
+ * owe more than one missed renewal, and by the time they re-add a card the
+ * past_due invoice is often no longer `latest_invoice`. Collecting only the
+ * latest silently forgives the rest — the exact leak that gifted a free month.
+ *
+ * Per-invoice failures are caught and reported (not thrown) so one decline
+ * doesn't abandon the others; `allSettled` tells the caller whether the balance
+ * is now fully cleared. Idempotent: a paid invoice leaves the `open` set, so
+ * re-running is a safe no-op.
+ *
+ * @returns {{ attempted: number, paidCount: number, amountPaid: number, failed: number, allSettled: boolean }}
+ */
+async function payAllOpenInvoices(customerId, paymentMethodId) {
+  const stripe = getStripe();
+  const open   = await stripe.invoices.list({ customer: customerId, status: 'open', limit: 100 });
+
+  const result = { attempted: open.data.length, paidCount: 0, amountPaid: 0, failed: 0 };
+  for (const invoice of open.data) {
+    try {
+      const paid = await stripe.invoices.pay(
+        invoice.id,
+        paymentMethodId ? { payment_method: paymentMethodId } : {},
+      );
+      result.paidCount  += 1;
+      result.amountPaid += paid.amount_paid || 0;
+    } catch (err) {
+      result.failed += 1;
+      console.error(`[Stripe] Failed to pay invoice ${invoice.id} for ${customerId}: ${err.message}`);
+    }
+  }
+  result.allSettled = result.failed === 0;
+  return result;
+}
+
+/**
  * Settle a past_due subscription using the card just collected via a setup-mode
  * Checkout Session. Called from the webhook on `checkout.session.completed`.
  *
  * Steps:
  *   1. Resolve the new payment method from the completed SetupIntent.
  *   2. Make it the customer + subscription default (so future renewals use it).
- *   3. Pay the subscription's open invoice IMMEDIATELY — we don't wait for
- *      Stripe's dunning retries, the driver is charged the moment they add a card.
+ *   3. Pay ALL outstanding invoices IMMEDIATELY — we don't wait for Stripe's
+ *      dunning retries, the driver is charged the moment they add a card.
  *
- * Paying the open invoice transitions the subscription past_due → active, which
+ * Paying the open invoices transitions the subscription past_due → active, which
  * fires `invoice.payment_succeeded` + `customer.subscription.updated` — both
- * already handled to re-activate the driver. Throws on a declined charge so the
- * caller can log it (the subscription simply stays past_due, as before).
+ * already handled to re-activate the driver. Never throws on a decline; the
+ * result reports what settled so the caller/webhook can log it (the subscription
+ * simply stays past_due until the balance clears, as before).
  *
- * @returns {{ paymentMethodId: string, invoicePaid: boolean }}
+ * @returns {{ paymentMethodId: string, invoicePaid: boolean, attempted: number, paidCount: number, amountPaid: number, failed: number, allSettled: boolean }}
  */
 async function reactivateFromSetupIntent({ customerId, subscriptionId, setupIntentId }) {
   const stripe = getStripe();
@@ -173,21 +213,15 @@ async function reactivateFromSetupIntent({ customerId, subscriptionId, setupInte
     invoice_settings: { default_payment_method: paymentMethodId },
   });
 
-  if (!subscriptionId) return { paymentMethodId, invoicePaid: false };
-
-  await stripe.subscriptions.update(subscriptionId, {
-    default_payment_method: paymentMethodId,
-  });
-
-  // Settle the outstanding invoice now, on this card.
-  const sub     = await stripe.subscriptions.retrieve(subscriptionId, { expand: ['latest_invoice'] });
-  const invoice = sub.latest_invoice;
-  if (invoice && invoice.status === 'open') {
-    await stripe.invoices.pay(invoice.id, { payment_method: paymentMethodId });
-    return { paymentMethodId, invoicePaid: true };
+  if (subscriptionId) {
+    await stripe.subscriptions.update(subscriptionId, {
+      default_payment_method: paymentMethodId,
+    });
   }
 
-  return { paymentMethodId, invoicePaid: false };
+  // Settle the entire outstanding balance now, on this card.
+  const result = await payAllOpenInvoices(customerId, paymentMethodId);
+  return { paymentMethodId, invoicePaid: result.paidCount > 0, ...result };
 }
 
 /**
@@ -254,6 +288,7 @@ module.exports = {
   createCustomer,
   createCheckoutSession,
   createSetupSession,
+  payAllOpenInvoices,
   reactivateFromSetupIntent,
   retrieveCheckoutSession,
   createPortalSession,

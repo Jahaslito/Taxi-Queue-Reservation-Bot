@@ -9,11 +9,12 @@
 //   customer.subscription.deleted      → subscription cancelled
 //   invoice.payment_succeeded / paid   → payment succeeded → ensure status = active
 //   invoice.payment_failed             → payment failed → status = past_due
-//   payment_method.attached            → card added via portal → lift card lock
+//   payment_method.attached            → card added/updated via portal → pay any
+//                                         open invoices, then lift card lock
 
 const express = require('express');
 const Driver  = require('../models/Driver');
-const { constructWebhookEvent, retrieveSubscription, reactivateFromSetupIntent } = require('../services/stripeService');
+const { constructWebhookEvent, retrieveSubscription, reactivateFromSetupIntent, payAllOpenInvoices } = require('../services/stripeService');
 const { sendPaymentFailedEmail } = require('../services/emailService');
 
 const router = express.Router();
@@ -147,13 +148,30 @@ router.post(
         }
 
         // Fires when a driver adds a card via the Billing Portal without a new
-        // checkout (e.g. updating their payment method). Lift the lock too.
+        // checkout (e.g. updating their payment method).
         case 'payment_method.attached': {
           const pm     = event.data.object;
           const driver = await Driver.findByStripeCustomerId(pm.customer);
           if (!driver) break;
-          if (!driver.card_required_by && driver.is_active) break; // nothing to lift
 
+          // Sweep every OPEN invoice with the new card FIRST. A portal card-swap
+          // must never reactivate a driver while a past_due renewal goes
+          // uncollected — that silently gifts a free month (the leak this fixes).
+          // Each successful payment fires invoice.payment_succeeded, which flips
+          // the driver back to active via the handler above; so we don't set the
+          // status here, we only lift the card-enforcement lock below.
+          try {
+            const swept = await payAllOpenInvoices(pm.customer, pm.id);
+            if (swept.attempted > 0) {
+              console.log(`[Stripe Webhook] Driver ${driver.id} payment_method.attached — settled ${swept.paidCount}/${swept.attempted} open invoice(s) ($${(swept.amountPaid / 100).toFixed(2)})${swept.allSettled ? '' : ' — balance NOT fully cleared'}`);
+            }
+          } catch (err) {
+            console.error(`[Stripe Webhook] Driver ${driver.id} payment_method.attached — invoice sweep failed:`, err.message);
+          }
+
+          // Lift a card-enforcement lock (card_required cohort). Reactivation
+          // from past_due is driven by the invoice.payment_succeeded events above.
+          if (!driver.card_required_by && driver.is_active) break; // nothing to lift
           await Driver.update(driver.id, { is_active: true, card_required_by: null });
           console.log(`[Stripe Webhook] Driver ${driver.id} payment_method.attached → card lock lifted`);
           break;

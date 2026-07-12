@@ -86,10 +86,14 @@ services:
       STRIPE_SECRET_KEY:      ${STRIPE_SECRET_KEY:-}
       STRIPE_PRICE_ID:        ${STRIPE_PRICE_ID:-}
       STRIPE_WEBHOOK_SECRET:  ${STRIPE_WEBHOOK_SECRET:-}
+      # Free-trial length for NEW sign-ups, in days. Unset/0 = NO free trial
+      # (card charged at Checkout). Set to 14 to restore the classic 14-day
+      # trial — no code deploy needed.
+      TRIAL_PERIOD_DAYS:      ${TRIAL_PERIOD_DAYS:-0}
       # Epoch (seconds) until which new sign-ups get an extended trial that
       # clears the existing-subscriber pause window. Leave unset for normal
-      # billing — empty string parses to 0 and the code falls through to the
-      # default 14-day trial. Paired with scripts/pause-subscriptions.js.
+      # billing — empty string parses to 0. Only affects sign-ups when a trial
+      # is enabled (TRIAL_PERIOD_DAYS>0). Paired with scripts/pause-subscriptions.js.
       STRIPE_PAUSE_UNTIL:     ${STRIPE_PAUSE_UNTIL:-}
       BILLING_ENABLED:        ${BILLING_ENABLED:-true}
 
@@ -167,13 +171,21 @@ services:
       # positions, enforced against a proven tail lower bound) to kill the
       # unbounded overshoot. '0' off | 'shadow' log-only (run a morning first,
       # grep ONSET-SHADOW) | '1' live.
+      # Ramp-tuned thresholds (07-10/07-11 forensics: both storms' trigger
+      # steps happened BELOW the old zone floor 55 / step 8 — onset armed 6-11s
+      # late, at the 12-15/s peak instead of the ramp). Calm mornings are
+      # protected by the DYNAMIC cap: allowance = min(CAP, max(10, 2×biggest
+      # recent render step)) — a lone +5 flurry unlocks only ~10 early (normal
+      # lead, no extra undershoot); real chunks unlock the full cap in one
+      # render. QUIET_MS replaces the retired MONITOR_ONSET_QUIET_TICKS (the
+      # detector is render-aware now; delete QUIET_TICKS from .env if present).
       MONITOR_ONSET_FIRE:        ${MONITOR_ONSET_FIRE:-0}
-      MONITOR_ONSET_ZONE_MIN:    ${MONITOR_ONSET_ZONE_MIN:-55}
+      MONITOR_ONSET_ZONE_MIN:    ${MONITOR_ONSET_ZONE_MIN:-40}
       MONITOR_ONSET_ZONE_MAX:    ${MONITOR_ONSET_ZONE_MAX:-90}
       MONITOR_ONSET_RATE:        ${MONITOR_ONSET_RATE:-1.2}
-      MONITOR_ONSET_STEP:        ${MONITOR_ONSET_STEP:-8}
+      MONITOR_ONSET_STEP:        ${MONITOR_ONSET_STEP:-5}
       MONITOR_ONSET_CAP:         ${MONITOR_ONSET_CAP:-25}
-      MONITOR_ONSET_QUIET_TICKS: ${MONITOR_ONSET_QUIET_TICKS:-6}
+      MONITOR_ONSET_QUIET_MS:    ${MONITOR_ONSET_QUIET_MS:-25000}
       BOT_ARMED_MAX:             ${BOT_ARMED_MAX:-40}
       # Roster-scaled armed pool: BOT_ARMED_BROWSERS is the FLOOR; one extra
       # browser opens per BOT_ARMED_SESSIONS_PER_BROWSER armed sessions, up to

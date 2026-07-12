@@ -1,37 +1,31 @@
 /**
  * Storm-onset early fire (MONITOR_ONSET_FIRE) — the anti-batch-add lever.
  *
- * 2026-07-08: a competitor batch jumped the displayed queue 66→105 inside one
- * 5 s render tick; every target in the jumped gap (78–113) fired born-over and
- * landed +32…+50. Level-triggered firing cannot beat an intra-tick chunk, so
- * this rule fires corridor drivers the moment the onset SIGNATURE appears
- * (queue in the position-locked onset zone + rate/step), spending bounded
- * undershoot: fire only while target − effectiveQueue ≤ ONSET_CAP, where
- * effectiveQueue is a proven lower bound of the true tail — so the worst case
- * (storm dies on the click) lands at target − ONSET_CAP at the earliest.
- *
- * These tests pin:
- *   1. onsetStep — arms only inside the zone on the signature, survives the
- *      storm, disarms after the quiet-tick cooldown.
- *   2. Live mode: eligible corridor drivers fire early (reason onset_early_fire);
- *      drivers whose gap exceeds the cap are HELD; calm ticks are unchanged.
- *   3. Shadow mode: never fires — annotates the wait line for replay.
- *   4. 07-08 replay shape: at the pre-step tick (queue 66) targets 78/90 fire
- *      early, target 113 holds, then fires normally at the 105 step.
+ * v2 (2026-07-11): detector is RENDER-aware and ramp-tuned, with a dynamic
+ * calm-guard cap. Forensics behind the changes:
+ *   • 07-10: the +10 trigger step happened at q54 — one position below the old
+ *     ZONE_MIN=55 — onset armed 6 s late, at the 15/s peak.
+ *   • 07-11: the ramp's first acceleration was +5 at q41, below both old
+ *     thresholds (zone 55, step 8) — armed 11 s late at 12/s.
+ *   • 07-09: quiet-TICK counting disarmed mid-storm (display renders every
+ *     ~5 s; 4 of 5 polls look calm between renders) — quiet is now TIME-based.
+ *   • Calm guard: allowance = min(CAP, max(POS_MAX_LEAD, 2 × biggest render
+ *     step in the last 20 s)) — a lone +5 calm flurry unlocks only ~10 early
+ *     (the normal lead: no extra undershoot), real chunks unlock the full cap.
  *
  * Flags are read at module load; jest.isolateModules gives shadow its own copy.
  */
 
-process.env.MONITOR_ONSET_FIRE       = '1';
-process.env.MONITOR_ONSET_ZONE_MIN   = '55';
-process.env.MONITOR_ONSET_ZONE_MAX   = '90';
-process.env.MONITOR_ONSET_RATE       = '1.2';
-process.env.MONITOR_ONSET_STEP       = '8';
-process.env.MONITOR_ONSET_CAP        = '25';
-process.env.MONITOR_ONSET_QUIET_TICKS = '3';
+process.env.MONITOR_ONSET_FIRE     = '1';
+process.env.MONITOR_ONSET_ZONE_MIN = '40';
+process.env.MONITOR_ONSET_ZONE_MAX = '90';
+process.env.MONITOR_ONSET_RATE     = '1.2';
+process.env.MONITOR_ONSET_STEP     = '5';
+process.env.MONITOR_ONSET_CAP      = '25';
+process.env.MONITOR_ONSET_QUIET_MS = '25000';
 
 const monitor = require('../../src/services/monitorService');
-const { _evaluatePositionScheduler, _onsetStep } = monitor;
+const { _evaluatePositionScheduler, _onsetStep, _onsetCapNow } = monitor;
 
 const makeState = (target, over = {}) => ({
   driverId: 42,
@@ -58,34 +52,74 @@ const ctx = (waitingCount, over = {}) => ({
   ...over,
 });
 
-const fresh = () => ({ active: false, quietTicks: 0, prevQueue: null, stepSeen: 0 });
+const fresh = () => ({ active: false, prevQueue: null, lastEvidenceMs: 0, recentSteps: [], stepSeen: 0 });
+const T0 = 1_700_000_000_000;
 
-describe('onsetStep — storm-onset tracker', () => {
-  test('arms inside the zone on a step ≥ threshold', () => {
-    let st = _onsetStep(fresh(), { queue: 57, rate: 0.5 });   // prime prevQueue
-    st = _onsetStep(st, { queue: 66, rate: 0.9 });            // +9 step in zone
+describe('onsetStep — render-aware storm-onset tracker', () => {
+  test('arms inside the zone on a render step ≥ threshold (07-11 ramp: +5 at q41)', () => {
+    let st = _onsetStep(fresh(), { queue: 36, rate: 0.4, nowMs: T0 });     // prime prevQueue
+    st = _onsetStep(st, { queue: 41, rate: 0.9, nowMs: T0 + 5000 });      // +5 render in zone
     expect(st.active).toBe(true);
   });
 
   test('arms inside the zone on sustained rate', () => {
-    let st = _onsetStep(fresh(), { queue: 60, rate: 1.5 });
+    let st = _onsetStep(fresh(), { queue: 60, rate: 1.5, nowMs: T0 });
     expect(st.active).toBe(true);
   });
 
   test('does NOT arm outside the zone (calm early queue, deep storm alike)', () => {
-    expect(_onsetStep(fresh(), { queue: 30, rate: 5 }).active).toBe(false);
-    expect(_onsetStep(fresh(), { queue: 200, rate: 5 }).active).toBe(false);
+    let low = _onsetStep(fresh(), { queue: 20, rate: 5, nowMs: T0 });
+    low = _onsetStep(low, { queue: 30, rate: 5, nowMs: T0 + 5000 });      // +10 but q < 40
+    expect(low.active).toBe(false);
+    let deep = _onsetStep(fresh(), { queue: 150, rate: 5, nowMs: T0 });
+    deep = _onsetStep(deep, { queue: 190, rate: 5, nowMs: T0 + 5000 });   // +40 but q > 90
+    expect(deep.active).toBe(false);
   });
 
-  test('stays armed through the storm, disarms after quiet ticks', () => {
-    let st = _onsetStep(fresh(), { queue: 60, rate: 2.0 });
-    st = _onsetStep(st, { queue: 105, rate: 8.0 });           // storm running, out of zone
+  test('unchanged display between renders is NOT calm evidence (no tick decay)', () => {
+    let st = _onsetStep(fresh(), { queue: 41, rate: 0.5, nowMs: T0 });
+    st = _onsetStep(st, { queue: 51, rate: 2.0, nowMs: T0 + 5000 });      // armed
+    for (let i = 1; i <= 20; i++) {                                       // 20 s of flat 1 s polls
+      st = _onsetStep(st, { queue: 51, rate: 0.1, nowMs: T0 + 5000 + i * 1000 });
+    }
+    expect(st.active).toBe(true);                                          // < QUIET_MS — still armed
+  });
+
+  test('stays armed while the storm runs OUT of the zone (07-09 mid-storm fix)', () => {
+    let st = _onsetStep(fresh(), { queue: 41, rate: 0.5, nowMs: T0 });
+    st = _onsetStep(st, { queue: 56, rate: 2, nowMs: T0 + 5000 });        // armed in zone
+    st = _onsetStep(st, { queue: 149, rate: 8, nowMs: T0 + 15000 });      // +93 step, out of zone
+    st = _onsetStep(st, { queue: 186, rate: 8, nowMs: T0 + 21000 });
     expect(st.active).toBe(true);
-    st = _onsetStep(st, { queue: 105, rate: 0.1 });           // quiet 1
-    st = _onsetStep(st, { queue: 105, rate: 0.1 });           // quiet 2
-    expect(st.active).toBe(true);
-    st = _onsetStep(st, { queue: 105, rate: 0.1 });           // quiet 3 → cooldown
+  });
+
+  test('disarms after QUIET_MS without storm evidence', () => {
+    let st = _onsetStep(fresh(), { queue: 41, rate: 0.5, nowMs: T0 });
+    st = _onsetStep(st, { queue: 51, rate: 2.0, nowMs: T0 + 5000 });      // armed
+    st = _onsetStep(st, { queue: 52, rate: 0.1, nowMs: T0 + 5000 + 26000 }); // +1 render, 26 s later
     expect(st.active).toBe(false);
+  });
+});
+
+describe('dynamic calm-guard cap (onsetCapNow)', () => {
+  test('a lone +5 calm flurry unlocks only the normal lead (10)', () => {
+    let st = _onsetStep(fresh(), { queue: 41, rate: 0.3, nowMs: T0 });
+    st = _onsetStep(st, { queue: 46, rate: 0.3, nowMs: T0 + 5000 });      // +5 → armed
+    expect(st.active).toBe(true);
+    expect(_onsetCapNow(st)).toBe(10);                                     // max(10, 2×5) = 10
+  });
+
+  test('a real chunk unlocks the full cap within one render', () => {
+    let st = _onsetStep(fresh(), { queue: 43, rate: 0.5, nowMs: T0 });
+    st = _onsetStep(st, { queue: 56, rate: 3, nowMs: T0 + 5000 });        // +13 → 2×13 = 26 → clamp 25
+    expect(_onsetCapNow(st)).toBe(25);
+  });
+
+  test('stale violence ages out of the cap window', () => {
+    let st = _onsetStep(fresh(), { queue: 43, rate: 0.5, nowMs: T0 });
+    st = _onsetStep(st, { queue: 56, rate: 3, nowMs: T0 + 5000 });        // +13
+    st = _onsetStep(st, { queue: 57, rate: 3, nowMs: T0 + 26000 });       // +1; the +13 is 21 s old
+    expect(_onsetCapNow(st)).toBe(10);                                     // only max(10, 2×1)
   });
 });
 
@@ -104,13 +138,21 @@ describe('onset early fire — live mode', () => {
     expect(d.action).toBe('wait'); // 113 − 66 = 47 > 25 → hold
   });
 
+  test('scheduler honours the DYNAMIC cap from ctx (calm-guard end to end)', () => {
+    const held = _evaluatePositionScheduler(makeState(85), ctx(66, { onsetActive: true, onsetCap: 10 }));
+    expect(held.action).toBe('wait');                       // gap 19 > calm cap 10
+    const fired = _evaluatePositionScheduler(makeState(75), ctx(66, { onsetActive: true, onsetCap: 10 }));
+    expect(fired.reason).toBe('onset_early_fire');          // gap 9 ≤ 10 ≈ normal lead
+    expect(fired.logLine).toMatch(/early by 9 ≤ cap 10/);
+  });
+
   test('no onset → identical to today (waits)', () => {
     const d = _evaluatePositionScheduler(makeState(90), ctx(66, { onsetActive: false }));
     expect(d.action).toBe('wait');
     expect(d.logLine).not.toMatch(/ONSET/);
   });
 
-  test('07-08 replay shape: held driver fires normally once the step reveals it', () => {
+  test('07-08 replay shape: held driver fires the moment the step closes his gap', () => {
     // Pre-step tick (queue 66, onset active): 78 and 90 go early, 113 holds.
     expect(_evaluatePositionScheduler(makeState(78),  ctx(66, { onsetActive: true })).reason).toBe('onset_early_fire');
     expect(_evaluatePositionScheduler(makeState(90),  ctx(66, { onsetActive: true })).reason).toBe('onset_early_fire');

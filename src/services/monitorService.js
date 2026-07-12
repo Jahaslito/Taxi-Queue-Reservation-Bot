@@ -172,20 +172,38 @@ const PREARM_QUEUE_POS  = parseInt(process.env.MONITOR_PREARM_QUEUE_POS ?? '45',
 // worst case (storm dies the instant we click) lands the driver at the
 // estimate itself: undershoot ≤ ONSET_CAP by construction.
 //   MONITOR_ONSET_FIRE:  '0' off (default) | 'shadow' log-only | '1' live
-//   Onset signature: queue inside [ZONE_MIN, ZONE_MAX] (storms are position-
-//   locked: onset 60–85 every observed morning) AND (sustained rate ≥
-//   ONSET_RATE or a single-tick step ≥ ONSET_STEP — 07-08 pre-step read
-//   45→50→57→66, ~1.4/s, one full tick before the +39).
-//   ONSET_QUIET_TICKS calm ticks in a row disarm it (false-alarm cutoff).
+//   Onset signature: queue inside [ZONE_MIN, ZONE_MAX] AND (sustained rate ≥
+//   ONSET_RATE or a RENDER step ≥ ONSET_STEP). Thresholds are tuned to the
+//   RAMP, not the peak (07-10: the +10 trigger step happened at q54, one
+//   position below the old ZONE_MIN=55 — onset armed 6 s late at 15/s; 07-11:
+//   the ramp's first acceleration was +5 at q41, below both old thresholds —
+//   armed 11 s late at 12/s; being those seconds earlier in SAN's processing
+//   line is the difference between landing on target and +40).
+//
+//   CALM-MORNING GUARD (dynamic cap): the early-fire allowance in force at any
+//   instant is  min(ONSET_CAP, max(POS_MAX_LEAD, 2 × biggest render step of
+//   the last ONSET_EVIDENCE_WINDOW_MS))  — a lone +5 flurry on a calm morning
+//   unlocks only ~10 early (≈ the normal lead: no extra undershoot spent),
+//   while a real chunk (+10…+42) unlocks the full cap within one render.
+//
+//   The detector is RENDER-aware: SAN's display only changes every ~5 s, so
+//   steps are measured between display CHANGES, and the false-alarm cutoff is
+//   time-based (ONSET_QUIET_MS without storm evidence → disarm) instead of
+//   counting 1 s poll ticks, 4 of every 5 of which look calm between renders
+//   (the bug that force-disarmed mid-storm on 07-09 and needed the
+//   QUIET_TICKS=12 band-aid — MONITOR_ONSET_QUIET_TICKS is now retired).
 const ONSET_FIRE_MODE   = String(process.env.MONITOR_ONSET_FIRE ?? '0').toLowerCase();
 const ONSET_FIRE_LIVE   = ONSET_FIRE_MODE === '1';
 const ONSET_FIRE_SHADOW = ONSET_FIRE_MODE === 'shadow';
-const ONSET_ZONE_MIN    = parseInt(process.env.MONITOR_ONSET_ZONE_MIN ?? '55', 10);
+const ONSET_ZONE_MIN    = parseInt(process.env.MONITOR_ONSET_ZONE_MIN ?? '40', 10);
 const ONSET_ZONE_MAX    = parseInt(process.env.MONITOR_ONSET_ZONE_MAX ?? '90', 10);
 const ONSET_RATE        = parseFloat(process.env.MONITOR_ONSET_RATE   ?? '1.2');
-const ONSET_STEP        = parseInt(process.env.MONITOR_ONSET_STEP     ?? '8', 10);
+const ONSET_STEP        = parseInt(process.env.MONITOR_ONSET_STEP     ?? '5', 10);
 const ONSET_CAP         = parseInt(process.env.MONITOR_ONSET_CAP      ?? '25', 10);
-const ONSET_QUIET_TICKS = parseInt(process.env.MONITOR_ONSET_QUIET_TICKS ?? '6', 10);
+const ONSET_QUIET_MS    = parseInt(process.env.MONITOR_ONSET_QUIET_MS ?? '25000', 10);
+// Render steps older than this no longer describe the storm's current violence
+// (drives the dynamic cap above). Internal — ~4 render cycles.
+const ONSET_EVIDENCE_WINDOW_MS = 20000;
 // Sacrificial tail probe (default OFF) — dedicated vehicle add→read→remove
 // cycles during the storm feed exact true-tail samples to the fleet probe.
 // See tailProbeService.js for the full rationale and safety rails.
@@ -553,27 +571,49 @@ let lastFleetLanding   = { position: 0, atMs: 0 };
 
 // ─── Storm-onset tracker (MONITOR_ONSET_FIRE) ────────────────────────────────
 // One instance per process, advanced once per poll tick with that tick's queue
-// count and smoothed growth rate. Pure step function (exported for tests):
-// arms when the onset signature appears inside the onset zone, stays armed
-// while the storm keeps moving, disarms after ONSET_QUIET_TICKS calm ticks.
-let onsetState = { active: false, quietTicks: 0, prevQueue: null, stepSeen: 0 };
+// count and smoothed growth rate. Pure step function (exported for tests).
+//
+// RENDER-aware: SAN's display changes every ~5 s while we poll at 1 s, so a
+// "step" only exists when the displayed value CHANGES; between renders the
+// tracker neither gains evidence nor decays. Arming needs the signature inside
+// the zone; once armed it stays armed while storm evidence keeps arriving
+// (any render step ≥ ONSET_STEP or rate ≥ ONSET_RATE, zone no longer required
+// — the storm has left the zone by definition), and disarms after
+// ONSET_QUIET_MS without evidence. recentSteps (pruned to
+// ONSET_EVIDENCE_WINDOW_MS) drives the dynamic calm-guard cap.
+const freshOnsetState = () => ({
+  active: false, prevQueue: null, lastEvidenceMs: 0, recentSteps: [], stepSeen: 0,
+});
+let onsetState = freshOnsetState();
 
-function onsetStep(st, { queue, rate }) {
-  const step     = st.prevQueue !== null ? Math.max(0, queue - st.prevQueue) : 0;
-  const storming = rate >= ONSET_RATE || step >= ONSET_STEP;
-  let { active, quietTicks } = st;
-  if (!active) {
-    if (queue >= ONSET_ZONE_MIN && queue <= ONSET_ZONE_MAX && storming) {
-      active     = true;
-      quietTicks = 0;
-    }
-  } else if (storming) {
-    quietTicks = 0;
-  } else {
-    quietTicks += 1;
-    if (quietTicks >= ONSET_QUIET_TICKS) { active = false; quietTicks = 0; }
+function onsetStep(st, { queue, rate, nowMs = Date.now() }) {
+  const changed = st.prevQueue !== null && queue !== st.prevQueue;
+  const step    = changed ? Math.max(0, queue - st.prevQueue) : 0;
+
+  const recentSteps = st.recentSteps
+    .filter((s) => nowMs - s.t <= ONSET_EVIDENCE_WINDOW_MS)
+    .concat(step > 0 ? [{ t: nowMs, step }] : []);
+
+  const evidence = step >= ONSET_STEP || rate >= ONSET_RATE;
+  let { active, lastEvidenceMs } = st;
+
+  if (evidence && (active || (queue >= ONSET_ZONE_MIN && queue <= ONSET_ZONE_MAX))) {
+    active         = true;
+    lastEvidenceMs = nowMs;
+  } else if (active && nowMs - lastEvidenceMs > ONSET_QUIET_MS) {
+    active = false;
   }
-  return { active, quietTicks, prevQueue: queue, stepSeen: step };
+
+  return { active, prevQueue: queue, lastEvidenceMs, recentSteps, stepSeen: step };
+}
+
+/** Calm-morning guard: the early-fire allowance actually in force. Scales with
+ *  the storm's observed violence — a lone +5 calm-day flurry unlocks only the
+ *  normal lead (~10, i.e. no extra undershoot), a real chunk unlocks the full
+ *  cap. Never exceeds ONSET_CAP, so the contract bound is unchanged. */
+function onsetCapNow(st) {
+  const maxStep = st.recentSteps.reduce((m, s) => Math.max(m, s.step), 0);
+  return Math.min(ONSET_CAP, Math.max(POS_MAX_LEAD, 2 * maxStep));
 }
 function recordFleetLanding(position) {
   if (!Number.isFinite(position) || position <= 0) return;
@@ -1605,6 +1645,7 @@ function evaluatePositionScheduler(state, ctx) {
     inBurstWindow           = false,
     maxLeadPositions        = POS_MAX_LEAD,
     onsetActive             = false,
+    onsetCap                = ONSET_CAP, // dynamic calm-guard cap — see onsetCapNow
   } = ctx;
 
   // Inactive drivers have no business being scheduled. isActive is synced to the
@@ -1800,7 +1841,7 @@ function evaluatePositionScheduler(state, ctx) {
   // eligible before the display step ever shows it.
   const onsetGap      = effectivePosition - effectiveQueue;
   const onsetEligible = (ONSET_FIRE_LIVE || ONSET_FIRE_SHADOW)
-    && onsetActive && onsetGap > 0 && onsetGap <= ONSET_CAP;
+    && onsetActive && onsetGap > 0 && onsetGap <= onsetCap;
 
   const projectionReached = projectedLanding >= effectivePosition;
   const shouldFire        = projectionReached || (ONSET_FIRE_LIVE && onsetEligible);
@@ -1822,7 +1863,7 @@ function evaluatePositionScheduler(state, ctx) {
       secondsUntilFire: onsetOnly ? 0 : secondsUntilFire,
       logLine: onsetOnly
         ? `[Pos] ${veh} — ⚡ ONSET early fire: queue ${effectiveQueue}${probeNote}, target ${effectivePosition} ` +
-          `(early by ${onsetGap} ≤ cap ${ONSET_CAP}, rate ${effectiveGrowthRate.toFixed(2)}/s) — firing before the chunk`
+          `(early by ${onsetGap} ≤ cap ${onsetCap}, rate ${effectiveGrowthRate.toFixed(2)}/s) — firing before the chunk`
         : `[Pos] ${veh} — ✓ queue ${effectiveQueue}${probeNote} + lead ${Number.isInteger(lead) ? lead : lead.toFixed(1)}` +
           `${leadNote ? leadNote : ` (drift ${estimatedDrift}${biasCorrection !== 0 ? ` + bias ${biasCorrection.toFixed(1)}` : ''})`} ` +
           `= ${projectedLanding.toFixed(1)} ≥ target ${effectivePosition} ` +
@@ -1842,7 +1883,7 @@ function evaluatePositionScheduler(state, ctx) {
   // Shadow mode: the onset rule WOULD have fired here — log it so a shadow
   // morning can be replayed against actual landings before going live.
   const shadowNote = ONSET_FIRE_SHADOW && onsetEligible
-    ? ` [ONSET-SHADOW: would fire early by ${onsetGap} ≤ cap ${ONSET_CAP}]`
+    ? ` [ONSET-SHADOW: would fire early by ${onsetGap} ≤ cap ${onsetCap}]`
     : '';
   return {
     action:  'wait',
@@ -1909,7 +1950,7 @@ async function poll() {
       s.dispatchNotifyPending = false;
     }
     // New day → fresh storm tracking (yesterday's onset must not leak forward).
-    onsetState = { active: false, quietTicks: 0, prevQueue: null, stepSeen: 0 };
+    onsetState = freshOnsetState();
     console.log('[Monitor] Daily reset — counters and visibility state cleared');
     broadcast('daily_reset', { date: currentDayPT });
 
@@ -2534,7 +2575,8 @@ async function poll() {
     if (onsetState.active !== wasActive) {
       console.log(onsetState.active
         ? `[Pos] ⚡ storm ONSET detected (queue ${waitingCount}, rate ${effectiveGrowthRate.toFixed(2)}/s, ` +
-          `step +${onsetState.stepSeen}) — early fire ${ONSET_FIRE_LIVE ? 'ACTIVE' : 'SHADOW (log-only)'}, cap ${ONSET_CAP}`
+          `step +${onsetState.stepSeen}) — early fire ${ONSET_FIRE_LIVE ? 'ACTIVE' : 'SHADOW (log-only)'}, ` +
+          `cap ${onsetCapNow(onsetState)} of ${ONSET_CAP} (scales with observed step size)`
         : `[Pos] storm onset cleared (queue ${waitingCount}, rate ${effectiveGrowthRate.toFixed(2)}/s) — early fire disarmed`);
     }
   }
@@ -2555,6 +2597,7 @@ async function poll() {
     isLockedOut:             credentialLockout.isLockedOut,
     inBurstWindow,
     onsetActive:             onsetState.active,
+    onsetCap:                onsetCapNow(onsetState),
   };
 
   // Track the soonest fire across all armed drivers — drives adaptive polling.
@@ -2989,25 +3032,28 @@ async function addWatch(driverId, { isAuto = false, _ctx = null } = {}) {
 }
 
 /**
- * Remove a driver from the manual watch list.
- * If they are also auto-watched, they stay in the watches Map (Watchlist still
- * shows them) — only the Monitor page card is removed.
+ * Stop watching a driver — the admin "Stop Watching" action.
+ *
+ * Fully removes the driver from the monitor: clears BOTH the manual pin and the
+ * auto-watch and deletes the in-memory state, so the bot stops servicing them
+ * immediately. Previously an auto-watched (active) driver was only unpinned and
+ * kept in `watches`, so "Stop Watching" removed the Monitor card but the bot
+ * kept running — the button appeared to do nothing.
+ *
+ * For an active subscriber, the periodic refreshAutoWatches will legitimately
+ * re-add them within AUTO_REFRESH_MS (that's the paid service resuming). To keep
+ * a driver stopped, lock (past_due) or deactivate them — the refresh gate then
+ * keeps them out permanently.
  */
 function removeWatch(driverId) {
   const state = watches.get(driverId);
   if (!state) return false;
 
+  watches.delete(driverId);
+  autoDriverIds.delete(driverId);
   manualWatchIds.delete(driverId);
-
-  if (autoDriverIds.has(driverId)) {
-    // Still auto-watched — keep in the watches Map, just remove the Monitor card
-    broadcast('watch_removed', { driverId, vehicleNumber: state.vehicleNumber });
-    console.log(`[Monitor] Unpinned #${state.vehicleNumber} from Monitor (still auto-watched)`);
-  } else {
-    watches.delete(driverId);
-    broadcast('watch_removed', { driverId, vehicleNumber: state.vehicleNumber });
-    console.log(`[Monitor] Stopped watching #${state.vehicleNumber}`);
-  }
+  broadcast('watch_removed', { driverId, vehicleNumber: state.vehicleNumber });
+  console.log(`[Monitor] Stopped watching #${state.vehicleNumber}`);
   return true;
 }
 
@@ -3224,21 +3270,21 @@ async function refreshAutoWatches() {
       }
     }
 
-    // Remove auto-watches for drivers who are no longer active.
-    // If they were also manually pinned, keep them in watches but clear the auto flag.
+    // Evict every watched driver who is no longer serviceable. findAllActive
+    // (subscription_status ∈ active/trialing AND is_active) is AUTHORITATIVE — a
+    // manual Monitor-page pin must NOT keep the bot running for a driver whose
+    // subscription lapsed (past_due/canceled) or who was deactivated. Otherwise a
+    // pin silently bypasses the billing lock (a past_due driver kept being
+    // serviced because monitor_enabled=true). So we sweep ALL watches, not just
+    // auto ones, and clear both flags together.
     let removed = 0;
-    for (const driverId of [...autoDriverIds]) {
+    for (const driverId of [...watches.keys()]) {
       if (!activeIds.has(driverId)) {
+        const s = watches.get(driverId);
+        watches.delete(driverId);
         autoDriverIds.delete(driverId);
-        if (manualWatchIds.has(driverId)) {
-          // Keep in watches — still manually pinned on Monitor page
-          const s = watches.get(driverId);
-          if (s) s.isAuto = false;
-        } else {
-          const s = watches.get(driverId);
-          watches.delete(driverId);
-          if (s) broadcast('watch_removed', { driverId, vehicleNumber: s.vehicleNumber });
-        }
+        manualWatchIds.delete(driverId);
+        if (s) broadcast('watch_removed', { driverId, vehicleNumber: s.vehicleNumber });
         removed++;
       }
     }
@@ -3412,7 +3458,7 @@ function stopMonitor() {
   scheduleFn   = null;   // a stopped monitor can't be nudged back to life
   nudgePending = false;
   pollInFlight = false;
-  onsetState   = { active: false, quietTicks: 0, prevQueue: null, stepSeen: 0 };
+  onsetState   = freshOnsetState();
   // Retire any borrowed probes so no real driver is left mid-cycle in the live
   // queue (syncRoster with active:false stops every loop and force-removes).
   if (BORROW_PROBE_ENABLED) {
@@ -3650,6 +3696,7 @@ module.exports = {
   _isWithinOperatingHours:    isWithinOperatingHours,
   _evaluatePositionScheduler: evaluatePositionScheduler,
   _onsetStep:                 onsetStep,
+  _onsetCapNow:               onsetCapNow,
   _carryoverClearStep:        carryoverClearStep,
   _removeCarryoverLeftover:   removeCarryoverLeftover,
   _dropAndArmLeftover:        dropAndArmLeftover,

@@ -32,34 +32,53 @@ async function createCustomer(driver) {
   });
 }
 
-const DEFAULT_TRIAL_DAYS = 14;
+// Length of the free trial for NEW sign-ups, in days. Env-driven (read at
+// call-time) so the trial can be turned off (or restored) without a code deploy:
+//   • TRIAL_PERIOD_DAYS unset or 0 → NO free trial: the card is charged at
+//     Checkout, exactly like the `skipTrial` (grandfathered/reactivation) path.
+//   • TRIAL_PERIOD_DAYS=14         → the classic 14-day free trial.
+// Non-numeric / negative values coerce to 0 (trial off) — the safe default.
+function trialPeriodDays() {
+  const n = parseInt(process.env.TRIAL_PERIOD_DAYS ?? '0', 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
 
 /**
  * Compute the trial config for a Checkout Session.
  *
- * Default: 14-day trial via `trial_period_days`. Stripe collects card details
- * upfront but charges nothing until day 15.
+ * Trial OFF (`TRIAL_PERIOD_DAYS` unset/0, the current default): behaves exactly
+ * like `skipTrialConfig` — the card is charged at Checkout, with the first
+ * charge deferred only if a billing pause is active. This is how the free
+ * trial is "turned off" for new customers.
  *
- * Pause-window override: when `STRIPE_PAUSE_UNTIL` is set to a future epoch
- * (seconds), we run the script-style billing pause for existing subscribers.
- * To keep NEW sign-ups consistent with that — no charges inside the pause
- * window — we extend their trial only as far as needed to clear the window.
- * Specifically: `trial_end = max(pauseUntil, now + 14 days)`. So:
+ * Trial ON (`TRIAL_PERIOD_DAYS > 0`): an N-day trial via `trial_period_days`.
+ * Stripe collects card details upfront but charges nothing until day N+1.
+ *
+ * Pause-window override (trial ON only): when `STRIPE_PAUSE_UNTIL` is set to a
+ * future epoch (seconds), we run the script-style billing pause for existing
+ * subscribers. To keep NEW sign-ups consistent with that — no charges inside
+ * the pause window — we extend their trial only as far as needed to clear it.
+ * Specifically: `trial_end = max(pauseUntil, now + N days)`. So:
  *   • A driver signing up at the start of a 21-day pause → 21-day trial
- *   • A driver signing up halfway → still gets their normal 14-day trial
+ *   • A driver signing up halfway → still gets their normal N-day trial
  *     (their natural end-date falls after pause expiry, no extension needed)
  *
  * Pure / no I/O — exported for unit testing via `_trialConfig`.
  *
  * @param {number} nowSec       — current Unix epoch in seconds
  * @param {number} pauseUntilSec — value of STRIPE_PAUSE_UNTIL (0 = no pause)
- * @returns {{trial_end: number} | {trial_period_days: number}}
+ * @returns {{trial_end: number} | {trial_period_days: number} | null}
  */
 function trialConfig(nowSec, pauseUntilSec) {
-  if (!Number.isFinite(pauseUntilSec) || pauseUntilSec <= nowSec) {
-    return { trial_period_days: DEFAULT_TRIAL_DAYS };
+  const days = trialPeriodDays();
+  // Trial disabled → charge at Checkout (still honoring any active pause).
+  if (days <= 0) {
+    return skipTrialConfig(nowSec, pauseUntilSec);
   }
-  const naturalTrialEnd = nowSec + DEFAULT_TRIAL_DAYS * 24 * 60 * 60;
+  if (!Number.isFinite(pauseUntilSec) || pauseUntilSec <= nowSec) {
+    return { trial_period_days: days };
+  }
+  const naturalTrialEnd = nowSec + days * 24 * 60 * 60;
   return { trial_end: Math.max(pauseUntilSec, naturalTrialEnd) };
 }
 
@@ -90,6 +109,11 @@ function skipTrialConfig(nowSec, pauseUntilSec) {
  * Create a hosted Checkout Session for a new subscription.
  * The trial period is handled on the subscription_data side so Stripe
  * collects card details upfront but charges nothing until the trial ends.
+ *
+ * With the free trial OFF (`TRIAL_PERIOD_DAYS` unset/0 — the default), the
+ * non-skipTrial path also charges at Checkout, so `skipTrial` becomes a no-op;
+ * it only matters when the trial is re-enabled (`TRIAL_PERIOD_DAYS>0`), where
+ * it still charges grandfathered/reactivating drivers at Checkout.
  *
  * Pass `skipTrial: true` for grandfathered reactivations — no free trial, the
  * card is charged at checkout (still deferred if a billing pause is active).

@@ -129,35 +129,72 @@ async function runOpenInvoices(summary) {
   }
 }
 
+// Resolve a usable card for a customer. These leaked precisely because the card
+// is ATTACHED but not the default_payment_method, so checking the default slot
+// alone reports "no card". Prefer the default, else the most recent attached
+// card, else the legacy default_source.
+async function resolveCard(customerId) {
+  const customer = await stripe.customers.retrieve(customerId);
+  const defPm = customer.invoice_settings && customer.invoice_settings.default_payment_method;
+  const pms   = await stripe.paymentMethods.list({ customer: customerId, type: 'card', limit: 10 });
+  const pmId  = defPm || (pms.data[0] && pms.data[0].id) || customer.default_source || null;
+  const found = pmId && pms.data.find((p) => p.id === pmId);
+  const card  = found ? found.card : null;
+  const source = defPm ? 'default' : (pms.data.length ? 'attached (not default)' : (customer.default_source ? 'legacy source' : null));
+  return { customer, pmId, card, source, isDefault: !!defPm };
+}
+
 // ─── Cohort B: named voided-leak customers — preview unless --charge-recover ──
 async function runRecover(summary) {
   if (RECOVER_IDS.length === 0) return;
   const { amount, currency } = await resolveRecoverAmount();
   console.log(`\n── Cohort B: ${RECOVER_IDS.length} named customer(s) @ ${money(amount, currency)} each ──`);
-  console.log(`  ${CHARGE_B ? 'CHARGING (--charge-recover set).' : 'PREVIEW ONLY — verify, then re-run with --charge-recover to charge.'}\n`);
+  console.log(`  ${CHARGE_B ? 'CHARGING (--charge-recover set). Also sets the used card as default so they stop leaking.' : 'PREVIEW ONLY — verify, then re-run with --charge-recover to charge.'}\n`);
 
   for (const customerId of RECOVER_IDS) {
-    let customer;
-    try { customer = await stripe.customers.retrieve(customerId); }
+    let info;
+    try { info = await resolveCard(customerId); }
     catch (err) { console.error(`  ✗ ${customerId} — lookup failed: ${err.message}`); summary.bFailed++; continue; }
 
-    const hasDefault = customer.invoice_settings?.default_payment_method || customer.default_source;
-    const cardNote   = hasDefault ? 'card on file' : 'NO DEFAULT CARD';
+    const { customer, pmId, card, source } = info;
+    const cardNote = pmId
+      ? `${card ? `${card.brand} ••${card.last4}` : pmId} [${source}]`
+      : 'NO CARD ON FILE';
 
     if (!CHARGE_B) {
-      console.log(`  would charge ${customerId}  ${money(amount, currency)}  ${who(customer)}  [${cardNote}]`);
+      console.log(`  would charge ${customerId}  ${money(amount, currency)}  ${who(customer)}  ${cardNote}`);
       summary.bWould++; continue;
     }
-    if (!hasDefault) { console.error(`  ✗ ${customerId} — no default payment method — ${who(customer)}`); summary.bFailed++; continue; }
+    if (!pmId) { console.error(`  ✗ ${customerId} — no card on file at all — ${who(customer)}`); summary.bFailed++; continue; }
     try {
-      await stripe.invoiceItems.create({ customer: customerId, amount, currency, description: 'Uncollected renewal (recovered)' });
+      // Make the resolved card the customer default so the NEXT renewal collects
+      // automatically — this is the per-customer half of the leak fix.
+      if (!info.isDefault) {
+        await stripe.customers.update(customerId, { invoice_settings: { default_payment_method: pmId } });
+      }
+      // Create the invoice FIRST, then attach the item to THAT invoice by id.
+      // (A floating invoice item on a customer WITH a subscription stays pending
+      // and attaches to the next renewal instead of a manual invoice — which is
+      // how an earlier version produced empty $0 invoices and collected nothing.)
       const invoice = await stripe.invoices.create({
         customer: customerId, collection_method: 'charge_automatically', auto_advance: false,
+        default_payment_method: pmId,
         description: 'Recovery of a renewal that was voided before collection',
       });
-      await stripe.invoices.finalizeInvoice(invoice.id);
-      const paid = await stripe.invoices.pay(invoice.id);
-      console.log(`  ✓ charged ${customerId} ${money(paid.amount_paid, paid.currency)} (${invoice.id})  ${who(customer)}`);
+      await stripe.invoiceItems.create({
+        customer: customerId, invoice: invoice.id, amount, currency,
+        description: 'Uncollected renewal (recovered)',
+      });
+      // finalizeInvoice auto-charges a charge_automatically invoice when a PM is
+      // available — so it's usually 'paid' already. Only call pay() if it isn't,
+      // otherwise Stripe throws "Invoice is already paid".
+      let paid = await stripe.invoices.finalizeInvoice(invoice.id);
+      if (paid.status === 'open') paid = await stripe.invoices.pay(invoice.id, { payment_method: pmId });
+      if (paid.status !== 'paid' || (paid.amount_paid || 0) === 0) {
+        console.error(`  ✗ ${customerId} — invoice ${invoice.id} ended ${paid.status} paid=${money(paid.amount_paid || 0, paid.currency)} (not collected) — ${who(customer)}`);
+        summary.bFailed++; continue;
+      }
+      console.log(`  ✓ charged ${customerId} ${money(paid.amount_paid, paid.currency)} (${invoice.id}) on ${cardNote}  ${who(customer)}`);
       summary.bCharged++; summary.bCollected += paid.amount_paid || 0;
     } catch (err) {
       console.error(`  ✗ FAILED ${customerId} — ${err.message} — ${who(customer)}`);

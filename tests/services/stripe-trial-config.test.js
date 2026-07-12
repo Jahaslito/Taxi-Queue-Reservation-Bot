@@ -3,29 +3,72 @@
 // Unit tests for the trial-config logic that drives Checkout's `subscription_data`.
 // We test the pure function `_trialConfig(nowSec, pauseUntilSec)` so we don't
 // have to mock the Stripe SDK — pure inputs in, pure config out.
+//
+// The trial length is env-driven (`TRIAL_PERIOD_DAYS`, read at call-time):
+//   • unset / 0  → NO free trial (charge at Checkout, like skipTrial) — DEFAULT
+//   • 14         → the classic 14-day trial
+// so each block sets/restores the env it needs.
 
 const { _trialConfig, _skipTrialConfig } = require('../../src/services/stripeService');
 
 const ONE_DAY = 24 * 60 * 60;
+const NOW = 1_700_000_000;
 
-describe('stripeService._trialConfig — trial selection', () => {
-  // Pick a fixed "now" so the math is easy to read.
-  const NOW = 1_700_000_000;
+// Restore whatever TRIAL_PERIOD_DAYS was before each test mutated it.
+const ORIGINAL_TRIAL_ENV = process.env.TRIAL_PERIOD_DAYS;
+afterEach(() => {
+  if (ORIGINAL_TRIAL_ENV === undefined) delete process.env.TRIAL_PERIOD_DAYS;
+  else process.env.TRIAL_PERIOD_DAYS = ORIGINAL_TRIAL_ENV;
+});
+
+describe('stripeService._trialConfig — free trial OFF (TRIAL_PERIOD_DAYS unset/0, the default)', () => {
+  beforeEach(() => { delete process.env.TRIAL_PERIOD_DAYS; });
+
+  test('no pause → null (charge at checkout)', () => {
+    expect(_trialConfig(NOW, NaN)).toBeNull();
+    expect(_trialConfig(NOW, 0)).toBeNull();
+    expect(_trialConfig(NOW, NOW - 1000)).toBeNull();
+  });
+
+  test('TRIAL_PERIOD_DAYS=0 explicitly → null (charge at checkout)', () => {
+    process.env.TRIAL_PERIOD_DAYS = '0';
+    expect(_trialConfig(NOW, 0)).toBeNull();
+  });
+
+  test('non-numeric TRIAL_PERIOD_DAYS coerces to off → null', () => {
+    process.env.TRIAL_PERIOD_DAYS = 'abc';
+    expect(_trialConfig(NOW, 0)).toBeNull();
+  });
+
+  test('active pause → defer first charge to pause-end (no free trial added)', () => {
+    const pauseUntil = NOW + 21 * ONE_DAY;
+    expect(_trialConfig(NOW, pauseUntil)).toEqual({ trial_end: pauseUntil });
+  });
+
+  test('matches _skipTrialConfig exactly (trial-off IS the skip-trial path)', () => {
+    expect(_trialConfig(NOW, 0)).toEqual(_skipTrialConfig(NOW, 0));
+    const pauseUntil = NOW + 21 * ONE_DAY;
+    expect(_trialConfig(NOW, pauseUntil)).toEqual(_skipTrialConfig(NOW, pauseUntil));
+  });
+});
+
+describe('stripeService._trialConfig — free trial ON (TRIAL_PERIOD_DAYS=14)', () => {
+  beforeEach(() => { process.env.TRIAL_PERIOD_DAYS = '14'; });
 
   describe('no pause window active', () => {
-    test('STRIPE_PAUSE_UNTIL unset (NaN) → default 14-day trial', () => {
+    test('STRIPE_PAUSE_UNTIL unset (NaN) → 14-day trial', () => {
       expect(_trialConfig(NOW, NaN)).toEqual({ trial_period_days: 14 });
     });
 
-    test('STRIPE_PAUSE_UNTIL = 0 → default 14-day trial', () => {
+    test('STRIPE_PAUSE_UNTIL = 0 → 14-day trial', () => {
       expect(_trialConfig(NOW, 0)).toEqual({ trial_period_days: 14 });
     });
 
-    test('pauseUntil already in the past → default 14-day trial', () => {
+    test('pauseUntil already in the past → 14-day trial', () => {
       expect(_trialConfig(NOW, NOW - 1000)).toEqual({ trial_period_days: 14 });
     });
 
-    test('pauseUntil exactly = now (edge) → default 14-day trial', () => {
+    test('pauseUntil exactly = now (edge) → 14-day trial', () => {
       // We treat "pause window over" inclusively so signups right at the
       // boundary don't get a one-second extension.
       expect(_trialConfig(NOW, NOW)).toEqual({ trial_period_days: 14 });
@@ -76,7 +119,7 @@ describe('stripeService._trialConfig — trial selection', () => {
       });
     });
 
-    test('every driver gets AT LEAST their default 14-day trial', () => {
+    test('every driver gets AT LEAST their 14-day trial', () => {
       // Spot check across the window — invariant: trial_end >= now + 14 days
       for (let dayOffset = 0; dayOffset < 21; dayOffset++) {
         const signupTime = NOW + dayOffset * ONE_DAY;
@@ -113,8 +156,6 @@ describe('stripeService._trialConfig — trial selection', () => {
 });
 
 describe('stripeService._skipTrialConfig — grandfathered reactivation (no free trial)', () => {
-  const NOW = 1_700_000_000;
-
   describe('no pause window active', () => {
     test('STRIPE_PAUSE_UNTIL unset (NaN) → null (charge at checkout)', () => {
       expect(_skipTrialConfig(NOW, NaN)).toBeNull();

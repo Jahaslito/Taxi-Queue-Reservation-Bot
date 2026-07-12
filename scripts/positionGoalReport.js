@@ -21,7 +21,12 @@ const fs = require('fs');
 
 const RE_TS   = /\[(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2}):(\d{2}) PT\]/;
 const RE_FIRE = /\[Pos\] #(\S+) — ✓ queue (\d+) \+ lead [\d.]+.*?≥ target (\d+) \(/;
-const RE_ARM  = /\[Arm\] ⚡ #(\S+) fired via armed session in (\d+) ms/;
+// Storm-onset early fires (MONITOR_ONSET_FIRE) — a fire like any other.
+const RE_ONSET = /\[Pos\] #(\S+) — ⚡ ONSET early fire: queue (\d+).*?target (\d+)/;
+// Armed path = confirmed armed click OR a verify-recovered timeout (the add
+// was committed by the armed click; SAN was just slow streaming the WAIT
+// screen back — NOT a cold fire).
+const RE_ARM  = /\[Arm\] ⚡ #(\S+) (?:fired via armed session in (\d+) ms|confirmation timed out at (\d+) ms but add COMMITTED)/;
 const RE_LAND = /\[PosTracking\] #(\S+) landed at (\d+)/;
 const RE_TPS  = /\[TailProbe\] tail sample: (\d+)/;
 const RE_FLP  = /\[fleet-probe (\d+)→(\d+)/;
@@ -46,7 +51,7 @@ for (const path of process.argv.slice(2)) {
     if (!ts) continue;
     day = ts[1];
     let m;
-    if ((m = RE_FIRE.exec(line))) {
+    if ((m = RE_FIRE.exec(line)) || (m = RE_ONSET.exec(line))) {
       fires.push({ veh: m[1], t: secs(ts), q: +m[2], tgt: +m[3] });
     } else if ((m = RE_LAND.exec(line))) {
       if (!lands.has(m[1])) lands.set(m[1], []);

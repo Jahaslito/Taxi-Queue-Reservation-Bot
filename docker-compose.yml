@@ -112,6 +112,17 @@ services:
       MONITOR_T1_URL:               ${MONITOR_T1_URL}
       MONITOR_T2_URL:               ${MONITOR_T2_URL}
 
+      # Red-zone (SAN "not authorized") auto-remove. When a cab is benched by SAN
+      # it shows in V Holding as class="notauthorized" (red) — visible but blocked.
+      # ENABLED → the monitor auto-runs the "Remove From Queue" bot so the cab is
+      # pulled out (free to rejoin) without the driver touching SAN, then verifies
+      # on the next poll. Safe re: the 2026-06-15 strand (never mutates carryover/
+      # hasBeenSeen flags). COOLDOWN + MAX_PER_DAY bound the ~00:00 churn, since SAN
+      # re-lists a removed cab within seconds. Set ENABLED=false to kill instantly.
+      MONITOR_REDZONE_AUTO_REMOVE_ENABLED: ${MONITOR_REDZONE_AUTO_REMOVE_ENABLED:-true}
+      MONITOR_REDZONE_REMOVE_COOLDOWN_MS:  ${MONITOR_REDZONE_REMOVE_COOLDOWN_MS:-90000}
+      MONITOR_REDZONE_REMOVE_MAX_PER_DAY:  ${MONITOR_REDZONE_REMOVE_MAX_PER_DAY:-6}
+
       # Proxy — routes ALL SAN traffic (polling + bot) through the same IP
       # Leave unset to use the droplet's own IP
       PROXY_SERVER:   ${PROXY_SERVER:-}

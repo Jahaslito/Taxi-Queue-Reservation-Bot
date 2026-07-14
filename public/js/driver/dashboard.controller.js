@@ -153,9 +153,16 @@ document.addEventListener('visibilitychange', () => {
 // not currently watched, monitor service unreachable, etc.) so we degrade
 // gracefully rather than hiding the button when in doubt.
 function updateRemoveQueueButtonVisibility(statusData) {
-  const btn = document.getElementById('btn-remove-queue');
+  const btn        = document.getElementById('btn-remove-queue');
+  const redzoneBtn = document.getElementById('btn-redzone-remove');
   if (!btn) return;
   const live = statusData && statusData.liveQueueState;
+
+  // Red zone (SAN "not authorized") is a distinct, mutually-exclusive state from
+  // in_queue. It gets its OWN button (remove-and-rejoin, no day-long opt-out).
+  const inRedZone = !!(live && live.notAuthorized === true);
+  if (redzoneBtn) redzoneBtn.style.display = inRedZone ? 'flex' : 'none';
+
   let isInQueue;
   if (live) {
     isInQueue = live.inQueue === true;
@@ -165,7 +172,8 @@ function updateRemoveQueueButtonVisibility(statusData) {
       && (log.status === 'success' || log.status === 'already_queued')
       && Number.isFinite(log.queue_position);
   }
-  btn.style.display = isInQueue ? 'flex' : 'none';
+  // Don't show both — in the red zone only the red-zone button applies.
+  btn.style.display = (isInQueue && !inRedZone) ? 'flex' : 'none';
 }
 
 // ─── Today status card ────────────────────────────────────────────────────────
@@ -615,9 +623,63 @@ async function performRemoveFromQueue() {
   }
 }
 
+// ─── Red-zone remove (SAN "not authorized") ───────────────────────────────────
+// One-tap manual fallback to the monitor's automatic red-zone removal. No modal
+// and no opt-out: the driver just wants out of the red zone so they can rejoin
+// and still fire at their target. Hits /redzone-remove (does NOT set
+// manually_removed_at). Bot run is 5–15s → inline spinner on the button.
+let redzoneRemoveInFlight = false;
+
+async function performRedZoneRemove() {
+  if (redzoneRemoveInFlight) return;
+  redzoneRemoveInFlight = true;
+
+  const btn   = document.getElementById('btn-redzone-remove');
+  const icon  = document.getElementById('btn-redzone-remove-icon');
+  const label = document.getElementById('btn-redzone-remove-label');
+  const sub   = document.getElementById('btn-redzone-remove-sub');
+  const spin  = document.getElementById('btn-redzone-remove-spinner');
+
+  btn.style.opacity       = '0.65';
+  btn.style.cursor        = 'not-allowed';
+  btn.style.pointerEvents = 'none';
+  icon.textContent        = '⏳';
+  label.textContent       = 'Leaving red zone…';
+  sub.textContent         = 'Connecting to SAN eDispatch';
+  spin.style.display      = 'block';
+
+  try {
+    const data = await api('/api/driver/redzone-remove', { method: 'POST' });
+    if (data && data.ok) {
+      showToast('✅ ' + (data.message || 'Removed from the red zone — you can rejoin now.'), 'success', 5000);
+      btn.style.display = 'none';
+      const statusData = await api('/api/driver/status/today');
+      renderTodayStatus(statusData);
+    } else if (data && data.reason === 'not_in_queue') {
+      showToast('ℹ ' + (data.message || 'You are not in the queue.'), 'success', 4000);
+      btn.style.display = 'none';
+    } else {
+      showToast('Could not remove: ' + (data && data.message ? data.message : 'unknown error'), 'error', 5000);
+    }
+  } catch (err) {
+    // 409 dispatched, 502 bot failure, network errors, etc.
+    showToast('❌ ' + (err.message || 'Failed to leave the red zone'), 'error', 6000);
+  } finally {
+    redzoneRemoveInFlight   = false;
+    btn.style.opacity       = '';
+    btn.style.cursor        = '';
+    btn.style.pointerEvents = '';
+    icon.textContent        = '🚫';
+    label.textContent       = 'Leave the red zone';
+    sub.textContent         = 'SAN has you blocked (not authorized) — remove & rejoin';
+    spin.style.display      = 'none';
+  }
+}
+
 document.getElementById('btn-remove-queue').addEventListener('click', openRemoveQueueModal);
 document.getElementById('btn-remove-queue-cancel').addEventListener('click', closeRemoveQueueModal);
 document.getElementById('btn-remove-queue-confirm').addEventListener('click', performRemoveFromQueue);
+document.getElementById('btn-redzone-remove').addEventListener('click', performRedZoneRemove);
 
 // Dismiss modal by tapping outside the dialog (but not during loading)
 document.getElementById('remove-queue-modal').addEventListener('click', (e) => {

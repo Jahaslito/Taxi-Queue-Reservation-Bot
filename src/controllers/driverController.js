@@ -3,6 +3,7 @@ const db                = require('../config/database');
 const Driver            = require('../models/Driver');
 const Log               = require('../models/Log');
 const PositionClaim     = require('../models/PositionClaim');
+const DriverAudit       = require('../models/DriverAudit');
 const { encrypt, decrypt } = require('../services/cryptoService');
 const { runBotForDriver, runRemoveBotForDriver } = require('../services/schedulerService');
 
@@ -129,6 +130,17 @@ async function updateProfile(req, res, next) {
       throw err;
     }
 
+    // Audit trail — one row per changed field, after commit. recordChanges
+    // never throws (failures are logged and swallowed), so awaiting can't fail
+    // the save — and NOT awaiting leaves an insert racing the response.
+    await DriverAudit.recordChanges({
+      driverId:   req.driverId,
+      driverName: updateData.name ?? driver.name,
+      changedBy:  'driver',
+      before:     driver,
+      after:      updateData,
+    });
+
     // Immediately propagate schedule changes to the monitor's in-memory state
     // so that position-scheduler decisions reflect the new dayPositions without
     // waiting up to 5 minutes for the next auto-refresh tick. Without this,
@@ -248,8 +260,9 @@ async function getTodayStatus(req, res, next) {
       const watch = state.watches.find((w) => w.driverId === req.driverId);
       if (watch) {
         liveQueueState = {
-          state:            watch.state,           // watching|in_queue|dispatched|at_terminal|requeuing
+          state:            watch.state,           // watching|in_queue|dispatched|at_terminal|requeuing|not_authorized
           inQueue:          watch.state === 'in_queue',
+          notAuthorized:    watch.state === 'not_authorized', // in SAN's red "not authorized" zone
           currentPosition:  watch.currentPosition ?? null,
           terminalName:     watch.terminalName     ?? null, // 'T1' | 'T2' | null
           terminalPosition: watch.terminalPosition ?? null,
@@ -354,4 +367,49 @@ async function removeFromQueue(req, res, next) {
   }
 }
 
-module.exports = { getProfile, updateProfile, getLogs, getTodayStatus, triggerSelf, removeFromQueue };
+/**
+ * POST /api/driver/redzone-remove
+ *
+ * Manual counterpart to the monitor's automatic red-zone removal. When SAN
+ * benches a driver ("not authorized", the red zone) they're visible in the queue
+ * but blocked; leaving and rejoining clears it. This runs the same remove bot as
+ * /remove-queue BUT — crucially — does NOT set manually_removed_at and does NOT
+ * tell the monitor to stop auto-requeuing. The driver isn't done for the day;
+ * they want OUT of the red zone so they can get back to their target position.
+ *
+ * Bot run time is 5–15 seconds. Frontend shows a loading state during the wait.
+ */
+async function removeFromRedZone(req, res, next) {
+  try {
+    const driver = await Driver.findByIdWithCredentials(req.driverId);
+    if (!driver) {
+      const err = new Error('Driver not found'); err.statusCode = 404; throw err;
+    }
+    if (!driver.is_active) {
+      const err = new Error('Your account is inactive'); err.statusCode = 400; throw err;
+    }
+
+    const result = await runRemoveBotForDriver(driver, 'redzone_manual_remove');
+
+    if (!result.success) {
+      if (result.dispatched) {
+        return res.status(409).json({ ok: false, reason: 'dispatched', message: result.message });
+      }
+      if (result.notInQueue) {
+        return res.status(200).json({ ok: false, reason: 'not_in_queue', message: result.message });
+      }
+      const err = new Error(result.message || result.error || 'Failed to remove from queue');
+      err.statusCode = 502;
+      throw err;
+    }
+
+    // Success — intentionally do NOT set manually_removed_at: the driver stays
+    // auto-managed so they rejoin and fire at their target once SAN drops the
+    // red-zone flag. The monitor confirms the exit on its next V Holding poll.
+    res.json({ ok: true, message: result.message });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { getProfile, updateProfile, getLogs, getTodayStatus, triggerSelf, removeFromQueue, removeFromRedZone };

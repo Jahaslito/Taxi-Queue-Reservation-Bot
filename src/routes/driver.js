@@ -5,7 +5,7 @@ const { authenticateDriver }    = require('../middleware/auth');
 const { apiLimiter }            = require('../middleware/rateLimiter');
 const requireSubscription       = require('../middleware/requireSubscription');
 const validate                  = require('../middleware/validate');
-const { getProfile, updateProfile, getLogs, getTodayStatus, triggerSelf, removeFromQueue } = require('../controllers/driverController');
+const { getProfile, updateProfile, getLogs, getTodayStatus, triggerSelf, removeFromQueue, removeFromRedZone } = require('../controllers/driverController');
 const sosController             = require('../controllers/sosController');
 const driverPushController      = require('../controllers/driverPushController');
 const driverMessagesController  = require('../controllers/driverMessagesController');
@@ -68,7 +68,8 @@ router.put(
 router.get('/logs',          getLogs);
 router.get('/status/today',  getTodayStatus);
 router.post('/trigger',      triggerSelf);
-router.post('/remove-queue', removeFromQueue);
+router.post('/remove-queue',   removeFromQueue);
+router.post('/redzone-remove', removeFromRedZone);
 
 // Dispatch push notifications — opt-in per device.
 router.get( '/push/config',       driverPushController.config);

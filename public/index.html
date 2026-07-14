@@ -725,15 +725,15 @@
   <!-- Hero -->
   <div style="padding:36px 0 28px;text-align:center;">
     <img src="/icons/logo.png" alt="SAN Queue" style="width:88px;height:88px;border-radius:22px;object-fit:contain;box-shadow:0 16px 40px rgba(0,194,212,0.25);margin-bottom:24px;display:block;margin-left:auto;margin-right:auto;" />
-    <h1 id="billing-view-title" style="font-family:'DM Sans',sans-serif;font-size:30px;font-weight:800;line-height:1.2;margin-bottom:12px;letter-spacing:-0.02em;">Start Your Free Trial</h1>
-    <p id="billing-view-subtitle" style="font-size:17px;color:var(--muted);line-height:1.6;">14 days free — then just <strong style="color:var(--white);">$16 / month</strong></p>
+    <h1 id="billing-view-title" style="font-family:'DM Sans',sans-serif;font-size:30px;font-weight:800;line-height:1.2;margin-bottom:12px;letter-spacing:-0.02em;">Start Your Subscription</h1>
+    <p id="billing-view-subtitle" style="font-size:17px;color:var(--muted);line-height:1.6;"><strong style="color:var(--white);">$16 / month</strong> — cancel any time</p>
   </div>
 
   <!-- Pricing pill -->
   <div style="text-align:center;margin-bottom:28px;">
     <div style="display:inline-flex;align-items:baseline;gap:4px;background:rgba(0,194,212,0.1);border:1px solid rgba(0,194,212,0.25);border-radius:40px;padding:10px 24px;">
       <span style="font-family:'DM Sans',sans-serif;font-size:32px;font-weight:800;color:var(--white);">$16</span>
-      <span id="billing-price-suffix" style="font-size:15px;color:var(--muted);">/ month after trial</span>
+      <span id="billing-price-suffix" style="font-size:15px;color:var(--muted);">/ month</span>
     </div>
   </div>
 
@@ -775,10 +775,10 @@
 
   <!-- CTA -->
   <button class="btn btn-primary" id="btn-start-billing" style="margin-bottom:10px;background:linear-gradient(135deg,#00b4ff,#7c6dff);border:none;font-size:17px;font-weight:700;padding:18px;border-radius:16px;">
-    Start Free Trial →
+    Subscribe →
   </button>
   <p id="billing-cta-note" style="text-align:center;font-size:13px;color:var(--muted);margin-bottom:24px;">
-    Card required — you won't be charged until day 15. Cancel any time.
+    Card required — you'll be charged $16 today. Cancel any time.
   </p>
   <button class="btn btn-ghost" id="btn-logout-billing" style="opacity:0.5;font-size:14px;">Log out</button>
 
@@ -950,6 +950,26 @@
       <div id="btn-remove-queue-sub" style="font-size:12px;color:rgba(252,165,165,0.7);margin-top:3px;">Done driving for today — opt out of auto-requeue</div>
     </div>
     <div id="btn-remove-queue-spinner" style="display:none;flex-shrink:0;"><span class="spinner"></span></div>
+  </button>
+
+  <!-- Red-zone remove button — only shown when SAN has the driver "not authorized" (toggled via JS).
+       Unlike the button above, this does NOT opt the driver out for the day — it pulls them out of the
+       red zone so they can rejoin and still fire at their target. -->
+  <button id="btn-redzone-remove" style="
+    display:none;
+    width:100%; margin-bottom:16px;
+    background:linear-gradient(135deg,rgba(239,68,68,0.16),rgba(239,68,68,0.08));
+    border:1px solid rgba(239,68,68,0.55); border-radius:16px;
+    padding:14px 20px; align-items:center; gap:14px;
+    cursor:pointer; text-align:left;
+    transition:transform .1s, box-shadow .1s, opacity .15s;
+    -webkit-tap-highlight-color: transparent;">
+    <div id="btn-redzone-remove-icon" style="font-size:22px;line-height:1;flex-shrink:0;">🚫</div>
+    <div style="flex:1;">
+      <div id="btn-redzone-remove-label" style="font-weight:700;color:#fca5a5;font-size:14px;">Leave the red zone</div>
+      <div id="btn-redzone-remove-sub" style="font-size:12px;color:rgba(252,165,165,0.7);margin-top:3px;">SAN has you blocked (not authorized) — remove &amp; rejoin</div>
+    </div>
+    <div id="btn-redzone-remove-spinner" style="display:none;flex-shrink:0;"><span class="spinner"></span></div>
   </button>
 
   <!-- Enable dispatch alerts button — toggles SMS + push notifications for this driver/device -->
@@ -1127,7 +1147,7 @@
       <div>
         <div id="acct-sub-status-badge" style="display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;">—</div>
         <div id="acct-sub-trial-info" style="display:none;font-size:12px;color:var(--muted);margin-top:6px;"></div>
-        <div style="font-size:13px;color:var(--muted);margin-top:6px;">$16 / month · 14-day free trial for new accounts</div>
+        <div style="font-size:13px;color:var(--muted);margin-top:6px;">$16 / month · cancel any time</div>
       </div>
       <button class="btn btn-ghost" id="btn-acct-billing" style="font-size:13px;padding:8px 16px;">Manage Billing</button>
     </div>

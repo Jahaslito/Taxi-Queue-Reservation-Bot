@@ -5,6 +5,7 @@ const Driver                  = require('../models/Driver');
 const Log                     = require('../models/Log');
 const PositionClaim           = require('../models/PositionClaim');
 const PositionTracking        = require('../models/PositionTracking');
+const DriverAudit             = require('../models/DriverAudit');
 const TerminalMetric          = require('../models/TerminalMetric');
 const { encrypt, decrypt }    = require('../services/cryptoService');
 const stripeService           = require('../services/stripeService');
@@ -310,6 +311,18 @@ async function updateDriver(req, res, next) {
       }
       throw err;
     }
+
+    // Audit trail — one row per changed field, after commit. recordChanges
+    // never throws (failures are logged and swallowed), so awaiting can't fail
+    // the save — and NOT awaiting leaves an insert racing the response.
+    await DriverAudit.recordChanges({
+      driverId:   driver.id,
+      driverName: updateData.name ?? driver.name,
+      changedBy:  'admin',
+      adminId:    req.adminId ?? null,
+      before:     driver,
+      after:      updateData,
+    });
 
     // Deactivating via the edit form stops billing too (same as the dedicated
     // Deactivate action) — cancel the subscription at period end.

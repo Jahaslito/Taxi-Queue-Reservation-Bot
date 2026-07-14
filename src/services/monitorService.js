@@ -94,6 +94,29 @@ const CARRYOVER_REMOVE_ENABLED = (process.env.MONITOR_CARRYOVER_REMOVE_ENABLED ?
 // missed poll wrongly flips a still-queued leftover to "fresh today" (the
 // 00:01:44 mislabel that started #0187's chain). 3 polls confirms a real exit.
 const CARRYOVER_CLEAR_POLLS    = parseInt(process.env.MONITOR_CARRYOVER_CLEAR_POLLS ?? '3', 10);
+
+// ─── Auto-remove from SAN's red "not authorized" zone ─────────────────────────
+// When SAN benches a vehicle it re-lists its V Holding row as class="notauthorized"
+// (rendered red). The driver is visible in the queue but blocked — they can't hold
+// a position or be dispatched, and the only fix is to leave the queue and rejoin.
+// Historically the driver had to do this by hand ("Remove From Queue" in SAN).
+// With this ON, the monitor fires that same remove automatically the moment it
+// sees a driver in the red zone, then VERIFIES on the next poll that they are no
+// longer not_authorized.
+//
+// SAFETY: this reuses removeFromQueue (a REMOVE-type 'redzone_auto_remove' trigger)
+// and — like removeCarryoverLeftover — NEVER mutates carryover/hasBeenSeen flags,
+// so it cannot re-create the 2026-06-15 fleet-strand (that was caused by clearing
+// protection on a self-reported remove "success"; hasBeenSeen is now add-only).
+// CHURN GUARD: most red-zone events are the ~00:00 carryover wave, and SAN re-adds
+// a removed cab within seconds — so a per-cab cooldown + daily cap keep the retry
+// from turning into a hot loop that hammers SAN. Kill switch: set the env to false.
+const REDZONE_AUTO_REMOVE_ENABLED = (process.env.MONITOR_REDZONE_AUTO_REMOVE_ENABLED ?? 'true') === 'true';
+// Minimum gap between remove attempts for the same cab (SAN's re-list is near-instant).
+const REDZONE_REMOVE_COOLDOWN_MS  = parseInt(process.env.MONITOR_REDZONE_REMOVE_COOLDOWN_MS ?? String(90_000), 10);
+// Hard cap on remove attempts per cab per Pacific day — bounds the midnight churn.
+const REDZONE_REMOVE_MAX_PER_DAY  = parseInt(process.env.MONITOR_REDZONE_REMOVE_MAX_PER_DAY ?? '6', 10);
+
 // ─── Forced drop of stuck leftovers at the position-window open (3 AM) ─────────
 // SAN's overnight purge clears most leftovers by ~02:00, but NOT all of them.
 // Log analysis (2026-06-26…30) shows 1–6 of our drivers per day stay in V Holding
@@ -1356,6 +1379,52 @@ async function removeCarryoverLeftover(driverId, vehicleNumber) {
   }
 }
 
+// ─── Red-zone (not_authorized) auto-remove ────────────────────────────────────
+// Pure throttle decision, kept separate so it can be unit-tested. Returns whether
+// a remove may fire for this cab right now, given its per-day attempt count, the
+// last attempt time, and whether a remove is already in flight. See
+// REDZONE_* config above for the guard rationale (midnight churn containment).
+function _redzoneRemoveDecision(state, nowMs, {
+  cooldownMs = REDZONE_REMOVE_COOLDOWN_MS,
+  maxPerDay  = REDZONE_REMOVE_MAX_PER_DAY,
+} = {}) {
+  if (state.redzoneRemoveInFlight)                         return { allow: false, reason: 'in_flight' };
+  if ((state.redzoneRemoveCountToday ?? 0) >= maxPerDay)   return { allow: false, reason: 'daily_cap' };
+  const last = state.redzoneRemoveLastAttemptMs ?? 0;
+  if (nowMs - last < cooldownMs)                           return { allow: false, reason: 'cooldown' };
+  return { allow: true };
+}
+
+// Fire the remove bot for a cab sitting in SAN's red "not authorized" zone.
+// Modelled on removeCarryoverLeftover: it NEVER mutates carryover/hasBeenSeen
+// flags, so even a self-reported "success" can't strand the driver — the only
+// authority on "left the red zone" is the next poll re-parsing V Holding (which
+// flips them out of not_authorized and triggers the verification log below).
+async function autoRemoveNotAuthorized(driverId, vehicleNumber) {
+  const pre = watches.get(driverId);
+  if (pre) pre.redzoneRemoveInFlight = true;
+  try {
+    const driver = await Driver.findByIdWithCredentials(driverId);
+    if (!driver || driver.is_active === false || !driver.san_username || !driver.san_password) return;
+
+    const { runRemoveBotForDriver } = require('./schedulerService');
+    const result = await runRemoveBotForDriver(driver, 'redzone_auto_remove');
+
+    if (result?.success) {
+      console.log(`[Monitor] #${vehicleNumber} — red-zone auto-remove sent (verifying against V Holding next poll)`);
+    } else if (result?.dispatched) {
+      console.log(`[Monitor] #${vehicleNumber} — red-zone auto-remove skipped: SAN says dispatched, not removable`);
+    } else {
+      console.warn(`[Monitor] #${vehicleNumber} — red-zone auto-remove did not remove (${result?.error || result?.message || 'unknown'}) — SAN may re-clear it`);
+    }
+  } catch (err) {
+    console.warn(`[Monitor] #${vehicleNumber} — red-zone auto-remove errored: ${err.message}`);
+  } finally {
+    const s = watches.get(driverId);
+    if (s) s.redzoneRemoveInFlight = false;
+  }
+}
+
 // ─── Forced drop + re-arm of one stuck overnight leftover (position-window open) ─
 // Removes a driver SAN failed to purge overnight, then — ONLY on a confirmed
 // removal — arms them to fire fresh at today's target. See CARRYOVER_DROP_ENABLED.
@@ -1948,6 +2017,9 @@ async function poll() {
       s.earlyJoinDetectedAt = null;
       s.earlyJoinAtPosition = null;
       s.dispatchNotifyPending = false;
+      s.redzoneRemoveCountToday   = 0;     // new day → red-zone auto-remove budget resets
+      s.redzoneRemoveLastAttemptMs = 0;
+      s.redzoneRemovePending      = false;
     }
     // New day → fresh storm tracking (yesterday's onset must not leak forward).
     onsetState = freshOnsetState();
@@ -2185,10 +2257,39 @@ async function poll() {
     const carryoverProtected = isCarryover || (state.wasCarryoverToday && !state.positionFiredToday);
     const markSeen    = () => { if (!carryoverProtected && !state.hasBeenSeen) state.hasBeenSeen = true; };
 
+    // Red-zone VERIFICATION: a cab we sent an auto-remove for has now dropped out
+    // of SAN's not_authorized set → the removal took. Confirm and clear the flag.
+    // (The state-change broadcast at the end of the loop refreshes the UI.)
+    if (state.redzoneRemovePending && !inNotAuthorized) {
+      state.redzoneRemovePending = false;
+      console.log(`[Monitor] #${state.vehicleNumber} ✓ red-zone auto-remove CONFIRMED — no longer not_authorized`);
+    }
+
     if (inNotAuthorized) {
       // Driver is in the red "not authorized" zone — visible but blocked by SAN.
       // Do NOT set hasBeenSeen (they haven't earned a queue spot) and do NOT requeue.
       next = 'not_authorized';
+
+      // Auto-remove: fire the same "Remove From Queue" bot the driver would run
+      // by hand, so a blocked cab is pulled out (and free to rejoin) without them
+      // having to touch SAN. Guarded by a per-cab cooldown + daily cap because the
+      // ~00:00 carryover wave is re-listed by SAN within seconds (see REDZONE_*).
+      // Fire-and-forget through the concurrency-capped jobQueue so it never blocks
+      // the poll loop. NEVER touches carryover/hasBeenSeen flags (see the fn).
+      if (
+        REDZONE_AUTO_REMOVE_ENABLED
+        && state.isActive
+        && !state.manuallyRemovedAt
+      ) {
+        const decision = _redzoneRemoveDecision(state, Date.now());
+        if (decision.allow) {
+          state.redzoneRemoveCountToday  = (state.redzoneRemoveCountToday ?? 0) + 1;
+          state.redzoneRemoveLastAttemptMs = Date.now();
+          state.redzoneRemovePending     = true;
+          console.log(`[Monitor] #${state.vehicleNumber} — in red zone (not_authorized), auto-remove attempt ${state.redzoneRemoveCountToday}/${REDZONE_REMOVE_MAX_PER_DAY}`);
+          jobQueue.enqueue(() => autoRemoveNotAuthorized(driverId, state.vehicleNumber)).catch(() => {});
+        }
+      }
     } else if (inDispatched) {
       markSeen();
       state.lastSeenAt = new Date();
@@ -3243,6 +3344,60 @@ async function watchAllActive() {
 }
 
 /**
+ * Sync a watch's vehicle identity after the driver record's vehicle_number
+ * changed (cab handover / renumbering). The watch snapshots vehicleNumber at
+ * addWatch and every observation (positions, terminal state, hasBeenSeen) is
+ * ABOUT that cab — so when the number changes, the old observations describe a
+ * different physical vehicle and must be dropped, or the dashboard keeps
+ * live-tracking the OLD cab (2026-07-13: record #35 was renumbered 0034→0026
+ * mid-flight; the driver's card streamed cab 0034 through V Holding and T2 all
+ * day while his real cab sat 400 positions back).
+ *
+ * Leaves scheduling flags (positionFiredToday, wasCarryoverToday) alone: they
+ * are day-scoped facts about the DRIVER's service, not the cab, and resetting
+ * them could double-fire a target. A bot mid-run ('requeuing') keeps its state
+ * label so _handleBotResult can settle it; everything cab-derived still resets.
+ *
+ * Returns true when a change was applied.
+ */
+function syncWatchVehicle(state, vehicleNumber) {
+  const newNorm = norm(vehicleNumber);
+  if (newNorm === state.vehicleNorm) return false;
+
+  console.log(
+    `[Monitor] #${state.vehicleNumber} → #${vehicleNumber} — vehicle number changed ` +
+    `(id=${state.driverId}), dropping observations of the old cab`,
+  );
+
+  state.vehicleNumber = vehicleNumber;
+  state.vehicleNorm   = newNorm;
+
+  // Everything below was observed under the OLD vehicle number.
+  if (state.state !== 'requeuing') state.state = 'watching';
+  state.hasBeenSeen          = false;
+  state.currentPosition      = null;
+  state.lastPosition         = null;
+  state.landedPositionToday  = null;
+  state.pendingTrackingId    = null;   // never attach the new cab's landing to an old fire
+  state.atTerminalSince      = null;
+  state.terminalSeen         = false;
+  state.terminalCheckCount   = 0;
+  state.terminalName         = null;
+  state.terminalPosition     = null;
+  state.terminalLastSeenAt   = null;
+  state.dispatchTerminal     = null;
+  state.dispatchNotifyPending = false;
+  state.inQueueFromCarryover = false;
+  state.carryoverAbsentPolls = 0;
+  state.redzoneRemovePending = false;
+  state.earlyJoinDetectedAt  = null;
+  state.earlyJoinAtPosition  = null;
+  state._lastBroadcastPos    = null;
+
+  return true;
+}
+
+/**
  * Periodic sync: pick up newly activated drivers, remove deactivated ones.
  * Runs every AUTO_REFRESH_MS (default 5 min) so new drivers are auto-added
  * without a server restart.
@@ -3267,6 +3422,11 @@ async function refreshAutoWatches() {
         existing.scheduledPosition     = d.scheduled_position ?? null;
         existing.dayPositions          = d.day_positions ?? null;
         existing.maxAcceptablePosition = d.max_acceptable_position ?? null;
+        // Cab handover / renumbering: re-point the watch at the new vehicle and
+        // drop observations of the old cab (they describe a different vehicle).
+        if (syncWatchVehicle(existing, d.vehicle_number)) {
+          broadcast('driver_state', { driverId: d.id, state: snap(existing) });
+        }
       }
     }
 
@@ -3692,6 +3852,7 @@ module.exports = {
   // Exposed for unit tests
   _parseQueue:                parseQueue,
   _parseTerminalPage:         parseTerminalPage,
+  _syncWatchVehicle:          syncWatchVehicle,
   _norm:                      norm,
   _isWithinOperatingHours:    isWithinOperatingHours,
   _evaluatePositionScheduler: evaluatePositionScheduler,
@@ -3699,6 +3860,8 @@ module.exports = {
   _onsetCapNow:               onsetCapNow,
   _carryoverClearStep:        carryoverClearStep,
   _removeCarryoverLeftover:   removeCarryoverLeftover,
+  _redzoneRemoveDecision:     _redzoneRemoveDecision,
+  _autoRemoveNotAuthorized:   autoRemoveNotAuthorized,
   _dropAndArmLeftover:        dropAndArmLeftover,
   _dropAndArmCarryoverLeftovers: dropAndArmCarryoverLeftovers,
   _setWatch:                  (driverId, state) => watches.set(driverId, state),

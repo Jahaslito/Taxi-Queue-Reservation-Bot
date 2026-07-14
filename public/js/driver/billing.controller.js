@@ -180,15 +180,17 @@ window.prepareBillingView = function (profile) {
   errEl.style.display = 'none';
   errEl.textContent   = '';
 
-  // Fine print under the primary CTA. The default markup is trial copy
-  // ("not charged until day 15") — accurate only for genuinely new drivers.
-  // Reactivating drivers are charged at checkout (skipTrial), so we rewrite it
-  // per branch to match what actually happens at Stripe.
-  const ctaNote   = document.getElementById('billing-cta-note');
-  const TRIAL_NOTE = "Card required — you won't be charged until day 15. Cancel any time.";
+  // Fine print under the primary CTA. With the free trial off
+  // (TRIAL_PERIOD_DAYS unset/0, the current default), every branch — new
+  // signups included — is charged at Checkout, so the note always states an
+  // immediate charge. (If the trial is re-enabled server-side, restore the
+  // new-subscriber copy below to trial wording.)
+  const ctaNote      = document.getElementById('billing-cta-note');
+  const NEW_SUB_NOTE = "Card required — you'll be charged $16 today. Cancel any time.";
 
-  // The pricing pill's "/ month after trial" suffix is only true for the
-  // new-trial branch — every reactivation path charges immediately.
+  // The pricing pill's suffix. With the trial off every branch charges
+  // immediately, so all show "/ month"; the withTrial arg is kept for when the
+  // trial is re-enabled (TRIAL_PERIOD_DAYS > 0).
   const priceSuffix = document.getElementById('billing-price-suffix');
   const setPriceSuffix = (withTrial) => {
     if (priceSuffix) priceSuffix.textContent = withTrial ? '/ month after trial' : '/ month';
@@ -238,13 +240,13 @@ window.prepareBillingView = function (profile) {
     setPriceSuffix(false);
     if (ctaNote) { ctaNote.textContent = 'Your card will be charged today to restart your subscription. Cancel any time.'; ctaNote.style.display = ''; }
   } else {
-    title.textContent    = 'Start Your Free Trial';
-    subtitle.textContent = '14 days free — then just $16 / month';
-    btnStart.textContent = 'Start Free Trial →';
+    title.textContent    = 'Start Your Subscription';
+    subtitle.textContent = '$16 / month — cancel any time';
+    btnStart.textContent = 'Subscribe →';
     btnStart.style.display   = '';
     manageSection.style.display = 'none';
-    setPriceSuffix(true);
-    if (ctaNote) { ctaNote.textContent = TRIAL_NOTE; ctaNote.style.display = ''; }
+    setPriceSuffix(false);
+    if (ctaNote) { ctaNote.textContent = NEW_SUB_NOTE; ctaNote.style.display = ''; }
   }
 };
 
@@ -270,7 +272,7 @@ document.getElementById('btn-start-billing').addEventListener('click', async fun
     if (typeof driverProfile !== 'undefined' && driverProfile && window.prepareBillingView) {
       window.prepareBillingView(driverProfile);
     } else {
-      this.textContent = 'Start Free Trial →';
+      this.textContent = 'Subscribe →';
     }
   }
 });
@@ -303,7 +305,7 @@ window.addEventListener('pageshow', event => {
   const resets = [
     { id: 'btn-acct-billing',   text: 'Manage Billing'        },
     { id: 'btn-manage-billing', text: 'Update Payment Method' },
-    { id: 'btn-start-billing',  text: 'Start Free Trial →'    },
+    { id: 'btn-start-billing',  text: 'Subscribe →'           },
   ];
   for (const { id, text } of resets) {
     const btn = document.getElementById(id);

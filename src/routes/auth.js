@@ -15,6 +15,7 @@ const {
   verifyEmail,
   resendVerification,
   createCheckoutSession,
+  syncSubscription,
   reactivateCheckout,
   resumeSubscription,
   billingPortal,
@@ -119,8 +120,15 @@ router.post(
 );
 
 // ─── Stripe Billing ───────────────────────────────────────────────────────────
-// Create a Checkout Session → returns { url } for the frontend to redirect to
+// Create a Checkout Session → returns { url } for the frontend to redirect to.
+// May instead return { already_subscribed, subscription_status } when Stripe
+// already holds a live subscription (duplicate-checkout guard).
 router.post('/driver/create-checkout', authenticateDriver, createCheckoutSession);
+
+// Verify the subscription directly against Stripe and sync the driver row.
+// Used by the paywall (checkout return, app re-focus, manual refresh) so access
+// doesn't depend on webhook delivery. Returns { subscription_status }.
+router.post('/driver/sync-subscription', authenticateDriver, syncSubscription);
 
 // Reactivate a past_due subscription → re-collect card via setup-mode Checkout,
 // then settle the open invoice immediately (webhook). Returns { url }.

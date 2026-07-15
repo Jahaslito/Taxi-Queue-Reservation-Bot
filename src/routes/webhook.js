@@ -14,7 +14,7 @@
 
 const express = require('express');
 const Driver  = require('../models/Driver');
-const { constructWebhookEvent, retrieveSubscription, reactivateFromSetupIntent, payAllOpenInvoices } = require('../services/stripeService');
+const { constructWebhookEvent, retrieveSubscription, retrievePaymentIntent, reactivateFromSetupIntent, payAllOpenInvoices, formatDeclineReason } = require('../services/stripeService');
 const { sendPaymentFailedEmail } = require('../services/emailService');
 
 const router = express.Router();
@@ -57,12 +57,17 @@ router.post(
               console.warn(`[Stripe Webhook] setup reactivate — no driver for customer ${session.customer}`);
               break;
             }
-            const { invoicePaid } = await reactivateFromSetupIntent({
+            const result = await reactivateFromSetupIntent({
               customerId:     session.customer,
               subscriptionId: driver.stripe_subscription_id,
               setupIntentId:  session.setup_intent,
             });
-            console.log(`[Stripe Webhook] Driver ${driver.id} reactivation setup — invoice ${invoicePaid ? 'paid' : 'not charged (none open)'}`);
+            // The NEW card declined too — record why, so the Payment Required
+            // screen tells them instead of looking like nothing happened.
+            if (!result.allSettled && result.lastFailureReason) {
+              await Driver.update(driver.id, { last_payment_error: result.lastFailureReason });
+            }
+            console.log(`[Stripe Webhook] Driver ${driver.id} reactivation setup — invoice ${result.invoicePaid ? 'paid' : 'not charged (none open)'}${result.allSettled ? '' : ` — FAILED: ${result.lastFailureReason}`}`);
             break;
           }
 
@@ -86,8 +91,10 @@ router.post(
             // re-activate a driver the sweep had deactivated.
             is_active:              true,
             card_required_by:       null,
-            // Fresh subscription — drop any prior scheduled-cancel date.
+            // Fresh subscription — drop any prior scheduled-cancel date and
+            // any stale decline reason from a previous failed attempt.
             subscription_cancel_at: null,
+            last_payment_error:     null,
           });
 
           console.log(`[Stripe Webhook] Driver ${driverId} subscribed — status: ${sub.status}`);
@@ -133,7 +140,10 @@ router.post(
         case 'invoice.payment_succeeded': {
           const invoice = event.data.object;
           const driver  = await Driver.findByStripeCustomerId(invoice.customer);
-          if (!driver) break;
+          if (!driver) {
+            console.warn(`[Stripe Webhook] ${event.type} — no driver for customer ${invoice.customer}`);
+            break;
+          }
 
           // A successful charge means a working card is on file — clear any
           // card-enforcement lock and re-activate.
@@ -142,6 +152,7 @@ router.post(
             is_active:              true,
             card_required_by:       null,
             subscription_cancel_at: null,
+            last_payment_error:     null,
           });
           console.log(`[Stripe Webhook] Driver ${driver.id} ${event.type} → active`);
           break;
@@ -165,6 +176,10 @@ router.post(
             if (swept.attempted > 0) {
               console.log(`[Stripe Webhook] Driver ${driver.id} payment_method.attached — settled ${swept.paidCount}/${swept.attempted} open invoice(s) ($${(swept.amountPaid / 100).toFixed(2)})${swept.allSettled ? '' : ' — balance NOT fully cleared'}`);
             }
+            // New card still declining — record why for the paywall screen.
+            if (!swept.allSettled && swept.lastFailureReason) {
+              await Driver.update(driver.id, { last_payment_error: swept.lastFailureReason });
+            }
           } catch (err) {
             console.error(`[Stripe Webhook] Driver ${driver.id} payment_method.attached — invoice sweep failed:`, err.message);
           }
@@ -180,15 +195,44 @@ router.post(
         case 'invoice.payment_failed': {
           const invoice = event.data.object;
           const driver  = await Driver.findByStripeCustomerId(invoice.customer);
-          if (!driver) break;
+          if (!driver) {
+            console.warn(`[Stripe Webhook] ${event.type} — no driver for customer ${invoice.customer}`);
+            break;
+          }
 
-          await Driver.update(driver.id, { subscription_status: 'past_due' });
-          console.log(`[Stripe Webhook] Driver ${driver.id} payment failed → past_due`);
+          // Pull the cardholder-facing decline reason off the PaymentIntent so
+          // the Payment Required screen / email can say WHY (insufficient
+          // funds, expired card, …) — otherwise drivers retry the same bad
+          // card blind. Best-effort: a lookup failure falls back to generic.
+          let reason = null;
+          if (invoice.payment_intent) {
+            try {
+              const pi  = await retrievePaymentIntent(invoice.payment_intent);
+              const err = pi.last_payment_error;
+              if (err) {
+                reason = formatDeclineReason({
+                  message:     err.message,
+                  declineCode: err.decline_code,
+                  brand:       err.payment_method?.card?.brand,
+                  last4:       err.payment_method?.card?.last4,
+                });
+              }
+            } catch (err) {
+              console.warn(`[Stripe Webhook] Could not read decline reason for driver ${driver.id}:`, err.message);
+            }
+          }
+          reason = reason || formatDeclineReason({});
+
+          await Driver.update(driver.id, {
+            subscription_status: 'past_due',
+            last_payment_error:  reason,
+          });
+          console.log(`[Stripe Webhook] Driver ${driver.id} payment failed → past_due (${reason})`);
 
           // Notify the driver their account is paused and they must re-add a
           // card. Non-blocking — a mail failure must not 5xx the webhook.
           if (driver.email) {
-            sendPaymentFailedEmail(driver).catch((err) =>
+            sendPaymentFailedEmail(driver, reason).catch((err) =>
               console.error(`[Stripe Webhook] Failed to send payment-failed email to driver ${driver.id}:`, err.message),
             );
           }

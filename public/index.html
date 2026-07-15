@@ -771,6 +771,10 @@
     </div>
   </div>
 
+  <!-- Why the last charge failed (Stripe's decline reason) — so drivers don't
+       keep retrying the same bad card. Filled by prepareBillingView. -->
+  <div id="billing-decline-reason" style="display:none;margin-bottom:16px;padding:12px 16px;background:rgba(245,166,35,0.12);border:1px solid rgba(245,166,35,0.4);border-radius:10px;color:#f5a623;font-size:14px;font-weight:600;"></div>
+
   <div id="billing-error" style="display:none;margin-bottom:16px;padding:12px 16px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.4);border-radius:10px;color:#f87171;font-size:14px;font-weight:600;"></div>
 
   <!-- CTA -->
@@ -780,6 +784,14 @@
   <p id="billing-cta-note" style="text-align:center;font-size:13px;color:var(--muted);margin-bottom:24px;">
     Card required — you'll be charged $16 today. Cancel any time.
   </p>
+  <button class="btn btn-ghost" id="btn-billing-refresh" style="font-size:14px;margin-bottom:10px;display:flex;align-items:center;justify-content:center;gap:8px;">
+    <span>Already paid? Refresh status</span>
+    <!-- Inline SVG refresh icon — the ↻ glyph renders as a hook in some device fonts -->
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink:0;">
+      <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+      <polyline points="21 3 21 9 15 9" />
+    </svg>
+  </button>
   <button class="btn btn-ghost" id="btn-logout-billing" style="opacity:0.5;font-size:14px;">Log out</button>
 
   <!-- Shown for past_due / canceled drivers instead of the trial button -->

@@ -86,11 +86,12 @@ function passwordResetEmail(driverName, resetUrl) {
 }
 
 // ─── Template: payment failed ──────────────────────────────────────────────────
-function paymentFailedEmail(driverName, billingUrl) {
+function paymentFailedEmail(driverName, billingUrl, reason) {
   return layout('Payment failed — action needed — SAN Queue', `
     <h1>Your payment didn't go through</h1>
     <p>Hi ${driverName}, we couldn't charge your card for your SAN Queue subscription, so your account has been paused — the bot will stop checking you into the queue until this is resolved.</p>
-    <div class="warning">⚠️ Your account is locked until a working card is added. Add your card below and you'll be charged right away to restore access.</div>
+    ${reason ? `<p><strong>Reason from your bank:</strong> ${reason}</p>` : ''}
+    <div class="warning">⚠️ Your account is locked until a working card is added.${reason ? ' Re-adding the same card will likely fail again — fix the issue above or use a different card.' : ''} Add your card below and you'll be charged right away to restore access.</div>
     <a class="btn" href="${billingUrl}">Add Card &amp; Restore Access</a>
     <div class="link-fallback">
       If the button doesn't work, copy this link into your browser:<br />
@@ -146,12 +147,12 @@ async function sendPasswordResetEmail(driver, token) {
  * Notify a driver that their subscription payment failed and their account is
  * locked until they add a working card. CTA lands on the in-app billing screen.
  */
-async function sendPaymentFailedEmail(driver) {
+async function sendPaymentFailedEmail(driver, reason) {
   const billingUrl = `${APP_URL}/app/`;
   await send({
     to:      driver.email,
     subject: 'Payment failed — your SAN Queue account is paused',
-    html:    paymentFailedEmail(driver.name, billingUrl),
+    html:    paymentFailedEmail(driver.name, billingUrl, reason || driver.last_payment_error),
   });
 }
 

@@ -168,6 +168,46 @@ async function createSetupSession({ customerId, driverId, successUrl, cancelUrl 
   });
 }
 
+// Friendly fallbacks for common decline codes when Stripe supplies no message.
+// Stripe's own `message` is already cardholder-appropriate, so these are only
+// used when it's absent.
+const DECLINE_CODE_TEXT = {
+  insufficient_funds: 'Your card has insufficient funds.',
+  expired_card:       'Your card has expired.',
+  incorrect_cvc:      "Your card's security code is incorrect.",
+  card_declined:      'Your card was declined.',
+  do_not_honor:       'Your card was declined by your bank.',
+  generic_decline:    'Your card was declined.',
+};
+
+/**
+ * Build the human-readable payment-failure reason we store on the driver row
+ * and show on the Payment Required screen / email. Accepts the fields of a
+ * PaymentIntent's `last_payment_error` or of a thrown Stripe card error:
+ *   { message, declineCode, brand, last4 }
+ * Always returns a non-empty string.
+ *
+ * Pure / no I/O — exported for unit testing via `_formatDeclineReason`.
+ */
+function formatDeclineReason({ message, declineCode, brand, last4 } = {}) {
+  const reason = message
+    || DECLINE_CODE_TEXT[declineCode]
+    || 'Your card was declined.';
+  const card = last4
+    ? `${brand ? brand.charAt(0).toUpperCase() + brand.slice(1) : 'Card'} •••• ${last4}: `
+    : '';
+  // Column is varchar(300) — keep well under it.
+  return (card + reason).slice(0, 280);
+}
+
+/**
+ * Retrieve a PaymentIntent (used by the invoice.payment_failed webhook to read
+ * `last_payment_error` — the decline reason shown to the driver).
+ */
+async function retrievePaymentIntent(paymentIntentId) {
+  return getStripe().paymentIntents.retrieve(paymentIntentId);
+}
+
 /**
  * Pay EVERY open (finalized, awaiting-payment) invoice for a customer, on the
  * given card. This is the single money-recovery primitive shared by both
@@ -189,7 +229,7 @@ async function payAllOpenInvoices(customerId, paymentMethodId) {
   const stripe = getStripe();
   const open   = await stripe.invoices.list({ customer: customerId, status: 'open', limit: 100 });
 
-  const result = { attempted: open.data.length, paidCount: 0, amountPaid: 0, failed: 0 };
+  const result = { attempted: open.data.length, paidCount: 0, amountPaid: 0, failed: 0, lastFailureReason: null };
   for (const invoice of open.data) {
     try {
       const paid = await stripe.invoices.pay(
@@ -200,6 +240,12 @@ async function payAllOpenInvoices(customerId, paymentMethodId) {
       result.amountPaid += paid.amount_paid || 0;
     } catch (err) {
       result.failed += 1;
+      // Card errors carry the cardholder-facing reason — keep it so callers can
+      // store/show it (drivers shouldn't retry a bad card blind).
+      result.lastFailureReason = formatDeclineReason({
+        message:     err.message,
+        declineCode: err.decline_code,
+      });
       console.error(`[Stripe] Failed to pay invoice ${invoice.id} for ${customerId}: ${err.message}`);
     }
   }
@@ -277,6 +323,48 @@ async function retrieveSubscription(subscriptionId) {
 }
 
 /**
+ * List every subscription (any status) for a customer, newest first.
+ * Used to verify payment state directly against Stripe when webhook delivery
+ * can't be relied on (the paywall return path), and to guard Checkout against
+ * creating a duplicate subscription for a driver who already paid.
+ */
+async function listSubscriptions(customerId) {
+  const res = await getStripe().subscriptions.list({
+    customer: customerId,
+    status:   'all',
+    limit:    20,
+  });
+  return res.data;
+}
+
+// Ranking for pickRelevantSubscription: lower = more authoritative about the
+// driver's real access state. A live paid sub always beats a dead one, no
+// matter how recently the dead one was created.
+const SUB_STATUS_RANK = {
+  active:     0,
+  trialing:   1,
+  past_due:   2,
+  unpaid:     3,
+  incomplete: 4,
+  canceled:   5,
+};
+
+/**
+ * Pick the single subscription that best represents the customer's access
+ * state: best status first (see SUB_STATUS_RANK), most recently created among
+ * ties. Returns null for an empty list.
+ *
+ * Pure / no I/O — exported for unit testing via `_pickRelevantSubscription`.
+ */
+function pickRelevantSubscription(subscriptions = []) {
+  if (!subscriptions.length) return null;
+  return [...subscriptions].sort((a, b) => {
+    const rank = (s) => SUB_STATUS_RANK[s.status] ?? 9;
+    return rank(a) - rank(b) || (b.created || 0) - (a.created || 0);
+  })[0];
+}
+
+/**
  * Remove a scheduled "cancel at period end" from a still-live subscription — the
  * driver changed their mind during the grace window. No new charge: the existing
  * subscription simply keeps running. Returns the updated subscription so the
@@ -317,10 +405,16 @@ module.exports = {
   retrieveCheckoutSession,
   createPortalSession,
   retrieveSubscription,
+  retrievePaymentIntent,
+  listSubscriptions,
+  pickRelevantSubscription,
+  formatDeclineReason,
   resumeSubscription,
   scheduleCancelAtPeriodEnd,
   constructWebhookEvent,
   // Exported for unit testing — not called by route handlers.
-  _trialConfig:     trialConfig,
-  _skipTrialConfig: skipTrialConfig,
+  _trialConfig:              trialConfig,
+  _skipTrialConfig:          skipTrialConfig,
+  _pickRelevantSubscription: pickRelevantSubscription,
+  _formatDeclineReason:      formatDeclineReason,
 };

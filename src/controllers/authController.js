@@ -335,6 +335,63 @@ async function resendVerification(req, res, next) {
   }
 }
 
+// ─── Sync a driver's subscription state directly from Stripe ─────────────────
+// Webhooks are the normal write path for subscription_status, but the paywall
+// return flow can't depend on them alone: delivery can lag past the boot poll,
+// and in the installed PWA the Stripe redirect can land in a different browser
+// context entirely. This reads Stripe truth on demand and mirrors the webhook
+// handlers' update semantics onto the driver row.
+//
+// Returns the fresh Stripe status (string), or null when the driver has no
+// Stripe customer / no subscription at all (row left untouched).
+async function syncSubscriptionFromStripe(driver) {
+  if (!driver.stripe_customer_id) return null;
+
+  const subs = await stripeService.listSubscriptions(driver.stripe_customer_id);
+  const sub  = stripeService.pickRelevantSubscription(subs);
+  if (!sub) return null;
+
+  const isLive = ['active', 'trialing'].includes(sub.status);
+  await Driver.update(driver.id, {
+    stripe_subscription_id: sub.id,
+    subscription_status:    sub.status,
+    trial_ends_at:          sub.trial_end ? new Date(sub.trial_end * 1000) : null,
+    subscription_cancel_at: (sub.cancel_at_period_end && sub.cancel_at)
+      ? new Date(sub.cancel_at * 1000)
+      : null,
+    // A live subscription means a card was collected — same treatment as the
+    // checkout.session.completed webhook: lift any card-enforcement lock,
+    // re-activate a driver the sweep had deactivated, and drop any stale
+    // decline reason from a previous failed attempt.
+    ...(isLive ? { is_active: true, card_required_by: null, last_payment_error: null } : {}),
+  });
+
+  if (driver.subscription_status !== sub.status) {
+    console.log(`[Billing Sync] Driver ${driver.id} subscription_status: ${driver.subscription_status || 'none'} → ${sub.status} (from Stripe)`);
+  }
+  return sub.status;
+}
+
+// POST /api/auth/driver/sync-subscription — called by the paywall when the
+// driver returns from Checkout (billing=success boot, app re-focus, manual
+// refresh button). Intentionally NOT behind requireSubscription: the caller is
+// by definition locked out. Returns { subscription_status }.
+async function syncSubscription(req, res, next) {
+  try {
+    const driver = await Driver.findById(req.driverId);
+    if (!driver) {
+      const err = new Error('Driver not found');
+      err.statusCode = 404;
+      throw err;
+    }
+
+    const status = await syncSubscriptionFromStripe(driver);
+    res.json({ subscription_status: status ?? driver.subscription_status ?? null });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // ─── Create Stripe Checkout Session ──────────────────────────────────────────
 // Returns { url } — the frontend redirects the driver to Stripe's hosted page.
 async function createCheckoutSession(req, res, next) {
@@ -349,6 +406,18 @@ async function createCheckoutSession(req, res, next) {
       const err = new Error('Please verify your email address before setting up billing.');
       err.statusCode = 403;
       throw err;
+    }
+
+    // Duplicate-subscription guard: a driver stuck on a stale paywall after
+    // paying (webhook lagged / PWA return gap) will tap Subscribe again. If
+    // Stripe already holds a live subscription for them, don't sell a second
+    // one — sync the row from Stripe truth and tell the frontend to let them in.
+    if (driver.stripe_customer_id) {
+      const status = await syncSubscriptionFromStripe(driver);
+      if (['active', 'trialing'].includes(status)) {
+        console.log(`[Billing] Driver ${driver.id} create-checkout skipped — live subscription already on Stripe (${status})`);
+        return res.json({ already_subscribed: true, subscription_status: status });
+      }
     }
 
     // Reuse existing Stripe customer or create a new one
@@ -402,6 +471,15 @@ async function reactivateCheckout(req, res, next) {
     // No live subscription/customer to reactivate → behave like a fresh signup,
     // but charge at checkout (skipTrial) since they've used the service before.
     if (!driver.stripe_customer_id || !driver.stripe_subscription_id) {
+      // Same duplicate-subscription guard as create-checkout: the sub id can be
+      // missing from the row while a live subscription exists on Stripe.
+      if (driver.stripe_customer_id) {
+        const status = await syncSubscriptionFromStripe(driver);
+        if (['active', 'trialing'].includes(status)) {
+          console.log(`[Billing] Driver ${driver.id} reactivate-checkout skipped — live subscription already on Stripe (${status})`);
+          return res.json({ already_subscribed: true, subscription_status: status });
+        }
+      }
       let customerId = driver.stripe_customer_id;
       if (!customerId) {
         const customer = await stripeService.createCustomer(driver);
@@ -522,6 +600,7 @@ module.exports = {
   verifyEmail,
   resendVerification,
   createCheckoutSession,
+  syncSubscription,
   reactivateCheckout,
   resumeSubscription,
   billingPortal,

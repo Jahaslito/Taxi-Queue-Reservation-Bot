@@ -198,10 +198,19 @@ window.__APP_CONFIG__ = { billingEnabled: true }; // safe default until fetched
       showToast('Verification link expired. Please request a new one.', 'error');
     }
 
-    // ?billing=success — Stripe checkout just completed; may need a moment for
-    // the webhook to fire. Poll profile up to 8 s until status becomes trialing/active.
+    // ?billing=success — Stripe checkout just completed. Don't gamble on the
+    // webhook having landed: ask the server to verify the subscription against
+    // Stripe directly and sync the row now. Only if that fails do we fall back
+    // to the old profile poll (webhook race).
     if (billing === 'success') {
       let resolved = ['trialing', 'active'].includes(profile.subscription_status);
+      if (!resolved) {
+        try {
+          const sync = await api('/api/auth/driver/sync-subscription', { method: 'POST' });
+          if (sync.subscription_status) profile.subscription_status = sync.subscription_status;
+          resolved = ['trialing', 'active'].includes(profile.subscription_status);
+        } catch { /* fall back to polling below */ }
+      }
       if (!resolved) {
         for (let i = 0; i < 4 && !resolved; i++) {
           await new Promise(r => setTimeout(r, 2000));

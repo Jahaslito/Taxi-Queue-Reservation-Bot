@@ -27,6 +27,9 @@ const PUBLIC_FIELDS = [
   'subscription_cancel_at',
   // Card-on-file enforcement deadline (grandfathered cardless cohort)
   'card_required_by',
+  // Stripe's reason for the most recent failed charge (cleared on success) —
+  // shown on the Payment Required screen so drivers don't retry a bad card blind
+  'last_payment_error',
   // SMS opt-in (Telnyx toll-free compliance — must be an explicit per-driver choice)
   'sms_opt_in',
 ];

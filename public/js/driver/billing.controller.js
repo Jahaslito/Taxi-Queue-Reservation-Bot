@@ -155,6 +155,16 @@ document.getElementById('btn-dash-add-card')?.addEventListener('click', async fu
   this.innerHTML = '<span class="spinner"></span> Connecting…';
   try {
     const data = await api('/api/auth/driver/create-checkout', { method: 'POST' });
+    // Already paid + live on Stripe (duplicate-checkout guard) — the banner
+    // clears on the next profile refresh; nothing to collect.
+    if (data.already_subscribed) {
+      showToast('✅ Your subscription is already active — no card needed.', 'success');
+      this.disabled    = false;
+      this.textContent = 'Add card →';
+      const banner = document.getElementById('dash-card-banner');
+      if (banner) banner.style.display = 'none';
+      return;
+    }
     window.location.href = data.url;
   } catch (err) {
     showToast(err.message || 'Could not start checkout. Please try again.', 'error');
@@ -179,6 +189,20 @@ window.prepareBillingView = function (profile) {
   const errEl = document.getElementById('billing-error');
   errEl.style.display = 'none';
   errEl.textContent   = '';
+
+  // Stripe's reason for the last failed charge (cleared server-side the moment
+  // a payment succeeds). Telling drivers WHY stops them retrying the same bad
+  // card over and over.
+  const declineEl = document.getElementById('billing-decline-reason');
+  if (declineEl) {
+    if (profile?.last_payment_error) {
+      declineEl.textContent   = `⚠️ Last payment attempt failed — ${profile.last_payment_error}`;
+      declineEl.style.display = 'block';
+    } else {
+      declineEl.style.display = 'none';
+      declineEl.textContent   = '';
+    }
+  }
 
   // Fine print under the primary CTA. With the free trial off
   // (TRIAL_PERIOD_DAYS unset/0, the current default), every branch — new
@@ -250,6 +274,65 @@ window.prepareBillingView = function (profile) {
   }
 };
 
+// ─── Paywall self-heal ────────────────────────────────────────────────────────
+// A driver who paid can still be looking at the paywall: in the installed PWA
+// the Stripe redirect lands in an in-app browser (separate window — the PWA
+// never navigates), and even in a normal tab the boot poll gives up after 8 s.
+// So whenever the paywall is the active view and the app regains focus — or the
+// driver taps the manual refresh button — verify against Stripe via the server
+// and route straight to the dashboard the moment the subscription is live.
+
+function billingViewActive() {
+  return document.getElementById('view-billing')?.classList.contains('active');
+}
+
+let _paywallSyncBusy = false;
+let _paywallSyncLast = 0;
+
+/**
+ * Verify the subscription server-side (Stripe truth) and re-route if it's live.
+ * Auto-triggers are throttled to one attempt per 5 s; pass force=true (manual
+ * refresh button) to bypass the throttle. Returns true when access was granted.
+ */
+async function syncPaywallStatus(force = false) {
+  if (_paywallSyncBusy) return false;
+  if (!force && Date.now() - _paywallSyncLast < 5000) return false;
+  _paywallSyncBusy = true;
+  _paywallSyncLast = Date.now();
+  try {
+    const sync = await api('/api/auth/driver/sync-subscription', { method: 'POST' });
+    if (!['trialing', 'active'].includes(sync.subscription_status)) return false;
+    const fresh = await api('/api/driver/profile');
+    showToast('🎉 Subscription active — welcome to SAN Queue!', 'success');
+    routeDriver(fresh);
+    return true;
+  } catch {
+    return false; // network / not logged in — the paywall simply stays
+  } finally {
+    _paywallSyncBusy = false;
+  }
+}
+
+// Re-check when the driver switches back to the app while parked on the paywall
+// (the common return path after paying in the in-app/external browser).
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && billingViewActive()) syncPaywallStatus();
+});
+
+// Manual escape hatch on the paywall: "Already paid? Refresh status"
+document.getElementById('btn-billing-refresh')?.addEventListener('click', async function () {
+  this.disabled = true;
+  // innerHTML, not textContent — the label includes an inline SVG refresh icon
+  const original = this.innerHTML;
+  this.innerHTML = '<span class="spinner"></span> Checking…';
+  const ok = await syncPaywallStatus(true);
+  if (!ok) {
+    showToast('No active subscription found yet. If you just paid, wait a few seconds and try again.', 'error');
+    this.disabled  = false;
+    this.innerHTML = original;
+  }
+});
+
 // ─── Start billing / checkout ─────────────────────────────────────────────────
 document.getElementById('btn-start-billing').addEventListener('click', async function () {
   const errEl = document.getElementById('billing-error');
@@ -263,6 +346,14 @@ document.getElementById('btn-start-billing').addEventListener('click', async fun
 
   try {
     const data = await api(endpoint, { method: 'POST' });
+    // Duplicate-checkout guard tripped server-side: they already paid and
+    // Stripe holds a live subscription — let them straight in, no re-charge.
+    if (data.already_subscribed) {
+      const fresh = await api('/api/driver/profile');
+      showToast('🎉 You already have an active subscription — welcome back!', 'success');
+      routeDriver(fresh);
+      return;
+    }
     window.location.href = data.url;
   } catch (err) {
     errEl.textContent   = err.message || 'Could not start checkout. Please try again.';
@@ -321,6 +412,10 @@ window.addEventListener('pageshow', event => {
   if (typeof driverProfile !== 'undefined' && driverProfile && window.prepareBillingView) {
     window.prepareBillingView(driverProfile);
   }
+
+  // Restored from bfcache onto the paywall (Stripe's "Close" uses
+  // history.back()) — the driver may have just paid, so verify with Stripe.
+  if (billingViewActive()) syncPaywallStatus();
 });
 
 // ─── view-verify-email helpers ────────────────────────────────────────────────

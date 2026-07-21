@@ -27,9 +27,11 @@ const makeState = (over = {}) => ({
 });
 
 // lead = min(estimatedDrift 55, POS_MAX_LEAD 10) = 10 ; target 100 ; max 120
+// Burst-rate ctx (3.0/s): the growth-scaled lead cap (MONITOR_GROWTH_LEAD,
+// 2026-07-19) only bites at calm rates — these probe scenarios are storms.
 const baseCtx = {
   waitingCount: 50,
-  effectiveGrowthRate: 1.0,
+  effectiveGrowthRate: 3.0,
   estimatedDrift: 55,
   biasCorrection: 0,
   horizonSeconds: 55,

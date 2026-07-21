@@ -678,9 +678,11 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
 // ─── Lightweight V Holding verifier ──────────────────────────────────────────
 // Used by the catch handler above. We import lazily to avoid a circular
 // dependency (botService ← monitorService for the parseQueue helper).
-async function verifyDriverInQueue(vehicleNumber) {
+// One snapshot fetch serves any number of vehicle lookups — the fire-visibility
+// poller below checks every in-flight fire against a single fetch per tick.
+async function fetchQueueSnapshot() {
   const { fetch: ufetch } = require('undici');
-  const { _parseQueue, _norm } = require('./monitorService');
+  const { _parseQueue } = require('./monitorService');
   const QUEUE_URL = process.env.MONITOR_QUEUE_URL
     ?? 'https://san.gtcvms.com/GSIDispatchmobile/spacezone/10-17';
   const res  = await ufetch(QUEUE_URL, {
@@ -689,11 +691,16 @@ async function verifyDriverInQueue(vehicleNumber) {
     signal: AbortSignal.timeout(10_000),
   });
   if (!res.ok) return null;
-  const html = await res.text();
-  const { waiting, dispatched } = _parseQueue(html);
+  return _parseQueue(await res.text()); // { waiting, dispatched } maps
+}
+
+async function verifyDriverInQueue(vehicleNumber) {
+  const snap = await fetchQueueSnapshot();
+  if (!snap) return null;
+  const { _norm } = require('./monitorService');
   const vn = _norm(vehicleNumber);
-  if (waiting.has(vn))    return { position: waiting.get(vn),    location: 'V Holding' };
-  if (dispatched.has(vn)) return { position: dispatched.get(vn), location: 'Dispatched' };
+  if (snap.waiting.has(vn))    return { position: snap.waiting.get(vn),    location: 'V Holding' };
+  if (snap.dispatched.has(vn)) return { position: snap.dispatched.get(vn), location: 'Dispatched' };
   return null;
 }
 
@@ -714,6 +721,100 @@ async function verifyAddLanded(vehicleNumber) {
     if (info && Number.isFinite(info.position)) return info;
   }
   return null;
+}
+
+// ─── Fire-visibility watch (live SAN-backlog signal + early landings) ─────────
+// SAN stamps a fire's position when its server PROCESSES the click, but the
+// WAIT-screen confirmation streams back much later under storm load (07-12/…/
+// 07-18: 12–33 s while the queue moved 30–60). Two consequences this watch
+// exploits, at the cost of one extra spacezone fetch per ~1.25 s while fires
+// are in flight:
+//
+//  1. BACKLOG SIGNAL — a fired vehicle that is not yet VISIBLE in V Holding has
+//     not been processed (visibility = processed + ≤5 s render + poll). The age
+//     of the oldest such fire, times the display slope, estimates how many
+//     positions of already-committed adds sit in SAN's pipe ahead of a click
+//     made right now — the quantity that landed 07-15…07-18 fires +20…+59 past
+//     target. monitorService reads it via oldestUnseenFireAgeMs() to open the
+//     onset early-fire cap ONLY when a deep backlog is proven (see
+//     MONITOR_ONSET_CAP_MAX). Crucially this stays near zero when confirm
+//     latency is mere stream-back lag (07-19: 12 s confirms, backlog ~14 —
+//     fires were visible within ~3 s), the case that must NOT deepen the cap.
+//
+//  2. EARLY LANDINGS — the position seen in V Holding is the landing, available
+//     ~5–10 s before the WAIT-screen confirm mid-storm. It feeds the fleet
+//     probe (recordFleetLanding via the listener) that much sooner.
+//
+// Entries live from click dispatch until fireClaimedSession reaches a verdict
+// (confirm, vehicle_not_available, verify-recovery, or cold fallback) — exactly
+// the in-flight window. FIRE_VIS_START_MS keeps the calm case free (a ~1.5 s
+// confirm resolves before the first poll would even count it).
+const FIRE_VIS_POLL_MS    = parseInt(process.env.BOT_FIRE_VIS_POLL_MS    ?? '1250', 10);
+const FIRE_VIS_START_MS   = parseInt(process.env.BOT_FIRE_VIS_START_MS   ?? '2000', 10);
+const FIRE_VIS_TIMEOUT_MS = parseInt(process.env.BOT_FIRE_VIS_TIMEOUT_MS ?? '60000', 10);
+
+const pendingFireVis = new Map(); // vehicleNumber → { clickAtMs, seenAtMs }
+let fireVisTimer     = null;
+let fireVisListener  = null;      // ({ vehicleNumber, position }) — set by monitorService
+let fetchSnapshotFn  = fetchQueueSnapshot; // injectable for tests
+
+function setFireVisibilityListener(fn) { fireVisListener = fn; }
+
+function beginFireVisibility(vehicleNumber, nowMs = Date.now()) {
+  pendingFireVis.set(String(vehicleNumber), { clickAtMs: nowMs, seenAtMs: null });
+  scheduleFireVisPoll();
+}
+
+function resolveFireVisibility(vehicleNumber) {
+  pendingFireVis.delete(String(vehicleNumber));
+  if (pendingFireVis.size === 0 && fireVisTimer) {
+    clearTimeout(fireVisTimer);
+    fireVisTimer = null;
+  }
+}
+
+/** Age (ms) of the oldest in-flight fire not yet visible in V Holding — 0 when
+ *  everything recent is processed. The monitor's backlog boost input. */
+function oldestUnseenFireAgeMs(nowMs = Date.now()) {
+  let oldest = 0;
+  for (const rec of pendingFireVis.values()) {
+    if (rec.seenAtMs) continue;
+    const age = nowMs - rec.clickAtMs;
+    if (age >= FIRE_VIS_START_MS && age <= FIRE_VIS_TIMEOUT_MS) oldest = Math.max(oldest, age);
+  }
+  return oldest;
+}
+
+function scheduleFireVisPoll() {
+  if (fireVisTimer || pendingFireVis.size === 0) return;
+  fireVisTimer = setTimeout(async () => {
+    fireVisTimer = null;
+    try { await fireVisPollOnce(); } catch { /* next tick retries */ }
+    scheduleFireVisPoll();
+  }, FIRE_VIS_POLL_MS);
+  fireVisTimer.unref?.();
+}
+
+async function fireVisPollOnce(nowMs = Date.now()) {
+  // Prune abandoned entries (verdict never resolved them — crash paths).
+  for (const [veh, rec] of pendingFireVis) {
+    if (nowMs - rec.clickAtMs > FIRE_VIS_TIMEOUT_MS) pendingFireVis.delete(veh);
+  }
+  const due = [...pendingFireVis.entries()]
+    .filter(([, r]) => !r.seenAtMs && nowMs - r.clickAtMs >= FIRE_VIS_START_MS);
+  if (due.length === 0) return;
+  const snap = await fetchSnapshotFn().catch(() => null);
+  if (!snap) return;
+  const { _norm } = require('./monitorService');
+  for (const [veh, rec] of due) {
+    const pos = snap.waiting.get(_norm(veh));
+    if (Number.isFinite(pos)) {
+      rec.seenAtMs = nowMs;
+      console.log(`[Arm] 👁 #${veh} visible in V Holding at ${pos} ` +
+        `(${((nowMs - rec.clickAtMs) / 1000).toFixed(1)}s after click) — early landing signal`);
+      try { fireVisListener?.({ vehicleNumber: veh, position: pos }); } catch { /* listener owns its errors */ }
+    }
+  }
 }
 
 /** Returns true if the WAIT confirmation screen is currently visible. */
@@ -1896,6 +1997,10 @@ async function fireClaimedSession(session) {
     if (!fastClicked) {
       await page.click(`button:has-text("${SAN_TEXT.ADD_TO_QUEUE_BUTTON}")`, { timeout: 2000 });
     }
+    // Click dispatched — the add is committed whenever SAN processes it. Watch
+    // V Holding for it from here: not-yet-visible age is the live backlog
+    // signal, and first visibility is an early landing (see the watch above).
+    beginFireVisibility(vehicleNumber);
     await page.waitForFunction(
       (needles) => needles.some((s) => document.body.innerText.includes(s)),
       [SAN_TEXT.REMOVE_FROM_QUEUE, SAN_TEXT.VEHICLE_NOT_AVAILABLE],
@@ -1961,6 +2066,9 @@ async function fireClaimedSession(session) {
     await debugCapture(page, vehicleNumber, 'armed_fire_error').catch(() => {});
     return null;
   } finally {
+    // Every verdict path ends the in-flight window: confirm, not-available,
+    // verify-recovery, or cold fallback (no-op if the click never dispatched).
+    resolveFireVisibility(vehicleNumber);
     await cap.dump();
     await disposeClaimedSession(session, 'fire attempt consumed the session');
   }
@@ -2051,4 +2159,13 @@ module.exports = {
   _isWaitScreen:                  isWaitScreen,
   _SAN_TEXT:                      SAN_TEXT,
   verifyDriverInQueue,
+  // Fire-visibility watch — backlog signal + early landings (see the section).
+  setFireVisibilityListener,
+  oldestUnseenFireAgeMs,
+  // Exposed for unit tests.
+  _beginFireVisibility:           beginFireVisibility,
+  _resolveFireVisibility:         resolveFireVisibility,
+  _fireVisPollOnce:               fireVisPollOnce,
+  _setFetchSnapshotFn:            (fn) => { fetchSnapshotFn = fn; },
+  _pendingFireVis:                pendingFireVis,
 };

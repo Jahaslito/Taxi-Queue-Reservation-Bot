@@ -227,6 +227,58 @@ const ONSET_QUIET_MS    = parseInt(process.env.MONITOR_ONSET_QUIET_MS ?? '25000'
 // Render steps older than this no longer describe the storm's current violence
 // (drives the dynamic cap above). Internal — ~4 render cycles.
 const ONSET_EVIDENCE_WINDOW_MS = 20000;
+// ─── Backlog-aware onset cap + target-horizon guard (2026-07-19) ─────────────
+// 07-15…07-18 forensics (5-morning replay, 314 fires): mid-ramp fires landed
+// (landed − queue@fire) = +20…+61 past the queue they fired at — SAN's
+// PROCESSING BACKLOG (adds already in its pipe ahead of our click; position is
+// stamped at click-processing time). The flat cap-20/25 onset allowance is half
+// the needed size mid-ramp (needs 30–55) yet TOO DEEP at the storm's death
+// (07-15 #0767 −12, 07-16 #0082 −18, 07-19 #0003 −19 — all fired early-by
+// 19–20 just as arrivals stopped, all targets ≥196). Two additions:
+//
+//  BACKLOG BOOST — the cap may exceed the base dynamic cap up to ONSET_CAP_MAX
+//  only while a deep backlog is PROVEN live: boost = display slope (pos/s over
+//  the last 10 s of render steps) × age of the oldest in-flight fire not yet
+//  VISIBLE in V Holding (botService.oldestUnseenFireAgeMs, minus the ~3.5 s
+//  render+poll baseline). Visibility — not confirm latency — separates real
+//  processing backlog (07-18: unseen 10 s+, backlog 38–54) from mere WAIT-
+//  screen stream-back lag (07-19: 12 s confirms but visible in ~3 s, backlog
+//  ~14), the case that must NOT deepen the cap (replay: deepening on confirm
+//  latency alone lands −19…−26 on 07-15/07-19).
+//
+//  TARGET-HORIZON GUARD — every observed storm since mid-June has run to a
+//  total of ≥190 positions (July: 200–232 five mornings straight), and every
+//  onset undershoot breach sat at target ≥196, exactly where storms die. So
+//  the deep allowance is prior-safe only below that boundary: targets ≤
+//  SAFE_HORIZON get the full (possibly boosted) cap; SAFE_HORIZON…MID_HORIZON
+//  get at most MID_CAP; above MID_HORIZON the onset rule is off entirely (the
+//  plain lead rule fires them on proven queue — post-storm drain lands −6…−9,
+//  vs the −12…−19 the cap produced there).
+//
+//  Replay over the 5 real mornings (anchored arrival-envelope method): p90
+//  overshoot +35→+31, worst +59→+47, zero undershoot breaches on all days
+//  (actual: 9). A clairvoyant oracle bounds these mornings at p90 ≈ +24 — the
+//  residual is SAN's arrival physics, not policy slack.
+const ONSET_CAP_MAX         = parseInt(process.env.MONITOR_ONSET_CAP_MAX         ?? '45', 10);
+const ONSET_SAFE_HORIZON    = parseInt(process.env.MONITOR_ONSET_SAFE_HORIZON    ?? '170', 10);
+const ONSET_MID_HORIZON     = parseInt(process.env.MONITOR_ONSET_MID_HORIZON     ?? '200', 10);
+const ONSET_MID_CAP         = parseInt(process.env.MONITOR_ONSET_MID_CAP         ?? '15', 10);
+const ONSET_VIS_BASELINE_MS = parseInt(process.env.MONITOR_ONSET_VIS_BASELINE_MS ?? '3500', 10);
+// Growth-scaled lead (MONITOR_GROWTH_LEAD, default ON — '0' disables): the
+// plain-rule lead additionally capped at 2 + 3×growthRate positions. The
+// drift floor (5) + bias (≈10) spend the full lead-10 on CALM pre-storm
+// mornings where growth during the ~1.5 s commit is ~0 — six of the nine
+// 07-15…07-19 undershoot breaches (−11…−13) were exactly this. At storm rates
+// (≥2.7/s) the cap is ≥10, i.e. a no-op; it never delays a burst fire.
+const GROWTH_LEAD_ENABLED   = (process.env.MONITOR_GROWTH_LEAD ?? '1') !== '0';
+// Undershoot-rescue detector (MONITOR_UNDER_RESCUE: '0' off | 'shadow'
+// log-only, default). A landing below target−10 is RECOVERABLE once the storm
+// dies: the tail keeps growing (07-19: display 232→251 within 90 s of the
+// storm end, 313 by 05:09), and a server-verified remove + armed re-add at
+// calm lands at tail+1 — in-band. Shadow mode only LOGS the moment such a
+// rescue would fire, to size the opportunity before any automation acts on a
+// paying driver's queue entry.
+const UNDER_RESCUE_MODE     = String(process.env.MONITOR_UNDER_RESCUE ?? 'shadow').toLowerCase();
 // Sacrificial tail probe (default OFF) — dedicated vehicle add→read→remove
 // cycles during the storm feed exact true-tail samples to the fleet probe.
 // See tailProbeService.js for the full rationale and safety rails.
@@ -608,6 +660,9 @@ const freshOnsetState = () => ({
   active: false, prevQueue: null, lastEvidenceMs: 0, recentSteps: [], stepSeen: 0,
 });
 let onsetState = freshOnsetState();
+// Last effective cap logged (backlog boost) — change-gated so the log shows the
+// cap ladder, not one line per tick.
+let lastLoggedOnsetCap = 0;
 
 function onsetStep(st, { queue, rate, nowMs = Date.now() }) {
   const changed = st.prevQueue !== null && queue !== st.prevQueue;
@@ -633,10 +688,30 @@ function onsetStep(st, { queue, rate, nowMs = Date.now() }) {
 /** Calm-morning guard: the early-fire allowance actually in force. Scales with
  *  the storm's observed violence — a lone +5 calm-day flurry unlocks only the
  *  normal lead (~10, i.e. no extra undershoot), a real chunk unlocks the full
- *  cap. Never exceeds ONSET_CAP, so the contract bound is unchanged. */
-function onsetCapNow(st) {
+ *  cap. backlogBoost (see the ONSET_CAP_MAX block) may raise it further, up to
+ *  ONSET_CAP_MAX, while a deep SAN processing backlog is proven live. */
+function onsetCapNow(st, backlogBoost = 0) {
   const maxStep = st.recentSteps.reduce((m, s) => Math.max(m, s.step), 0);
-  return Math.min(ONSET_CAP, Math.max(POS_MAX_LEAD, 2 * maxStep));
+  const base    = Math.min(ONSET_CAP, Math.max(POS_MAX_LEAD, 2 * maxStep));
+  return Math.min(ONSET_CAP_MAX, Math.max(base, Math.floor(backlogBoost)));
+}
+
+/** Live SAN-backlog estimate in positions: display slope (render steps of the
+ *  last 10 s) × how long the oldest in-flight fire has been invisible in
+ *  V Holding beyond the render+poll baseline. Zero unless the storm is active,
+ *  the display is genuinely ramping (≥2/s), and at least one fire is provably
+ *  stuck in SAN's pipe — all three gates measured, none extrapolated.
+ *  unseenAgeMs is injectable for tests; production reads botService. */
+function onsetBacklogBoost(st, { nowMs = Date.now(), unseenAgeMs = null } = {}) {
+  if (!st.active) return { boost: 0, slope10: 0, visAgeS: 0 };
+  const stepSum = st.recentSteps
+    .filter((s) => nowMs - s.t <= 10_000)
+    .reduce((a, s) => a + s.step, 0);
+  const slope10 = stepSum / 10;
+  if (slope10 < 2) return { boost: 0, slope10, visAgeS: 0 };
+  const rawAge  = unseenAgeMs ?? require('./botService').oldestUnseenFireAgeMs(nowMs);
+  const visAgeS = Math.min(25, Math.max(0, (rawAge - ONSET_VIS_BASELINE_MS) / 1000));
+  return { boost: slope10 * visAgeS, slope10, visAgeS };
 }
 function recordFleetLanding(position) {
   if (!Number.isFinite(position) || position <= 0) return;
@@ -658,6 +733,28 @@ function recordFleetLanding(position) {
     // estimate also avoids churning the poll on stale stragglers.
     if (FLEET_PROBE_ENABLED) nudgePoll();
   }
+}
+
+/** Undershoot-rescue detector (see UNDER_RESCUE_MODE — shadow/log-only). An
+ *  undershoot landing is recoverable exactly when the storm has died AND the
+ *  tail has grown back into the driver's band: a server-verified remove + armed
+ *  re-add at that moment lands at tail+1, in-band. Mid-storm this must never
+ *  trigger (the tail blows through the band in seconds; a re-add would chase
+ *  the ramp and overshoot) — hence the calm-rate gate. Logs once per driver per
+ *  day; no automation acts on it yet. */
+function maybeFlagUnderRescue(state, target, waitingCount, growthRate) {
+  if (UNDER_RESCUE_MODE === '0') return;
+  const landed = state.landedPositionToday;
+  if (!Number.isFinite(landed) || !Number.isFinite(target)) return;
+  if (landed >= target - 10) return;          // within contract — nothing to rescue
+  if (state.underRescueFlagged) return;       // one flag per day
+  if (growthRate >= 1.0) return;              // storm still running — unsafe to re-add
+  if (waitingCount < target - 5) return;      // tail hasn't re-reached the band yet
+  state.underRescueFlagged = true;
+  console.log(
+    `[Pos] 🛟 UNDER-RESCUE (shadow): #${state.vehicleNumber} landed ${landed} vs target ${target} ` +
+    `(${landed - target}); queue ${waitingCount} at calm ${growthRate.toFixed(2)}/s has re-reached the band — ` +
+    `a server-verified remove + armed re-add NOW would land in-band (log-only; no action taken)`);
 }
 
 // ─── Borrowed-probe roster (MONITOR_BORROW_PROBE) ─────────────────────────────
@@ -1715,6 +1812,10 @@ function evaluatePositionScheduler(state, ctx) {
     maxLeadPositions        = POS_MAX_LEAD,
     onsetActive             = false,
     onsetCap                = ONSET_CAP, // dynamic calm-guard cap — see onsetCapNow
+    growthLeadEnabled       = GROWTH_LEAD_ENABLED,
+    onsetSafeHorizon        = ONSET_SAFE_HORIZON,
+    onsetMidHorizon         = ONSET_MID_HORIZON,
+    onsetMidCap             = ONSET_MID_CAP,
   } = ctx;
 
   // Inactive drivers have no business being scheduled. isActive is synced to the
@@ -1753,6 +1854,7 @@ function evaluatePositionScheduler(state, ctx) {
     return {
       action:  'skip_already_fired',
       logLine: `[Pos] ${veh} — already fired today (target: ${effectivePosition}), skipping`,
+      metrics: baseMetrics, // target feeds the undershoot-rescue detector
     };
   }
   // Credentials confirmed bad earlier (warmer or a prior bot run). Skip the
@@ -1847,7 +1949,14 @@ function evaluatePositionScheduler(state, ctx) {
   // only trip when the queue itself is within lead of max, not because a
   // one-tick rate spike inflated the forecast (the Jun 04 false skips).
   const rawLead          = estimatedDrift + biasCorrection;
-  const lead             = Math.min(rawLead, maxLeadPositions);
+  // Growth-scaled cap (see GROWTH_LEAD_ENABLED): lead is spent undershoot, so
+  // never spend more of it than the queue's measured growth can repay during
+  // the commit. Calm (≤0.3/s) → lead 2–3 (was 10 via drift-floor+bias — the
+  // −11…−13 pre-storm class); any burst rate (≥2.7/s) → 10, unchanged.
+  const growthLeadCap    = growthLeadEnabled
+    ? Math.max(2, Math.ceil(2 + effectiveGrowthRate * 3))
+    : Infinity;
+  const lead             = Math.min(rawLead, maxLeadPositions, growthLeadCap);
   const leadClamped      = lead !== rawLead;
 
   // Fleet-landing true-tail probe (FLEET_PROBE_ENABLED): if a FRESH genuine
@@ -1909,8 +2018,16 @@ function evaluatePositionScheduler(state, ctx) {
   // processing raises the tail toward them within seconds, so they become
   // eligible before the display step ever shows it.
   const onsetGap      = effectivePosition - effectiveQueue;
+  // Target-horizon guard (see ONSET_SAFE_HORIZON block): the deep allowance is
+  // prior-safe only for targets the storm is certain to run past. Targets near
+  // the historical storm-death boundary get a tight cap; beyond it the onset
+  // rule is off — the plain lead rule fires them on proven queue, which the
+  // post-storm drain serves at −6…−9 instead of the cap's −12…−19.
+  const onsetAllow = effectivePosition <= onsetSafeHorizon
+    ? onsetCap
+    : (effectivePosition <= onsetMidHorizon ? Math.min(onsetCap, onsetMidCap) : 0);
   const onsetEligible = (ONSET_FIRE_LIVE || ONSET_FIRE_SHADOW)
-    && onsetActive && onsetGap > 0 && onsetGap <= onsetCap;
+    && onsetActive && onsetGap > 0 && onsetGap <= onsetAllow;
 
   const projectionReached = projectedLanding >= effectivePosition;
   const shouldFire        = projectionReached || (ONSET_FIRE_LIVE && onsetEligible);
@@ -1932,7 +2049,7 @@ function evaluatePositionScheduler(state, ctx) {
       secondsUntilFire: onsetOnly ? 0 : secondsUntilFire,
       logLine: onsetOnly
         ? `[Pos] ${veh} — ⚡ ONSET early fire: queue ${effectiveQueue}${probeNote}, target ${effectivePosition} ` +
-          `(early by ${onsetGap} ≤ cap ${onsetCap}, rate ${effectiveGrowthRate.toFixed(2)}/s) — firing before the chunk`
+          `(early by ${onsetGap} ≤ cap ${onsetAllow}, rate ${effectiveGrowthRate.toFixed(2)}/s) — firing before the chunk`
         : `[Pos] ${veh} — ✓ queue ${effectiveQueue}${probeNote} + lead ${Number.isInteger(lead) ? lead : lead.toFixed(1)}` +
           `${leadNote ? leadNote : ` (drift ${estimatedDrift}${biasCorrection !== 0 ? ` + bias ${biasCorrection.toFixed(1)}` : ''})`} ` +
           `= ${projectedLanding.toFixed(1)} ≥ target ${effectivePosition} ` +
@@ -1952,7 +2069,7 @@ function evaluatePositionScheduler(state, ctx) {
   // Shadow mode: the onset rule WOULD have fired here — log it so a shadow
   // morning can be replayed against actual landings before going live.
   const shadowNote = ONSET_FIRE_SHADOW && onsetEligible
-    ? ` [ONSET-SHADOW: would fire early by ${onsetGap} ≤ cap ${onsetCap}]`
+    ? ` [ONSET-SHADOW: would fire early by ${onsetGap} ≤ cap ${onsetAllow}]`
     : '';
   return {
     action:  'wait',
@@ -1984,6 +2101,7 @@ async function poll() {
       s.requeueCountToday  = 0;
       s.positionFiredToday = false;
       s.landedPositionToday = null; // yesterday's landing must not feed today's diagnostics
+      s.underRescueFlagged  = false; // rescue detector re-arms each day
       s.lastPosDecision    = null; // new day → next decision will write a fresh row
       s.pendingTrackingId  = null;
       s.consecutiveAlreadyQueued = 0;
@@ -2670,6 +2788,7 @@ async function poll() {
 
   // Storm-onset tracker — advanced exactly once per tick, shared by every
   // per-driver decision below. Transition logs make shadow mornings auditable.
+  let onsetBoost = 0;
   if (ONSET_FIRE_LIVE || ONSET_FIRE_SHADOW) {
     const wasActive = onsetState.active;
     onsetState = onsetStep(onsetState, { queue: waitingCount, rate: effectiveGrowthRate });
@@ -2679,6 +2798,18 @@ async function poll() {
           `step +${onsetState.stepSeen}) — early fire ${ONSET_FIRE_LIVE ? 'ACTIVE' : 'SHADOW (log-only)'}, ` +
           `cap ${onsetCapNow(onsetState)} of ${ONSET_CAP} (scales with observed step size)`
         : `[Pos] storm onset cleared (queue ${waitingCount}, rate ${effectiveGrowthRate.toFixed(2)}/s) — early fire disarmed`);
+      if (!onsetState.active) lastLoggedOnsetCap = 0;
+    }
+    // Backlog boost — deepens the cap (≤ ONSET_CAP_MAX) only while unprocessed
+    // fires prove SAN's pipe is deep. Logged when the effective cap moves ≥5.
+    const bb = onsetBacklogBoost(onsetState);
+    onsetBoost = bb.boost;
+    const capInForce = onsetCapNow(onsetState, onsetBoost);
+    if (onsetState.active && Math.abs(capInForce - lastLoggedOnsetCap) >= 5) {
+      console.log(`[Pos] onset cap → ${capInForce} ` +
+        `(backlog boost ${Math.round(bb.boost)}: display ${bb.slope10.toFixed(1)}/s × ` +
+        `${bb.visAgeS.toFixed(1)}s unprocessed-fire age, max ${ONSET_CAP_MAX})`);
+      lastLoggedOnsetCap = capInForce;
     }
   }
 
@@ -2698,7 +2829,7 @@ async function poll() {
     isLockedOut:             credentialLockout.isLockedOut,
     inBurstWindow,
     onsetActive:             onsetState.active,
-    onsetCap:                onsetCapNow(onsetState),
+    onsetCap:                onsetCapNow(onsetState, onsetBoost),
   };
 
   // Track the soonest fire across all armed drivers — drives adaptive polling.
@@ -2754,6 +2885,7 @@ async function poll() {
 
       case 'skip_already_fired':
         console.log(decision.logLine);
+        maybeFlagUnderRescue(state, decision.metrics?.targetPosition, waitingCount, effectiveGrowthRate);
         break;
 
       case 'skip_locked_out':
@@ -3597,6 +3729,17 @@ async function startMonitor() {
   scheduleFn = schedule;
   schedule();
 
+  // Fire-visibility listener: a fired vehicle spotted in V Holding before its
+  // WAIT-screen confirm is a genuine landing 5–10 s early — feed the fleet
+  // probe now (recordFleetLanding nudges the poll chain itself).
+  try {
+    require('./botService').setFireVisibilityListener(({ position }) => {
+      recordFleetLanding(position);
+    });
+  } catch (e) {
+    console.warn('[Monitor] fire-visibility listener not registered:', e.message);
+  }
+
   refreshTimer = setInterval(() => refreshAutoWatches().catch(console.error), AUTO_REFRESH_MS);
 
   pollInFlight = true;
@@ -3619,6 +3762,8 @@ function stopMonitor() {
   nudgePending = false;
   pollInFlight = false;
   onsetState   = freshOnsetState();
+  lastLoggedOnsetCap = 0;
+  try { require('./botService').setFireVisibilityListener(null); } catch { /* not loaded */ }
   // Retire any borrowed probes so no real driver is left mid-cycle in the live
   // queue (syncRoster with active:false stops every loop and force-removes).
   if (BORROW_PROBE_ENABLED) {
@@ -3858,6 +4003,8 @@ module.exports = {
   _evaluatePositionScheduler: evaluatePositionScheduler,
   _onsetStep:                 onsetStep,
   _onsetCapNow:               onsetCapNow,
+  _onsetBacklogBoost:         onsetBacklogBoost,
+  _maybeFlagUnderRescue:      maybeFlagUnderRescue,
   _carryoverClearStep:        carryoverClearStep,
   _removeCarryoverLeftover:   removeCarryoverLeftover,
   _redzoneRemoveDecision:     _redzoneRemoveDecision,

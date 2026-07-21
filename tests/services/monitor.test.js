@@ -758,7 +758,7 @@ describe('evaluatePositionScheduler — safety rails', () => {
     test('queue within clamped lead of max → skip', () => {
       const decision = _evaluatePositionScheduler(
         makeState({ scheduledPosition: 100, maxAcceptablePosition: 120 }),
-        { ...baseCtx, waitingCount: 115, estimatedDrift: 50 }, // 115+min(50,10)=125 > 120
+        { ...baseCtx, waitingCount: 115, estimatedDrift: 50, effectiveGrowthRate: 3.0 }, // 115+min(50,10)=125 > 120 (burst rate: growth-lead cap ≥ 10)
       );
       expect(decision.action).toBe('missed_impossible');
       expect(decision.reason).toBe('projection_exceeds_max');
@@ -767,7 +767,7 @@ describe('evaluatePositionScheduler — safety rails', () => {
     test('bias participates in the lead below the clamp', () => {
       const decision = _evaluatePositionScheduler(
         makeState({ scheduledPosition: 100, maxAcceptablePosition: 120 }),
-        { ...baseCtx, waitingCount: 112, estimatedDrift: 4, biasCorrection: 8 }, // 112+min(12,10)=122 > 120
+        { ...baseCtx, waitingCount: 112, estimatedDrift: 4, biasCorrection: 8, effectiveGrowthRate: 3.0 }, // 112+min(12,10)=122 > 120 (burst rate)
       );
       expect(decision.action).toBe('missed_impossible');
       expect(decision.reason).toBe('projection_exceeds_max');
@@ -815,11 +815,11 @@ describe('evaluatePositionScheduler — safety rails', () => {
       for (const estimatedDrift of [12, 55, 98]) {
         const at89 = _evaluatePositionScheduler(
           makeState(),
-          { ...baseCtx, waitingCount: 89, estimatedDrift }, // 89+10=99 < 100
+          { ...baseCtx, waitingCount: 89, estimatedDrift, effectiveGrowthRate: 3.0 }, // 89+10=99 < 100 (burst rate)
         );
         const at90 = _evaluatePositionScheduler(
           makeState(),
-          { ...baseCtx, waitingCount: 90, estimatedDrift }, // 90+10=100 ≥ 100
+          { ...baseCtx, waitingCount: 90, estimatedDrift, effectiveGrowthRate: 3.0 }, // 90+10=100 ≥ 100 (burst rate)
         );
         expect(at89.action).toBe('wait');
         expect(at90.action).toBe('fire');
@@ -865,7 +865,7 @@ describe('evaluatePositionScheduler — safety rails', () => {
       // Clamped projection 124 ≥ 121 and ≤ 141 → fire.
       const decision = _evaluatePositionScheduler(
         makeState({ scheduledPosition: 121, maxAcceptablePosition: 141 }),
-        { ...baseCtx, waitingCount: 114, estimatedDrift: 58, biasCorrection: -5.5 },
+        { ...baseCtx, waitingCount: 114, estimatedDrift: 58, biasCorrection: -5.5, effectiveGrowthRate: 3.0 },
       );
       expect(decision.action).toBe('fire');
     });
@@ -873,7 +873,7 @@ describe('evaluatePositionScheduler — safety rails', () => {
     test('ctx.maxLeadPositions overrides the default clamp', () => {
       const decision = _evaluatePositionScheduler(
         makeState(),
-        { ...baseCtx, waitingCount: 80, estimatedDrift: 55, maxLeadPositions: 20 }, // 80+20=100
+        { ...baseCtx, waitingCount: 80, estimatedDrift: 55, maxLeadPositions: 20, effectiveGrowthRate: 6.0 }, // 80+20=100 (rate 6 → growth-lead cap 20)
       );
       expect(decision.action).toBe('fire');
     });

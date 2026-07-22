@@ -213,8 +213,13 @@ services:
       # alone undershoots −19…−26 in replay). Targets above SAFE_HORIZON get at
       # most MID_CAP; above MID_HORIZON no onset early fire at all (storms die
       # at ~200–232; every onset undershoot breach was a target ≥196).
-      # Rollback: MONITOR_ONSET_CAP_MAX=25 restores the pre-07-19 behavior.
-      MONITOR_ONSET_CAP_MAX:         ${MONITOR_ONSET_CAP_MAX:-45}
+      # DEEP CAP RETIRED 2026-07-21 — default is now 25 (= ONSET_CAP). The
+      # overshoot it fought is attacked at its source by the fast page release
+      # (BOT_FIRE_RELEASE_MS) at ZERO undershoot cost, so firing the corridor
+      # 26-45 early only carried undershoot risk (−44 on a stall). Set to 45 in
+      # .env to re-enable if a future storm shows a genuine SAN-side backlog the
+      # declog can't clear.
+      MONITOR_ONSET_CAP_MAX:         ${MONITOR_ONSET_CAP_MAX:-25}
       MONITOR_ONSET_SAFE_HORIZON:    ${MONITOR_ONSET_SAFE_HORIZON:-170}
       MONITOR_ONSET_MID_HORIZON:     ${MONITOR_ONSET_MID_HORIZON:-200}
       MONITOR_ONSET_MID_CAP:         ${MONITOR_ONSET_MID_CAP:-15}
@@ -233,6 +238,24 @@ services:
       BOT_FIRE_VIS_POLL_MS:          ${BOT_FIRE_VIS_POLL_MS:-1250}
       BOT_FIRE_VIS_START_MS:         ${BOT_FIRE_VIS_START_MS:-2000}
       BOT_FIRE_VIS_TIMEOUT_MS:       ${BOT_FIRE_VIS_TIMEOUT_MS:-60000}
+      # Fast page release (2026-07-21 pipeline-declog). The old fire path held
+      # each browser page in waitForFunction until SAN streamed the WAIT screen
+      # back (10-25 s under storm load); with ~25 drivers now firing per queue
+      # jump (fleet grew ~15→68), that jams the shared browsers and balloons
+      # SAN's effective slot-latency 0.3 s→1.6 s = the entire +30→+50 overshoot
+      # regression. Now: wait only this long for the WAIT screen; if it hasn't
+      # rendered (the load case), release the browser immediately and confirm the
+      # committed add via the V Holding read. Contract-safe — changes only HOW we
+      # confirm, never WHEN we fire. Raise it to keep more calm fires on the
+      # in-page read; lower it to free the pipeline sooner during storms.
+      BOT_FIRE_RELEASE_MS:           ${BOT_FIRE_RELEASE_MS:-3000}
+      # After a fast release, confirm the committed add via V Holding with a
+      # longer window (12 × 1.5 s ≈ 18 s of lightweight HTTP, no held browser) so
+      # a slow-to-appear add is never conceded to the cold fallback — which would
+      # re-add and write "already in queue" to the Position Accuracy table. Only
+      # a genuinely benched "Not Authorized" driver falls through (reported as
+      # Not-Authorized, never "already in queue").
+      BOT_FIRE_RELEASE_VERIFY_ATTEMPTS: ${BOT_FIRE_RELEASE_VERIFY_ATTEMPTS:-12}
       BOT_ARMED_MAX:             ${BOT_ARMED_MAX:-40}
       # Roster-scaled armed pool: BOT_ARMED_BROWSERS is the FLOOR; one extra
       # browser opens per BOT_ARMED_SESSIONS_PER_BROWSER armed sessions, up to

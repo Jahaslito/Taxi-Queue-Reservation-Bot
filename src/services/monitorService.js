@@ -259,7 +259,19 @@ const ONSET_EVIDENCE_WINDOW_MS = 20000;
 //  overshoot +35→+31, worst +59→+47, zero undershoot breaches on all days
 //  (actual: 9). A clairvoyant oracle bounds these mornings at p90 ≈ +24 — the
 //  residual is SAN's arrival physics, not policy slack.
-const ONSET_CAP_MAX         = parseInt(process.env.MONITOR_ONSET_CAP_MAX         ?? '45', 10);
+//
+//  DEEP CAP RETIRED 2026-07-21 → default back to ONSET_CAP (25). The overshoot
+//  it fought is now attacked at its SOURCE by the fast page release (botService
+//  FIRE_RELEASE_MS): the +30→+50 regression was self-inflicted pipeline clog
+//  (fleet grew ~15→68 → 25 fires/tick jammed the browsers → SAN slot-latency
+//  0.3 s→1.6 s), which the declog fixes with ZERO undershoot cost. Firing the
+//  corridor DEEPER (26–45 early) only added undershoot risk (−44 if a storm
+//  stalls) for marginal overshoot gain — redundant once the pipeline is clear.
+//  The boost math below still runs but is now ceilinged at the proven 25, so the
+//  early-fire undershoot exposure returns to the deployed onset level. Set
+//  MONITOR_ONSET_CAP_MAX=45 in .env to re-enable the deep cap if a future storm
+//  ever needs it (e.g. the declog underdelivers on a genuine SAN-side backlog).
+const ONSET_CAP_MAX         = parseInt(process.env.MONITOR_ONSET_CAP_MAX         ?? '25', 10);
 const ONSET_SAFE_HORIZON    = parseInt(process.env.MONITOR_ONSET_SAFE_HORIZON    ?? '170', 10);
 const ONSET_MID_HORIZON     = parseInt(process.env.MONITOR_ONSET_MID_HORIZON     ?? '200', 10);
 const ONSET_MID_CAP         = parseInt(process.env.MONITOR_ONSET_MID_CAP         ?? '15', 10);

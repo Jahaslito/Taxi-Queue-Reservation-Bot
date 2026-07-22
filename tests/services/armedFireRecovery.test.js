@@ -24,6 +24,7 @@ process.env.BOT_ARM_FIRE_TIMEOUT_MS        = '12000';
 process.env.BOT_ARM_FIRE_TIMEOUT_MAX_MS    = '45000';
 process.env.BOT_ARM_VERIFY_ATTEMPTS        = '3';
 process.env.BOT_ARM_VERIFY_PAUSE_MS        = '5';
+process.env.BOT_FIRE_RELEASE_VERIFY_ATTEMPTS = '3'; // keep the fast-release confirm window small in tests
 process.env.BOT_ARM_OPS_CONCURRENCY        = '4';
 process.env.BOT_SESSION_PERSIST_PATH       = '/tmp/armed-recovery-test-sessions.json';
 
@@ -156,6 +157,51 @@ describe('verify-on-timeout recovery', () => {
 
     expect(result).toBeNull();
     expect(mockFetch).toHaveBeenCalledTimes(3);    // every verify attempt exhausted
+  });
+});
+
+// 2026-07-21 pipeline-declog: when the WAIT screen doesn't render within
+// FIRE_RELEASE_MS (the storm case that jams the pool), the fire path must
+// RELEASE the browser BEFORE confirming, then confirm the committed add via the
+// authoritative V Holding read. Frees the browser for the fires behind it.
+describe('fast page release under load', () => {
+  test('WAIT screen slow → page disposed BEFORE the V Holding confirm, genuine landing returned', async () => {
+    mockWaiting = new Map([['7777', 91]]);
+    mockFetch.mockClear();
+
+    const events = [];
+    // WAIT screen never renders in the release window; record dispose ordering.
+    const session = {
+      driverId:      701,
+      vehicleNumber: '7777',
+      context:       { close: async () => { events.push('context-closed'); } },
+      page: {
+        evaluate:        async () => true,             // click dispatched in-page
+        click:           async () => {},
+        waitForFunction: async () => { throw new Error('page.waitForFunction: Timeout 3000ms exceeded.'); },
+        textContent:     async () => '',
+        screenshot:      async () => { throw new Error('no screenshots'); },
+        context:         () => ({ storageState: async () => ({}) }),
+        on: () => {}, off: () => {},
+      },
+    };
+    // Record when the V Holding read happens relative to the dispose.
+    mockFetch.mockImplementation(async () => { events.push('vholding-read'); return { ok: true, text: async () => '<html>' }; });
+
+    const result = await bot.fireClaimedSession(session);
+
+    expect(result).not.toBeNull();
+    expect(result.success).toBe(true);
+    expect(result.position).toBe(91);
+    expect(result.recoveredFromTimeout).toBe(true);
+    expect(result.alreadyQueued).toBe(false);
+    // The browser is freed BEFORE we spend time reading V Holding — that's the
+    // whole point: the pipeline declogs for the next fires.
+    expect(events[0]).toBe('context-closed');
+    expect(events).toContain('vholding-read');
+    expect(events.indexOf('context-closed')).toBeLessThan(events.indexOf('vholding-read'));
+
+    mockFetch.mockImplementation(async () => ({ ok: true, text: async () => '<html>' }));
   });
 });
 

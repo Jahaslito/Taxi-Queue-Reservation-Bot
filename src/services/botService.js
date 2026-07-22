@@ -714,8 +714,8 @@ async function verifyDriverInQueue(vehicleNumber) {
  * the same justification the HTTP-fire path uses — which makes the returned
  * position a genuine landing, safe for position tracking and the fleet probe.
  */
-async function verifyAddLanded(vehicleNumber) {
-  for (let attempt = 0; attempt < ARM_VERIFY_ATTEMPTS; attempt++) {
+async function verifyAddLanded(vehicleNumber, attempts = ARM_VERIFY_ATTEMPTS) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
     if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, ARM_VERIFY_PAUSE_MS));
     const info = await verifyDriverInQueue(vehicleNumber).catch(() => null);
     if (info && Number.isFinite(info.position)) return info;
@@ -1381,6 +1381,39 @@ const ARM_FIRE_LATENCY_WINDOW_MS = parseInt(process.env.BOT_ARM_FIRE_LATENCY_WIN
 // confirmation wait expired.
 const ARM_VERIFY_ATTEMPTS        = Math.max(1, parseInt(process.env.BOT_ARM_VERIFY_ATTEMPTS ?? '4', 10));
 const ARM_VERIFY_PAUSE_MS        = parseInt(process.env.BOT_ARM_VERIFY_PAUSE_MS ?? '1500', 10);
+// ─── Fast page release (2026-07-21 pipeline-declog) ──────────────────────────
+// WHY: as the fleet grew ~15→68, a single queue jump now makes ~25 drivers fire
+// at once (was ~4-6). The old fire path HELD each browser page in
+// `page.waitForFunction` until SAN streamed the WAIT confirmation screen back —
+// 10-25 s under storm load. 25 pages jammed for 20 s saturates the shared
+// browser CPU, delaying every OTHER fire's click and ballooning SAN's effective
+// slot-latency from ~0.3 s (good small-fleet days) to ~1.6 s — which at 40/s IS
+// the entire +30→+50 overshoot regression. The storm rate (15-20/s) and
+// burstiness (+30-44 jumps) are UNCHANGED vs the good days; only our own
+// concurrent volume grew.
+// FIX: stop holding the page for the slow WAIT screen. Wait only FIRE_RELEASE_MS
+// for it; if it hasn't rendered by then (i.e. we're under load — the exact case
+// that clogs the pipeline), DISPOSE the page immediately (frees the browser for
+// the next fires) and confirm the committed add via the lightweight authoritative
+// V Holding read (verifyAddLanded / spacezone HTTP GET) instead. The Blazor add
+// is a fire-and-forget SignalR frame committed when SAN processes the click, so
+// the page is not needed after the click — the slot is readable from V Holding.
+// Contract-safe: changes only HOW we confirm, never WHEN we fire, so undershoot
+// is untouched. Calm days keep the fast in-page read (WAIT screen shows in ~1-2 s).
+const FIRE_RELEASE_MS            = parseInt(process.env.BOT_FIRE_RELEASE_MS ?? '3000', 10);
+// After the fast release, confirm the committed add via V Holding with a LONGER
+// window than the cold-timeout verify — because we must never concede to the
+// cold fallback while the add is merely slow to appear (the cold bot would
+// re-add, find the driver already there, and write "already in queue" to the
+// Position Accuracy table). Authorized adds ALWAYS commit (5 storms, ~320 fires,
+// 0 genuine failures), and a fired driver becomes visible in V Holding within
+// ~2-10 s even under load, so this window (12 × 1.5 s ≈ 18 s of lightweight
+// HTTP polling — NOT a held browser) reliably catches the landing and records it
+// as a genuine position. Only a SAN-benched "Not Authorized" driver never
+// appears; that falls through to the cold path, which reports Not-Authorized —
+// never "already in queue".
+const FIRE_RELEASE_VERIFY_ATTEMPTS = Math.max(ARM_VERIFY_ATTEMPTS,
+  parseInt(process.env.BOT_FIRE_RELEASE_VERIFY_ATTEMPTS ?? '12', 10));
 
 // Rolling window of armed-fire durations (successes, rejections, timeouts —
 // every round-trip that measures SAN's confirmation latency).
@@ -2001,37 +2034,84 @@ async function fireClaimedSession(session) {
     // V Holding for it from here: not-yet-visible age is the live backlog
     // signal, and first visibility is an early landing (see the watch above).
     beginFireVisibility(vehicleNumber);
-    await page.waitForFunction(
-      (needles) => needles.some((s) => document.body.innerText.includes(s)),
-      [SAN_TEXT.REMOVE_FROM_QUEUE, SAN_TEXT.VEHICLE_NOT_AVAILABLE],
-      { timeout: adaptiveFireTimeoutMs() },
-    );
 
-    const bodyText = await page.textContent('body').catch(() => '');
-    if (bodyText.includes(SAN_TEXT.VEHICLE_NOT_AVAILABLE)) {
+    // Wait only a SHORT window for the WAIT screen (see FIRE_RELEASE_MS). On a
+    // calm day it renders in ~1-2 s and we read the slot straight from the page
+    // (the fast in-page path, unchanged). Under storm load it takes 10-25 s —
+    // holding the page that long is exactly what jams the pool and inflates
+    // everyone's slot-latency, so we DON'T wait: we release below and confirm
+    // via the authoritative V Holding read instead.
+    let waitScreenSeen = true;
+    try {
+      await page.waitForFunction(
+        (needles) => needles.some((s) => document.body.innerText.includes(s)),
+        [SAN_TEXT.REMOVE_FROM_QUEUE, SAN_TEXT.VEHICLE_NOT_AVAILABLE],
+        { timeout: FIRE_RELEASE_MS },
+      );
+    } catch {
+      waitScreenSeen = false;
+    }
+
+    if (waitScreenSeen) {
+      const bodyText = await page.textContent('body').catch(() => '');
+      if (bodyText.includes(SAN_TEXT.VEHICLE_NOT_AVAILABLE)) {
+        recordArmedFireDuration(Date.now() - startTime);
+        console.log(`[Arm] #${vehicleNumber} → ${SAN_TEXT.VEHICLE_NOT_AVAILABLE} (SAN business-rule rejection)`);
+        return {
+          success:             false,
+          vehicleNotAvailable: true,
+          viaArmedSession:     true,
+          durationMs:          Date.now() - startTime,
+          error:               DRIVER_ERROR_COPY.VEHICLE_NOT_AVAILABLE,
+          message:             DRIVER_ERROR_COPY.VEHICLE_NOT_AVAILABLE,
+        };
+      }
+
+      const info = await extractQueueInfo(page);
       recordArmedFireDuration(Date.now() - startTime);
-      console.log(`[Arm] #${vehicleNumber} → ${SAN_TEXT.VEHICLE_NOT_AVAILABLE} (SAN business-rule rejection)`);
+      console.log(`[Arm] ⚡ #${vehicleNumber} fired via armed session in ${Date.now() - startTime} ms → position ${info.position}`);
       return {
-        success:             false,
-        vehicleNotAvailable: true,
-        viaArmedSession:     true,
-        durationMs:          Date.now() - startTime,
-        error:               DRIVER_ERROR_COPY.VEHICLE_NOT_AVAILABLE,
-        message:             DRIVER_ERROR_COPY.VEHICLE_NOT_AVAILABLE,
+        success:         true,
+        alreadyQueued:   false,
+        viaArmedSession: true,
+        ...info,
+        durationMs:      Date.now() - startTime,
+        message:         `Added to queue — Position: ${info.position}, Location: ${info.location}`,
       };
     }
 
-    const info = await extractQueueInfo(page);
-    recordArmedFireDuration(Date.now() - startTime);
-    console.log(`[Arm] ⚡ #${vehicleNumber} fired via armed session in ${Date.now() - startTime} ms → position ${info.position}`);
-    return {
-      success:         true,
-      alreadyQueued:   false,
-      viaArmedSession: true,
-      ...info,
-      durationMs:      Date.now() - startTime,
-      message:         `Added to queue — Position: ${info.position}, Location: ${info.location}`,
-    };
+    // ─── Fast release (under load) ───────────────────────────────────────────
+    // The WAIT screen hasn't streamed back in FIRE_RELEASE_MS — we're in the
+    // storm case that clogs the pool. Free this browser NOW so the fires behind
+    // us click without contention, then confirm the committed add via the
+    // lightweight V Holding read (one spacezone GET per attempt). Disposing here
+    // is safe: the click already dispatched the add; the page is not needed.
+    await disposeClaimedSession(session, 'fast-release: confirming via V Holding');
+    // Persistent confirm (no held browser) — never concede to cold while the
+    // committed add is merely slow to appear, so the table shows a real landing,
+    // not "already in queue" (see FIRE_RELEASE_VERIFY_ATTEMPTS).
+    const landed = await verifyAddLanded(vehicleNumber, FIRE_RELEASE_VERIFY_ATTEMPTS);
+    const elapsedMs = Date.now() - startTime;
+    recordArmedFireDuration(elapsedMs);
+    if (landed) {
+      console.log(`[Arm] ⚡ #${vehicleNumber} fast-released at ${FIRE_RELEASE_MS} ms, add COMMITTED → position ${landed.position} (V Holding, ${elapsedMs} ms total)`);
+      return {
+        success:              true,
+        // Parked page proved not-queued at arm time ⇒ this V Holding presence is
+        // OUR add: a genuine landing (same justification as the verify-on-timeout
+        // recovery), safe for position tracking + the fleet probe.
+        alreadyQueued:        false,
+        viaArmedSession:      true,
+        recoveredFromTimeout: true,
+        ...landed,
+        durationMs:           elapsedMs,
+        message:              `Added to queue — Position: ${landed.position}, Location: ${landed.location}`,
+      };
+    }
+    // Not visible yet — likely a genuine failure or a very slow add. The cold
+    // fallback takes over (idempotent: it detects an in-queue add as already_queued).
+    console.warn(`[Arm] ✗ #${vehicleNumber} fast-released but not in V Holding after ${elapsedMs} ms — falling back to cold bot`);
+    return null;
   } catch (err) {
     // A confirmation error is NOT a failed add: the click is a fire-and-forget
     // SignalR event, committed when SAN's server processes it. Record the

@@ -305,33 +305,60 @@ const TAIL_PROBE_ENABLED = process.env.MONITOR_TAIL_PROBE === '1';
 // the landing — instead of hours of add/remove churn.
 const TAIL_PROBE_AHEAD_SECS = parseInt(process.env.MONITOR_TAIL_PROBE_AHEAD_SECS ?? '90', 10);
 // Borrowed tail probe (MONITOR_BORROW_PROBE=1, default OFF): when no dedicated
-// probe account exists, lend the probe the highest-target watched drivers.
+// probe account exists, lend the probe the highest-target watched drivers to get
+// true-tail samples between SAN's blind 5 s display steps (the observation prize
+// — worth ~21 positions of overshoot on a ramp storm like 07-21).
 //
-// ⚠ 2026-07-04 PRODUCTION FAILURE — the original design was UNSAFE and is now
-// hard-gated to CALM-ONLY. That morning borrowing ran DURING the burst; the
-// queue rocketed 40+/s and the retire (a slow add→remove under SAN storm load,
-// seconds each, seen churning 10× on one driver) could NOT hand drivers back
-// before the queue blew past their targets. Every borrowed driver near the
-// storm fired BORN-OVER and COLD (no armed session ready): #0911 +61, #1237
-// +72, #1965 +85, and 4 past-max misses (#093/#696/#0034/#0387). ROOT CAUSE:
-// a real scheduled driver is only SAFE to borrow while the storm is far away,
-// but the probe is only USEFUL during the storm — mutually exclusive. So
-// borrowing is now confined to deep calm and the whole roster is mass-retired
-// the instant the storm approaches (queue nears onset OR the rate rises), which
-// leaves the retire to finish in calm and the armed pool to arm the driver for
-// a normal on-time fire. Intra-STORM samples must come from the fleet probe
-// (our own real landings — safe) or a DEDICATED probe account, never a paying
-// driver held into the burst.
+// ⚠ 2026-07-04 PRODUCTION FAILURE (the design this now fixes): borrowing ran on a
+// global calm gate and retired the WHOLE roster only when the storm arrived; the
+// queue rocketed 40+/s and the mass hand-back couldn't finish before the queue
+// blew past the borrowed drivers' targets → they fired BORN-OVER and COLD
+// (#0911 +61, #1237 +72, #1965 +85, 4 past-max misses). ROOT CAUSE: retiring on a
+// global signal is too late; by the time "the storm" is detected, a driver whose
+// target is nearby has no runway left.
+//
+// FIX (2026-07-22, PER-DRIVER rate-aware retire — see borrowSafeToHold /
+// borrowRetireBuffer): each driver is kept as a probe ONLY while the queue is
+// more than a RATE-SCALED buffer below their own target — i.e. while there is
+// provably ≥ BORROW_RETIRE_LEAD_SECS of runway to remove them and re-arm. The
+// buffer is max(+RETIRE_BUFFER, rate × RETIRE_LEAD_SECS), so a fast burst forces
+// an early hand-back automatically; a driver drops out the instant the storm
+// gets within their runway, is server-verify-removed by tailProbeService, and is
+// re-armed by the prearm pool for an on-time armed fire. This lets us probe
+// THROUGH the storm using far-target drivers, while making the 07-04 strand
+// impossible by construction: we never hold a driver we can't get back. The
+// preferred workhorse (BORROW_PROBE_VEHICLE, default 4000) is borrowed first but
+// protected by the exact same rule.
 const BORROW_PROBE_ENABLED = process.env.MONITOR_BORROW_PROBE === '1';
 const BORROW_PROBE_MAX     = parseInt(process.env.MONITOR_BORROW_PROBE_MAX    ?? '2', 10);
 const BORROW_PROBE_MARGIN  = parseInt(process.env.MONITOR_BORROW_PROBE_MARGIN ?? '60', 10);
-// Calm-only safety rails (mass-retire the whole borrow roster when tripped):
-//   STOP_QUEUE — stop borrowing once the queue reaches this (well below the
-//     60–85 onset) so every borrowed driver is handed back while still calm.
-//   STORM_RATE — any growth at/above this (drivers/s) means the storm is
-//     starting → mass-retire NOW, don't wait for the queue threshold.
-const BORROW_STOP_QUEUE    = parseInt(process.env.MONITOR_BORROW_STOP_QUEUE  ?? '45', 10);
-const BORROW_STORM_RATE    = parseFloat(process.env.MONITOR_BORROW_STORM_RATE ?? '2');
+// Preferred probe vehicle (user-designated, 2026-07-22): borrowed FIRST when
+// it's a valid, safe candidate, so a chosen workhorse account carries the probe
+// load before we lend anyone else's. Still retired by the SAME rate-aware +buffer
+// rule below — it is protected exactly like every other borrowed driver.
+const BORROW_PROBE_VEHICLE = String(process.env.MONITOR_BORROW_PROBE_VEHICLE ?? '4000').trim();
+// ─── PER-DRIVER rate-aware retire (2026-07-22, replaces the calm-only gate) ──
+// The 07-04 failure was retiring TOO LATE: borrowing ran into the burst and the
+// hand-back couldn't finish before the queue blew past the driver's target, so
+// they fired born-over and COLD. The user's rule is "+RETIRE_BUFFER positions
+// before target." But a fixed +20 is only ~0.5 s of runway at 40/s — far too
+// little to remove + re-arm. So the effective buffer SCALES with the storm:
+//   retireBuffer = max(RETIRE_BUFFER, ceil(rate × RETIRE_LEAD_SECS))
+// and a driver is only kept as a probe while (target − queue) > retireBuffer,
+// i.e. while there is provably ≥ RETIRE_LEAD_SECS of runway to hand them back
+// and re-arm. The instant that runway shrinks below the lead, the driver drops
+// from the roster → tailProbeService retires (server-verified remove) → the
+// prearm pool re-arms → they fire their OWN target, armed and on-time. This is
+// what makes storm-window borrowing safe: we only ever borrow drivers whose
+// target is far enough away RIGHT NOW that we can always get them back.
+const BORROW_RETIRE_BUFFER    = parseInt(process.env.MONITOR_BORROW_RETIRE_BUFFER ?? '20', 10);
+const BORROW_RETIRE_LEAD_SECS = parseInt(process.env.MONITOR_BORROW_RETIRE_LEAD_SECS ?? '30', 10);
+// Legacy calm-only rails kept for the emergency global kill (still honored as an
+// OUTER guard: if the queue is past this OR the fleet-wide rate is berserk we
+// stop taking NEW borrows regardless of per-driver math). Defaults widened so
+// the per-driver rate-aware rule is the real control.
+const BORROW_STOP_QUEUE    = parseInt(process.env.MONITOR_BORROW_STOP_QUEUE  ?? '400', 10);
+const BORROW_STORM_RATE    = parseFloat(process.env.MONITOR_BORROW_STORM_RATE ?? '60');
 // Fallback estimate for Playwright bot execution time (ms) before we have real
 // data. Used to project how many positions will be added between the fire decision
 // and when SAN assigns the queue slot. The actual estimate is the rolling median
@@ -777,6 +804,10 @@ function maybeFlagUnderRescue(state, target, waitingCount, growthRate) {
 const borrowCredsCache    = new Map(); // driverId → { username, password }
 let   borrowRosterInFlight = false;
 let   _borrowRetireLogged  = false;    // one-shot log guard for the mass-retire message
+// The single highest-target driver we pin as the (only) second borrow account
+// for the day — see updateBorrowRoster. Reset each morning + on stopMonitor so
+// the blast radius is always exactly {BORROW_PROBE_VEHICLE, this one driver}.
+let   borrowPinnedSecondId = null;
 
 /**
  * Calm-only borrow gate (pure — the 2026-07-04 safety rail). Borrowing is
@@ -787,6 +818,22 @@ let   _borrowRetireLogged  = false;    // one-shot log guard for the mass-retire
  */
 function borrowAllowedInCalm(waitingCount, growthRate) {
   return waitingCount < BORROW_STOP_QUEUE && growthRate < BORROW_STORM_RATE;
+}
+
+/** Rate-aware retire buffer (positions): how far below a driver's target we must
+ *  stop borrowing them to guarantee runway to remove + re-arm before their fire.
+ *  Floor = BORROW_RETIRE_BUFFER (the user's +20); scales with the storm so a
+ *  fast burst forces an early hand-back. Pure — exported for tests. */
+function borrowRetireBuffer(growthRate) {
+  return Math.max(BORROW_RETIRE_BUFFER, Math.ceil(Math.max(0, growthRate) * BORROW_RETIRE_LEAD_SECS));
+}
+
+/** Is this driver still SAFE to hold as a probe right now? Only while the queue
+ *  is more than the rate-aware buffer below their target — i.e. there is provably
+ *  ≥ BORROW_RETIRE_LEAD_SECS of runway to hand them back and re-arm. The instant
+ *  this is false they must be retired (dropped from the borrow roster). */
+function borrowSafeToHold(target, waitingCount, growthRate) {
+  return (target - waitingCount) > borrowRetireBuffer(growthRate);
 }
 // Per-driver borrow audit (for the admin "Borrowed Drivers" table): proves a
 // lent driver was cycled, retired, re-armed, and still landed on target.
@@ -803,17 +850,45 @@ const borrowExcluded      = new Set();
  * flag from the probe's ACTUAL held set — a retiring driver stays flagged until
  * truly removed, so the observation loop never sees a probe cycle.
  */
+/**
+ * DAMAGE MINIMIZATION (user, 2026-07-22) — pure selection: the borrow set is
+ * ONLY ever two fixed accounts all day, the preferred workhorse (4000) and the
+ * SINGLE highest-target driver, PINNED on first selection so it never rotates
+ * as drivers retire (without the pin, the "second" slot would shift to the
+ * next-highest driver each time one retired, so the day's blast radius could
+ * exceed two). Each still only appears while it's a safe candidate. Returns the
+ * chosen list and the (possibly newly-pinned) second id — no side effects, so
+ * it's unit-testable. maxN caps the result (2).
+ */
+function selectBorrowAccounts(eligible, pinnedSecondId, maxN) {
+  const preferred = eligible.find((c) => c.preferred); // the 4000 workhorse
+  let pinned = pinnedSecondId;
+  if (pinned == null) {
+    const hi = eligible.filter((c) => !c.preferred).sort((a, b) => b.target - a.target)[0];
+    if (hi) pinned = hi.driverId;
+  }
+  const second = eligible.find((c) => c.driverId === pinned);
+  const chosen = [preferred, second].filter(Boolean).slice(0, maxN);
+  return { chosen, pinnedSecondId: pinned };
+}
+
 async function updateBorrowRoster(candidates, todayDayKey, active) {
   if (borrowRosterInFlight) return; // declarative — next tick reconciles
   borrowRosterInFlight = true;
   try {
     const tp       = require('./tailProbeService');
     const disabled = new Set(tp.disabledBorrowedIds()); // self-disabled → leave alone
-    const chosen   = active
-      ? candidates.sort((a, b) => b.target - a.target)
-          .filter((c) => !disabled.has(c.driverId) && !borrowExcluded.has(c.driverId))
-          .slice(0, BORROW_PROBE_MAX)
+    const eligible = active
+      ? candidates.filter((c) => !disabled.has(c.driverId) && !borrowExcluded.has(c.driverId))
       : [];
+    const wasPinned = borrowPinnedSecondId;
+    const sel = selectBorrowAccounts(eligible, borrowPinnedSecondId, BORROW_PROBE_MAX);
+    borrowPinnedSecondId = sel.pinnedSecondId;
+    if (borrowPinnedSecondId != null && borrowPinnedSecondId !== wasPinned) {
+      const hi = eligible.find((c) => c.driverId === borrowPinnedSecondId);
+      console.log(`[Borrow] pinned second probe → #${hi?.vehicle} (target ${hi?.target}); only #${BORROW_PROBE_VEHICLE} and this account will ever be borrowed today`);
+    }
+    const chosen = sel.chosen;
 
     const roster = [];
     for (const c of chosen) {
@@ -2153,6 +2228,7 @@ async function poll() {
     }
     // New day → fresh storm tracking (yesterday's onset must not leak forward).
     onsetState = freshOnsetState();
+    borrowPinnedSecondId = null; // new day → re-pin the single second borrow account
     console.log('[Monitor] Daily reset — counters and visibility state cleared');
     broadcast('daily_reset', { date: currentDayPT });
 
@@ -2945,19 +3021,28 @@ async function poll() {
           });
         }
 
-        // Borrowed-probe candidate: a genuinely-waiting driver whose target is
-        // still ≥ BORROW_PROBE_MARGIN above the current tail — their real fire
-        // is far off, so their idle account can safely serve as a probe until
-        // the tail closes in. Never carryovers (already in V Holding).
+        // Borrowed-probe candidate: a genuinely-waiting driver whose real fire is
+        // still far enough away — by the rate-aware retire buffer — that we can
+        // ALWAYS hand them back and re-arm before it. Never carryovers (already
+        // in V Holding). borrowSafeToHold is the per-driver storm-safety gate
+        // (see the 07-04 note): a driver drops out the instant the queue climbs
+        // within the runway, and tailProbeService retires them there.
         if (BORROW_PROBE_ENABLED) {
           const target = decision.metrics?.targetPosition ?? null;
           if (
             target !== null &&
             decision.reason !== 'awaiting_overnight_purge' &&
             !state.hasBeenSeen &&
-            (target - waitingCount) >= BORROW_PROBE_MARGIN
+            (target - waitingCount) >= BORROW_PROBE_MARGIN &&
+            borrowSafeToHold(target, waitingCount, effectiveGrowthRate)
           ) {
-            borrowCandidates.push({ driverId, vehicle: state.vehicleNumber, target });
+            borrowCandidates.push({
+              driverId,
+              vehicle:    state.vehicleNumber,
+              target,
+              // preferred workhorse floats to the front of the roster
+              preferred:  String(state.vehicleNumber) === BORROW_PROBE_VEHICLE,
+            });
           }
         }
         break;
@@ -3106,16 +3191,19 @@ async function poll() {
   // and each driver's borrowedAsProbe flag is reconciled from the probe's ACTUAL
   // held set so a retiring driver stays checked-out until truly removed.
   if (BORROW_PROBE_ENABLED) {
-    // CALM-ONLY (see the 2026-07-04 failure note on the constants above): the
-    // instant the queue nears onset OR the rate rises, force the roster empty
-    // → tailProbeService mass-retires every borrowed driver and the armed pool
-    // arms them for a normal fire. Borrowing only ever runs in deep calm, so a
-    // driver is never held into the burst. This inverts the original (unsafe)
-    // gate that ran borrowing DURING the burst.
+    // STORM-WINDOW borrowing (2026-07-22), made safe PER-DRIVER: the candidate
+    // list above already contains ONLY drivers with provable hand-back runway
+    // (borrowSafeToHold, the rate-aware +buffer). As the queue climbs, drivers
+    // drop out of the list one by one exactly when the storm gets within their
+    // runway → tailProbeService retires them (server-verified remove) → the
+    // prearm pool re-arms → they fire their own target on time. So this feeds
+    // the probe THROUGH the storm using only far-target drivers, instead of the
+    // old all-or-nothing calm gate. The outer kill (borrowAllowedInCalm, now
+    // widened) only trips on a fleet-wide berserk rate as a last-resort stop.
     const borrowActive = borrowAllowedInCalm(waitingCount, effectiveGrowthRate);
     if (!borrowActive && borrowHistory.size > 0 && !_borrowRetireLogged) {
       _borrowRetireLogged = true;
-      console.log(`[Borrow] storm approaching (queue ${waitingCount}, rate ${effectiveGrowthRate.toFixed(1)}/s) — mass-retiring all borrowed drivers so they fire armed & on-time`);
+      console.log(`[Borrow] emergency global stop (queue ${waitingCount}, rate ${effectiveGrowthRate.toFixed(1)}/s) — retiring all borrowed drivers`);
     }
     if (borrowActive) _borrowRetireLogged = false;
     updateBorrowRoster(borrowCandidates, todayDayKey, borrowActive)
@@ -3783,6 +3871,7 @@ function stopMonitor() {
     catch (err) { console.error('[Borrow] stop cleanup failed:', err.message); }
   }
   borrowCredsCache.clear();
+  borrowPinnedSecondId = null;
   borrowHistory.clear();
   borrowExcluded.clear();
   borrowRosterInFlight = false;
@@ -4032,6 +4121,9 @@ module.exports = {
   _resetLatencySamples:       () => { botLatencySamples.length = 0; },
   _recordFleetLanding:        recordFleetLanding,
   _borrowAllowedInCalm:       borrowAllowedInCalm,
+  _borrowRetireBuffer:        borrowRetireBuffer,
+  _borrowSafeToHold:          borrowSafeToHold,
+  _selectBorrowAccounts:      selectBorrowAccounts,
   _setFleetLanding:           (position, atMs) => { lastFleetLanding = { position, atMs: atMs ?? Date.now() }; },
   _getFleetLanding:           () => ({ ...lastFleetLanding }),
 };

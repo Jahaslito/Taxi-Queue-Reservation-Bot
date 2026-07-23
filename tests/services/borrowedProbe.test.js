@@ -20,22 +20,81 @@ process.env.TAIL_PROBE_STAGGER_MS     = '1';
 
 const probe = require('../../src/services/tailProbeService');
 
-// Calm-only borrow gate (2026-07-04 safety rail). Defaults: STOP_QUEUE=45,
-// STORM_RATE=2/s. Borrowing must be OFF the instant the storm approaches, so a
-// lent driver is never held into the burst (the +61/+72/+85 failure).
-describe('calm-only borrow gate (borrowAllowedInCalm)', () => {
+// PER-DRIVER rate-aware retire (2026-07-22) — replaces the old global calm gate.
+// A driver is kept as a probe ONLY while the queue is more than a RATE-SCALED
+// buffer below their target, so there is always runway to remove + re-arm before
+// their fire. This is what makes storm-window borrowing safe (the 07-04 strand
+// impossible by construction). borrowAllowedInCalm is now only an emergency
+// global kill (widened to 400 / 60).
+describe('rate-aware retire buffer (borrowRetireBuffer / borrowSafeToHold)', () => {
+  const { _borrowRetireBuffer, _borrowSafeToHold } = require('../../src/services/monitorService');
+
+  test('floor is the user +20 at calm rates', () => {
+    expect(_borrowRetireBuffer(0)).toBe(20);
+    expect(_borrowRetireBuffer(0.5)).toBe(20);   // 0.5×30=15 < 20 floor
+  });
+  test('scales with the storm — 40/s needs ~1200 positions of runway', () => {
+    expect(_borrowRetireBuffer(2)).toBe(60);     // 2×30
+    expect(_borrowRetireBuffer(40)).toBe(1200);  // 40×30 — a fixed +20 would be 0.5s, unsafe
+  });
+  test('safe to hold only while target is beyond the rate-aware buffer', () => {
+    // calm: target 300, queue 40 → 260 > 20 → safe
+    expect(_borrowSafeToHold(300, 40, 0.5)).toBe(true);
+    // 40/s storm: even target 300 at queue 100 has only 200 runway < 1200 → NOT safe → retire
+    expect(_borrowSafeToHold(300, 100, 40)).toBe(false);
+    // winddown (5/s): target 300, queue 130 → 170 > 150 buffer → still safe
+    expect(_borrowSafeToHold(300, 130, 5)).toBe(true);
+    // driver within +20 of target at calm → retire (the user's rule)
+    expect(_borrowSafeToHold(300, 285, 0.5)).toBe(false);
+  });
+});
+
+// Damage minimization: only ever two fixed accounts — 4000 + the pinned
+// highest-target driver, never rotating as drivers retire.
+describe('two-account selection (selectBorrowAccounts)', () => {
+  const { _selectBorrowAccounts } = require('../../src/services/monitorService');
+  const C = (driverId, target, preferred = false) => ({ driverId, vehicle: String(driverId), target, preferred });
+
+  test('picks the preferred (4000) + the single highest-target driver', () => {
+    const elig = [C(1, 100), C(2, 320), C(9, 275), C(40, 150, true)];
+    const { chosen, pinnedSecondId } = _selectBorrowAccounts(elig, null, 2);
+    expect(chosen.map((c) => c.driverId).sort()).toEqual([2, 40]); // 4000(id40) + highest(id2, tgt320)
+    expect(pinnedSecondId).toBe(2);
+  });
+
+  test('the second account is PINNED — does not rotate when a higher one appears/retires', () => {
+    // pinned to driver 2 already; even though driver 9 is now the highest eligible,
+    // we keep driver 2 (or drop to just 4000 if 2 is gone) — never switch to 9.
+    const elig = [C(9, 400), C(40, 150, true)]; // driver 2 retired; 9 is highest now
+    const { chosen } = _selectBorrowAccounts(elig, 2, 2);
+    expect(chosen.map((c) => c.driverId)).toEqual([40]); // only 4000 — NOT driver 9
+  });
+
+  test('never exceeds two accounts even with many eligible', () => {
+    const elig = [C(1, 100), C(2, 320), C(3, 310), C(4, 300), C(40, 200, true)];
+    const { chosen } = _selectBorrowAccounts(elig, null, 2);
+    expect(chosen.length).toBe(2);
+    expect(chosen.some((c) => c.driverId === 40)).toBe(true); // 4000 in
+  });
+
+  test('4000 absent → only the pinned highest, still ≤ 2', () => {
+    const elig = [C(1, 100), C(2, 320)];
+    const { chosen } = _selectBorrowAccounts(elig, null, 2);
+    expect(chosen.map((c) => c.driverId)).toEqual([2]);
+  });
+});
+
+// borrowAllowedInCalm is now the EMERGENCY global stop only (widened defaults).
+describe('emergency global stop (borrowAllowedInCalm)', () => {
   const { _borrowAllowedInCalm } = require('../../src/services/monitorService');
 
-  test('deep calm → borrowing allowed', () => {
-    expect(_borrowAllowedInCalm(20, 0.5)).toBe(true);
+  test('normal storm operation is allowed (per-driver gate does the real work)', () => {
+    expect(_borrowAllowedInCalm(77, 21.3)).toBe(true);   // the old 07-04 zone — now allowed, per-driver retire protects
+    expect(_borrowAllowedInCalm(200, 30)).toBe(true);
   });
-  test('queue at/over onset threshold → mass-retire (no borrowing)', () => {
-    expect(_borrowAllowedInCalm(45, 0.5)).toBe(false);
-    expect(_borrowAllowedInCalm(77, 0.5)).toBe(false); // the 07-04 storm zone
-  });
-  test('rate rising (storm onset) → mass-retire even at low queue', () => {
-    expect(_borrowAllowedInCalm(30, 2)).toBe(false);
-    expect(_borrowAllowedInCalm(30, 21.3)).toBe(false); // the 07-04 spike
+  test('only a fleet-wide berserk queue/rate trips the global kill', () => {
+    expect(_borrowAllowedInCalm(400, 5)).toBe(false);    // queue past 400
+    expect(_borrowAllowedInCalm(100, 60)).toBe(false);   // rate ≥ 60/s
   });
 });
 

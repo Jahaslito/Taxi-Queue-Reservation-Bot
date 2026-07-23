@@ -307,19 +307,25 @@ services:
       # before each fire cluster instead of burning the cycle cap all morning.
       MONITOR_TAIL_PROBE_AHEAD_SECS: ${MONITOR_TAIL_PROBE_AHEAD_SECS:-90}
       # Borrowed tail probe (default OFF, and RECOMMENDED OFF after the
-      # 2026-07-04 failure). Lending paying drivers to the probe caused +61/+72/
-      # +85 overshoots and 4 past-max misses: a real driver can't be retired
-      # fast enough once the storm accelerates, so it fires born-over and cold.
-      # Now hard-gated to CALM-ONLY — the whole roster is mass-retired the
-      # instant the queue reaches MONITOR_BORROW_STOP_QUEUE or the rate reaches
-      # MONITOR_BORROW_STORM_RATE, so no driver is ever held into the burst.
-      # Even so, intra-STORM samples should come from MONITOR_FLEET_PROBE (our
-      # own real landings — safe) or a dedicated account, NOT borrowing.
-      MONITOR_BORROW_PROBE:        ${MONITOR_BORROW_PROBE:-0}
-      MONITOR_BORROW_STOP_QUEUE:   ${MONITOR_BORROW_STOP_QUEUE:-45}
-      MONITOR_BORROW_STORM_RATE:   ${MONITOR_BORROW_STORM_RATE:-2}
-      MONITOR_BORROW_PROBE_MAX:    ${MONITOR_BORROW_PROBE_MAX:-2}
-      MONITOR_BORROW_PROBE_MARGIN: ${MONITOR_BORROW_PROBE_MARGIN:-60}
+      # 2026-07-04 failure). Old design lent paying drivers on a global calm gate
+      # and retired the whole roster only when the storm arrived — too late, so
+      # near-target drivers fired born-over & cold (+61/+72/+85). FIXED 2026-07-22
+      # with PER-DRIVER rate-aware retire: a driver is kept as a probe ONLY while
+      # the queue is more than max(RETIRE_BUFFER, rate × RETIRE_LEAD_SECS) below
+      # their target — i.e. while there is provably enough runway to remove +
+      # re-arm before their fire. Drivers drop out one by one as the storm nears
+      # their target; the strand is impossible by construction. This lets us probe
+      # THROUGH the storm with far-target drivers. Default OFF — cycles a paying
+      # account; enable only deliberately. PROBE_VEHICLE (4000) is borrowed first.
+      MONITOR_BORROW_PROBE:            ${MONITOR_BORROW_PROBE:-0}
+      MONITOR_BORROW_PROBE_VEHICLE:    ${MONITOR_BORROW_PROBE_VEHICLE:-4000}
+      MONITOR_BORROW_RETIRE_BUFFER:    ${MONITOR_BORROW_RETIRE_BUFFER:-20}
+      MONITOR_BORROW_RETIRE_LEAD_SECS: ${MONITOR_BORROW_RETIRE_LEAD_SECS:-30}
+      MONITOR_BORROW_PROBE_MAX:        ${MONITOR_BORROW_PROBE_MAX:-2}
+      MONITOR_BORROW_PROBE_MARGIN:     ${MONITOR_BORROW_PROBE_MARGIN:-60}
+      # Emergency global kill only (per-driver retire is the real control):
+      MONITOR_BORROW_STOP_QUEUE:       ${MONITOR_BORROW_STOP_QUEUE:-400}
+      MONITOR_BORROW_STORM_RATE:       ${MONITOR_BORROW_STORM_RATE:-60}
       # Poll cache-buster — TESTED 2026-07-03, DON'T BOTHER: spacezone already
       # returns "cache-control: no-cache, no-store, max-age=0" (identical with
       # a buster param), so there is no intermediary cache; the ~5 s step is

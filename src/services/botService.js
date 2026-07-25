@@ -1400,7 +1400,14 @@ const ARM_VERIFY_PAUSE_MS        = parseInt(process.env.BOT_ARM_VERIFY_PAUSE_MS 
 // the page is not needed after the click — the slot is readable from V Holding.
 // Contract-safe: changes only HOW we confirm, never WHEN we fire, so undershoot
 // is untouched. Calm days keep the fast in-page read (WAIT screen shows in ~1-2 s).
-const FIRE_RELEASE_MS            = parseInt(process.env.BOT_FIRE_RELEASE_MS ?? '3000', 10);
+// TUNED 2026-07-24 3000→1000: the 07-24 storm fired 29 drivers on ONE tick,
+// serialising ~4 deep across 7 browsers; at 3 s/hold the tail landed 11 s late
+// (+48…+59 overshoot vs +32 for the first-out driver — the delta is pure
+// per-browser hold time). Under storm load the WAIT screen takes 10-25 s to
+// stream back, so a 3 s hold never catches it anyway — it's wasted latency that
+// jams the pool. 1 s frees each browser ~3× sooner (zero undershoot cost); calm
+// fires whose WAIT screen is slower than 1 s just confirm via V Holding instead.
+const FIRE_RELEASE_MS            = parseInt(process.env.BOT_FIRE_RELEASE_MS ?? '1000', 10);
 // After the fast release, confirm the committed add via V Holding with a LONGER
 // window than the cold-timeout verify — because we must never concede to the
 // cold fallback while the add is merely slow to appear (the cold bot would

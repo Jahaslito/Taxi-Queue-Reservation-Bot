@@ -248,7 +248,12 @@ services:
       # committed add via the V Holding read. Contract-safe — changes only HOW we
       # confirm, never WHEN we fire. Raise it to keep more calm fires on the
       # in-page read; lower it to free the pipeline sooner during storms.
-      BOT_FIRE_RELEASE_MS:           ${BOT_FIRE_RELEASE_MS:-3000}
+      # TUNED 2026-07-24 3000→1000: the 07-24 storm fired 29 drivers on one tick,
+      # serialising ~4 deep across 7 browsers → 11 s tails → +48…+59 overshoot
+      # (vs +32 first-out; the delta is pure per-browser hold). Under storm load
+      # the WAIT screen takes 10-25 s to return, so the 3 s hold was wasted; 1 s
+      # frees each browser ~3× sooner at zero undershoot cost.
+      BOT_FIRE_RELEASE_MS:           ${BOT_FIRE_RELEASE_MS:-1000}
       # After a fast release, confirm the committed add via V Holding with a
       # longer window (12 × 1.5 s ≈ 18 s of lightweight HTTP, no held browser) so
       # a slow-to-appear add is never conceded to the cold fallback — which would

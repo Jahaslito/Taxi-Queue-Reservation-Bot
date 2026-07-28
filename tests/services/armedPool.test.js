@@ -106,3 +106,57 @@ describe('armed browser pool', () => {
     }
   });
 });
+
+// An arm op can spend seconds queued on the arm-ops semaphore or mid-login
+// while its driver fires anyway (usually cold) and drops out of the wanted
+// set. Without a re-check the op finishes a full SAN login and parks an
+// orphan session mid-storm (07-27: several of the 35 fire-minute logins were
+// for drivers whose fire was already in flight). These pin both re-check
+// points: after semaphore acquisition, and before parking the session.
+describe('arm-op wanted-set re-check', () => {
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise((r) => { resolve = r; });
+    return { promise, resolve };
+  };
+
+  test('op queued on the semaphore aborts once its driver leaves the wanted set', async () => {
+    // 5 wanted, concurrency 4: the first 4 hold the semaphore (stalled in
+    // getCredentials), the 5th queues behind them.
+    const gates = Array.from({ length: 5 }, () => deferred());
+    const ws = gates.map((g, i) => ({
+      driverId:         200 + i,
+      vehicleNumber:    `Q${i}`,
+      secondsUntilFire: 10 + i,            // ranked order = index order
+      getCredentials:   () => g.promise,
+    }));
+    const p1 = bot.syncFireSessions(ws);
+    // Next tick: the 5th driver fired meanwhile — no longer wanted.
+    await bot.syncFireSessions(ws.slice(0, 4));
+    gates.forEach((g, i) => g.resolve({ sanUsername: `q-u${i}`, sanPassword: 'p' }));
+    await p1;
+
+    const stats = bot.armedFireSessionStats();
+    expect(stats.armed).toBe(4);
+    expect(stats.sessions.some((s) => s.driverId === 204)).toBe(false);
+  });
+
+  test('a login finishing after the driver stops being wanted is released, not parked', async () => {
+    const gate = deferred();
+    const late = {
+      driverId:         300,
+      vehicleNumber:    'LATE',
+      secondsUntilFire: 5,
+      getCredentials:   () => gate.promise,
+    };
+    // Passes the queued-op re-check (still wanted), then stalls pre-login.
+    const p = bot.syncFireSessions([late]);
+    // Next tick: fired meanwhile — wanted set no longer includes them.
+    await bot.syncFireSessions([]);
+    gate.resolve({ sanUsername: 'late-u', sanPassword: 'p' });
+    await p;
+
+    // Without the pre-park re-check this would be 1 — an orphan armed session.
+    expect(bot.armedFireSessionStats().armed).toBe(0);
+  });
+});

@@ -170,17 +170,37 @@ const POS_MAX_LEAD     = parseInt(process.env.MONITOR_POS_MAX_LEAD     ?? '10', 
 // screen for every driver whose fire is near, so the fire itself is a ~1 s
 // click instead of a ~3.5 s Chromium launch (see botService "Pre-armed fire
 // sessions"). PREARM_AHEAD_SECS controls how far ahead of the projected fire
-// time we arm; inside the burst window every armed-and-waiting driver is
-// pre-armed regardless (the queue can jump 30+ positions in seconds).
+// time we arm each driver.
 const PREARM_ENABLED    = (process.env.MONITOR_PREARM_ENABLED ?? 'true') !== 'false';
 const PREARM_AHEAD_SECS = parseInt(process.env.MONITOR_PREARM_AHEAD_SECS ?? '240', 10);
+// Fleet-wide storm-readiness lead (2026-07-27): the whole watched fleet arms as
+// soon as the queue is MOVING toward the day's earliest target, or that earliest
+// target is projected within PREARM_LEAD_SECS (20 min) of being reached —
+// whichever comes first. This replaces the old "arm for the entire burst window"
+// rule (which held ~60–75 SAN sessions warm across the dead-calm pre-storm hour
+// and the post-storm plateau for no gain). Movement catches a fast onset; the
+// earliest-target projection catches a gradual pre-ramp creep even while the rate
+// is still below the movement threshold (the 07-26 04:47 case). 20 min is a
+// generous lead — arming the fleet takes seconds — so no driver fires cold.
+const PREARM_LEAD_SECS  = parseInt(process.env.MONITOR_PREARM_LEAD_SECS ?? '1200', 10);
+// Wall-clock prearm floor (2026-07-28, user request): arm the whole fleet from
+// this PT time regardless of what the projections say — a deterministic "armed
+// by" guarantee on top of the dynamic triggers (which can still arm EARLIER on
+// movement, never later). 03:30 leaves ~30 min before the earliest onset ever
+// observed (04:00, and drifting ~7 min/wk earlier — move this up if the trend
+// continues). Bounded to the storm-watch window so the fleet doesn't sit armed
+// all day. Format 'HH:MM' PT; parse failures fall back to 03:30.
+const PREARM_CLOCK_MIN  = parsePrearmClockPT(process.env.MONITOR_PREARM_CLOCK_PT ?? '03:30');
 // Position-proximity arming: bursts are POSITION-locked, not time-locked —
 // storm onset lands at queue 60–85 every morning (May–Jun logs: median 71)
 // while its clock time swings 42 minutes. secondsUntilFire is a rate-based
 // GUESS that a chunk storm invalidates in one tick, so once the queue nears
 // the storm zone every waiting driver gets armed regardless of how far away
-// their fire looks. 45 leaves ~2 min of runway before the earliest onset.
-const PREARM_QUEUE_POS  = parseInt(process.env.MONITOR_PREARM_QUEUE_POS ?? '45', 10);
+// their fire looks. 2026-07-28: 45→22 — July storms now BEGIN at queue 26–36
+// (57-day re-analysis), so 45 armed after the storm had started; 22 sits just
+// under the July onset floor. Arming never fires anyone, so the only cost is
+// session-hours. Recalibrate when the regime drifts again.
+const PREARM_QUEUE_POS  = parseInt(process.env.MONITOR_PREARM_QUEUE_POS ?? '22', 10);
 // ─── Storm-onset early fire (MONITOR_ONSET_FIRE, default OFF) ────────────────
 // SAN's display renders on a hard 5 s server tick (WS-verified 2026-07-08), so
 // a competitor batch-add can jump the queue +39 inside ONE tick (07-08:
@@ -218,7 +238,13 @@ const PREARM_QUEUE_POS  = parseInt(process.env.MONITOR_PREARM_QUEUE_POS ?? '45',
 const ONSET_FIRE_MODE   = String(process.env.MONITOR_ONSET_FIRE ?? '0').toLowerCase();
 const ONSET_FIRE_LIVE   = ONSET_FIRE_MODE === '1';
 const ONSET_FIRE_SHADOW = ONSET_FIRE_MODE === 'shadow';
-const ONSET_ZONE_MIN    = parseInt(process.env.MONITOR_ONSET_ZONE_MIN ?? '40', 10);
+// 2026-07-28: zone floor 40→20 — the regime moved (July onsets begin at queue
+// 26–36, 20 of 21 days below the old floor, so detection armed a chunk late by
+// construction). Safe by the calm-guard above: a 9-week replay found pre-storm
+// flurries in the 20–40 band on 37/57 days, worst step +5 ⇒ cap = 10 on every
+// one — identical to the normal lead. Onset fires only land EARLY, so a lower
+// floor cannot add overshoot.
+const ONSET_ZONE_MIN    = parseInt(process.env.MONITOR_ONSET_ZONE_MIN ?? '20', 10);
 const ONSET_ZONE_MAX    = parseInt(process.env.MONITOR_ONSET_ZONE_MAX ?? '90', 10);
 const ONSET_RATE        = parseFloat(process.env.MONITOR_ONSET_RATE   ?? '1.2');
 const ONSET_STEP        = parseInt(process.env.MONITOR_ONSET_STEP     ?? '5', 10);
@@ -373,26 +399,64 @@ const BORROW_STORM_RATE    = parseFloat(process.env.MONITOR_BORROW_STORM_RATE ??
 // just above the observed median so we err slightly conservative without
 // inflating cold-start drift to 3× reality.
 const POS_BOT_EXEC_MS  = parseInt(process.env.MONITOR_POS_BOT_EXEC_MS  ?? '7000', 10);
+// ─── SAN commit-latency awareness (MONITOR_COMMIT_LATENCY_LEAD, default OFF) ──
+// The horizon above (effectiveBotExecMs) measures the BOT's own run time —
+// decision → click. It is BLIND to SAN's own commit latency: the wall-clock gap
+// between our click and SAN stamping the driver's slot. On a calm morning that
+// gap is ~1–3 s; on the 2026-07-27 storm it stalled to 22–42 s as a ~34/s onset
+// drained through the fire pool and SAN's server buckled. During that stall the
+// queue kept climbing, so every pending fire landed 150+ positions past target
+// (overshoot ↔ commit latency r=0.869). We now MEASURE that gap per fire
+// (decision timestamp → landing stamp, recordCommitLatency below) and expose a
+// rolling median (commitLatencyEstimateMs). When this flag is ON, the median is
+// folded into horizonSeconds so drift/lead and secondsUntilFire reflect SAN's
+// real commit stall, not just our bot run time. It NEVER relaxes the ±10
+// undershoot contract: the resulting lead is still clamped by POS_MAX_LEAD (10)
+// and growthLeadCap, so on a full storm it is already pinned (no behaviour
+// change) and on moderate mornings it only tightens an under-predicted horizon.
+// Default OFF so the measurement can be validated against a live storm before it
+// influences any decision. The instrumentation (the median + logging) runs
+// regardless of this flag — only the horizon inclusion is gated.
+const COMMIT_LATENCY_LEAD = (process.env.MONITOR_COMMIT_LATENCY_LEAD ?? 'false') === 'true';
 // Minimum assumed queue growth rate (drivers/second) used as a floor before historical
 // data exists and during calm periods. Protects against cold-start on a busy morning.
 // Tune down if drivers land too early; tune up if they still land too late.
 const EMERGENCY_SURGE_RATE = parseFloat(process.env.MONITOR_EMERGENCY_SURGE_RATE ?? '0.5');
 // Extra seconds added to the forecast horizon as a safety cushion.
 const SAFETY_BUFFER_SECS   = parseInt(process.env.MONITOR_SAFETY_BUFFER_MS ?? '10000', 10) / 1000;
-// Burst window: SAN's morning rush can arrive anywhere between 4:00 and 5:30 AM PT
-// and the exact minute shifts daily. We lock the poll to POLL_BURST_MS (1 s) for
-// the full 4:00–5:30 AM window so no burst timing catches us at the slow cadence.
+// Storm-watch window: SAN's morning rush can arrive anywhere in a wide span —
+// July onsets crept to ~04:00, while Sunday peaks land ~05:40 (some as late as
+// 06:44, well past the old fixed 5:30 cutoff that skipped them entirely). Widened
+// 2026-07-27 to 3:00–8:00 AM PT, all days, so no storm — early, late, or shifted —
+// is ever caught at the slow cadence.
 //
-// Why 1 s instead of 5 s:
-//   The queue can jump 50+ positions in a single 5 s tick (observed Jun 04–06).
-//   A driver whose target window is only 40 positions wide (e.g. target 140,
-//   max 180) can be completely skipped in that one tick. At 1 s, the same burst
-//   is spread across 5 ticks — the window is visible for ~8–10 ticks instead of
-//   1–2, giving the bot a chance to fire before the queue overshoots.
+// The wide window is affordable because the 1 s poll inside it is ACTIVITY-GATED
+// (see the cadence decision in poll()): we only hit SAN at 1 s while the queue is
+// actually moving, and idle at BURST_IDLE_POLL_MS through the long calm and the
+// post-storm plateau. The 1 s cadence stays essential while active — the queue can
+// jump 50+ positions in a single 5 s tick (Jun 04–06), skipping a 40-wide target
+// window whole; 1 s spreads that burst across ~5 ticks so the window is catchable.
 //
-// Configurable via env so the window can be shifted if SAN changes hours.
-const BURST_WINDOW_END_MIN   = parseInt(process.env.MONITOR_BURST_END_MIN   ?? '30', 10); // minutes past 5 AM
+// All bounds env-configurable so the window can shift if SAN changes hours.
+const BURST_START_HOUR       = parseInt(process.env.MONITOR_BURST_START_HOUR ?? '3', 10); // PT hour, inclusive
+const BURST_END_HOUR         = parseInt(process.env.MONITOR_BURST_END_HOUR   ?? '8', 10); // PT hour, exclusive
 const POLL_BURST_MS          = parseInt(process.env.MONITOR_BURST_POLL_MS   ?? '1000', 10);
+const BURST_IDLE_POLL_MS     = parseInt(process.env.MONITOR_BURST_IDLE_POLL_MS ?? '5000', 10);
+// Growth rate (positions/s) at or above which the queue counts as "moving" —
+// arms prearm and holds the 1 s cadence. Below it the queue is treated as calm.
+const MOVEMENT_RATE_PER_S    = parseFloat(process.env.MONITOR_MOVEMENT_RATE ?? '0.3');
+// A scheduled fire this close (s) counts as imminent — holds the 1 s cadence even
+// with no measurable growth (covers the last driver in a dying storm).
+const IMMINENT_FIRE_SECS     = parseInt(process.env.MONITOR_IMMINENT_FIRE_SECS ?? '45', 10);
+// ── MASTER FAIL-SAFE ─────────────────────────────────────────────────────────
+// One flag to revert every 2026-07-27 cadence/prearm change to the conservative
+// pre-change behavior: lock to 1 s for the WHOLE storm-watch window and pre-arm
+// every waiting driver across it (never activity-gated, never released early).
+// It trades SAN load for guaranteed readiness — flip it to '0'/'false' the moment
+// the smart logic is suspected of missing or delaying a fire; no code deploy
+// needed, just an env change + restart. Default ON (smart behavior).
+const SMART_CADENCE = (process.env.MONITOR_SMART_CADENCE ?? 'true') !== 'false'
+                   && process.env.MONITOR_SMART_CADENCE !== '0';
 // During burst the measured growth rate can spike to 10–15/s for a single tick
 // (e.g. 75 drivers join in 5 s). If we use that raw rate for drift estimation,
 // drift = 15 × 15 s = 225 positions — instantly marking every driver with
@@ -441,23 +505,37 @@ function isWithinPositionHours() {
   return h >= POS_START_HOUR && h < POS_END_HOUR;
 }
 
-// Returns true during the extended burst window: 4:00 AM–5:30 AM PT (default).
-// The SAN rush can arrive at any point in this 90-minute window, so we hold
-// the poll at POLL_BURST_MS (1 s) for the entire span rather than trying to
-// predict the exact minute. BURST_WINDOW_END_MIN controls how many minutes
-// past 5 AM the window runs (default 30 → 5:30 AM).
+/** Today's target position for a driver — the day-specific override when set,
+ *  else the base scheduledPosition; null when the driver has no target today.
+ *  Mirrors evaluatePositionScheduler's own resolution so the fleet-wide
+ *  "earliest target" pre-pass and the per-driver scheduler never disagree. */
+function resolveTargetPosition(state, todayDayKey) {
+  let target = state.scheduledPosition;
+  if (state.dayPositions) {
+    try { target = JSON.parse(state.dayPositions)[todayDayKey] ?? null; }
+    catch { target = null; }
+  }
+  return target || null;
+}
+
+// Returns true inside the storm-watch window: [BURST_START_HOUR, BURST_END_HOUR)
+// PT — default 3:00–8:00 AM, all days. Governs storm readiness (prearm + the
+// zero safety-buffer burst drift math); the 1 s poll cadence inside it is
+// further activity-gated in poll() so the calm stretches don't hammer SAN.
 function isWithinBurstWindow() {
-  const now   = new Date();
-  const parts = new Intl.DateTimeFormat('en-US', {
+  const h = currentHourPT();
+  return h >= BURST_START_HOUR && h < BURST_END_HOUR;
+}
+
+/** Minutes since midnight PT — drives the wall-clock prearm floor. */
+function currentMinutesPT() {
+  const [h, m] = new Date().toLocaleString('en-US', {
     timeZone: 'America/Los_Angeles',
     hour:     '2-digit',
     minute:   '2-digit',
     hour12:   false,
-  }).formatToParts(now);
-  const h = parseInt(parts.find(p => p.type === 'hour').value,   10);
-  const m = parseInt(parts.find(p => p.type === 'minute').value, 10);
-  // Full hour 4 (4:00–4:59) plus first BURST_WINDOW_END_MIN minutes of hour 5.
-  return h === 4 || (h === 5 && m < BURST_WINDOW_END_MIN);
+  }).split(':');
+  return (parseInt(h, 10) % 24) * 60 + parseInt(m, 10);
 }
 
 const QUEUE_URL = process.env.MONITOR_QUEUE_URL
@@ -1002,6 +1080,69 @@ function expectedNextPollMs(secondsUntilFire) {
   return POLL_AT_FIRE_MS;
 }
 
+// ─── Storm-watch cadence & prearm decision helpers (pure, unit-tested) ────────
+// Extracted from poll() so the 2026-07-27 activity-gated cadence, dynamic prearm,
+// and morning-complete release are covered by tests in isolation. All O(1), no
+// I/O, no allocation beyond a tiny result object — called once per poll tick.
+
+/** Fleet storm-readiness for prearm. The queue is "building" toward the day's
+ *  earliest still-unfired target when it is actively MOVING (onset armed, or
+ *  growth ≥ MOVEMENT_RATE_PER_S) OR that target is projected within `leadSecs`
+ *  of being reached. secsToEarliestTarget is ∞ when the queue is flat (rate ≤ 0)
+ *  or every target is already fired (earliestTarget ∞) — so neither the pre-storm
+ *  calm nor the post-storm plateau reports building. */
+function computeStormReadiness({ onsetActive, growthRate, earliestTarget, waitingCount, leadSecs }) {
+  const secsToEarliestTarget =
+    (growthRate > 0 && Number.isFinite(earliestTarget))
+      ? (earliestTarget - waitingCount) / growthRate
+      : Infinity;
+  const stormBuilding =
+    Boolean(onsetActive) || growthRate >= MOVEMENT_RATE_PER_S || secsToEarliestTarget <= leadSecs;
+  return { stormBuilding, secsToEarliestTarget };
+}
+
+/** Parse 'HH:MM' (PT wall clock) → minutes since midnight. Falls back to 03:30
+ *  (210) on anything malformed so a bad env value can never disable the
+ *  deterministic prearm floor. */
+function parsePrearmClockPT(str) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(str).trim());
+  if (!m) return 210;
+  const h = parseInt(m[1], 10), min = parseInt(m[2], 10);
+  if (h > 23 || min > 59) return 210;
+  return h * 60 + min;
+}
+
+/** Fleet prearm gate (2026-07-28). Smart mode arms on the dynamic signal OR the
+ *  wall-clock floor (inside the storm-watch window only, so the fleet is not
+ *  held armed all day) — the clock can only make arming EARLIER than the
+ *  dynamic triggers alone, never later. Fail-safe (!smart) keeps the pre-change
+ *  rule: armed across the whole window. */
+function computePrearmReady({ smart, stormBuilding, inWatchWindow, minutesPT, clockMinutes }) {
+  if (!smart) return inWatchWindow;
+  return Boolean(stormBuilding) || (inWatchWindow && minutesPT >= clockMinutes);
+}
+
+/** Whether the queue is "active" (hold the 1 s cadence): onset armed, measurable
+ *  growth, or a fire imminent — the three ramp signals, all silent on the calm
+ *  and the post-storm plateau (where an absolute-level test would wrongly stay). */
+function isQueueActive({ onsetActive, growthRate, minSecondsUntilFire }) {
+  return Boolean(onsetActive)
+    || growthRate >= MOVEMENT_RATE_PER_S
+    || (Number.isFinite(minSecondsUntilFire) && minSecondsUntilFire <= IMMINENT_FIRE_SECS);
+}
+
+/** Next poll delay (ms). Encodes the whole storm-watch cadence in one place:
+ *   • !smart (fail-safe) → 1 s for the entire window, else normal adaptive;
+ *   • outside the window, OR the morning's fires are all done (no fire pending)
+ *       → normal adaptive (30–90 s), even inside the window;
+ *   • queue active → 1 s burst; otherwise the idle floor, never slower than the
+ *       adaptive rate a nearer fire would ask for. */
+function computePollDelayMs({ smart, inWatchWindow, firePending, queueActive, burstMs, idleMs, adaptiveMs }) {
+  if (!smart)                            return inWatchWindow ? burstMs : adaptiveMs;
+  if (!(inWatchWindow && firePending))   return adaptiveMs;
+  return queueActive ? burstMs : Math.min(idleMs, adaptiveMs);
+}
+
 // ─── Bot latency tracking (median + freshness window) ────────────────────────
 // Each sample is { ms, recordedAt } — recordedAt lets us discard data older
 // than LATENCY_FRESHNESS_MS so a one-time architectural change (e.g. the 5/29
@@ -1116,6 +1257,43 @@ function botExecutionEstimateMs({ now = Date.now() } = {}) {
     .filter((s) => s.recordedAt >= cutoff)
     .map((s) => s.ms);
   if (fresh.length < MIN_SAMPLES_FOR_EST) return POS_BOT_EXEC_MS;
+  return computeMedian(fresh);
+}
+
+// ─── SAN commit-latency tracking (decision → landing stamp) ──────────────────
+// Mirrors the bot-latency ring buffer above, but measures a DIFFERENT gap: not
+// how long our bot runs, but how long SAN takes to stamp the slot after we fire
+// (the storm-day blind spot — see COMMIT_LATENCY_LEAD). Each sample is the
+// wall-clock ms from the fire decision (triggerPositionSchedule stamps
+// state._posFiredAtMs) to the genuine landing observation. In-memory only: this
+// signal is storm-specific and decays fast, so a restart cold-starting to "no
+// estimate" (→ 0 ms contribution, i.e. current behaviour) is the correct, safe
+// default rather than dragging yesterday's stall forward. Freshness-windowed on
+// the same 12 h cutoff as bot latency so a one-off slow morning doesn't haunt
+// the estimate for days.
+const commitLatencySamples = []; // [{ ms, recordedAt }]; newest pushed to end
+
+function recordCommitLatency(durationMs, { now = Date.now() } = {}) {
+  // Guard against garbage: a negative gap (clock skew) or an absurd one (>10 min
+  // — a driver who landed hours later via some other path, not this fire) must
+  // not poison the median.
+  if (!Number.isFinite(durationMs) || durationMs <= 0 || durationMs > 10 * 60 * 1000) return;
+  commitLatencySamples.push({ ms: durationMs, recordedAt: now });
+  if (commitLatencySamples.length > MAX_LATENCY_SAMPLES) commitLatencySamples.shift();
+}
+
+/**
+ * Rolling median (ms) of recent SAN commit latencies, or 0 when we have too few
+ * fresh samples to trust. 0 makes the horizon contribution a no-op — the safe
+ * default, identical to today's behaviour, until real storm data accumulates.
+ * `now` injectable for tests.
+ */
+function commitLatencyEstimateMs({ now = Date.now() } = {}) {
+  const cutoff = now - LATENCY_FRESHNESS_MS;
+  const fresh  = commitLatencySamples
+    .filter((s) => s.recordedAt >= cutoff)
+    .map((s) => s.ms);
+  if (fresh.length < MIN_SAMPLES_FOR_EST) return 0;
   return computeMedian(fresh);
 }
 
@@ -1398,6 +1576,17 @@ async function _runBot(driverId, state, triggerType = 'monitor_requeue', botOpts
     // borrowed table showed #4004 as ✗ −19 when the real landing was −6.
     state.landedPositionToday = result.position;
     recordFleetLanding(result.position); // feed the true-tail probe (genuine join only)
+    // SAN commit latency: decision → this genuine landing stamp. Only for
+    // position fires (triggerPositionSchedule set _posFiredAtMs); auto-requeue
+    // landings have it unset and are skipped. Cleared so a later landing on this
+    // same state can't reuse a stale fire time.
+    if (state._posFiredAtMs) {
+      const commitMs = Date.now() - state._posFiredAtMs;
+      state._posFiredAtMs = null;
+      recordCommitLatency(commitMs);
+      console.log(`[Pos] ⏱ #${state.vehicleNumber} SAN commit latency ${(commitMs / 1000).toFixed(1)}s ` +
+        `(median ${(commitLatencyEstimateMs() / 1000).toFixed(1)}s over ${commitLatencySamples.length} fires)`);
+    }
     PositionTracking.updateActualPosition(trackingId, result.position)
       .then(() => console.log(`[PosTracking] #${state.vehicleNumber} landed at ${result.position} (from bot result)`))
       .catch((err) => console.error('[PosTracking] Failed to update actual position from bot result:', err.message));
@@ -1408,6 +1597,7 @@ async function _runBot(driverId, state, triggerType = 'monitor_requeue', botOpts
     // bias) so the report shows the real cause instead of a stuck "pending".
     const aqTrackingId = state.pendingTrackingId;
     state.pendingTrackingId = null;
+    state._posFiredAtMs = null; // this fire didn't genuinely land — no commit sample
     PositionTracking.markAlreadyQueued(aqTrackingId)
       .catch((err) => console.error('[PosTracking] markAlreadyQueued error:', err.message));
     console.log(`[PosTracking] #${state.vehicleNumber} → bot found already in queue (pos ${result.position}) — labelled already_queued, NOT recording actual (avoids bias contamination)`);
@@ -1426,6 +1616,7 @@ async function _runBot(driverId, state, triggerType = 'monitor_requeue', botOpts
     // failure context.
     const failedTrackingId = state.pendingTrackingId;
     state.pendingTrackingId = null;
+    state._posFiredAtMs = null; // failed fire — no commit sample
     const reason = result?.error || result?.message || 'unknown bot failure';
     PositionTracking.markFailed(failedTrackingId, reason)
       .catch((err) => console.error('[PosTracking] markFailed (non-success) error:', err.message));
@@ -1695,6 +1886,10 @@ async function triggerPositionSchedule(driverId, state, effectivePosition, {
   broadcast('requeue_triggered', { driverId, vehicleNumber: state.vehicleNumber });
 
   const queueSizeAtFire = state._lastQueueSize ?? 0;
+  // Stamp the fire-decision instant so the genuine-landing handler can measure
+  // SAN's commit latency (click → slot stamped). Position fires only — cleared
+  // when consumed so an unrelated later landing can't reuse a stale timestamp.
+  state._posFiredAtMs = Date.now();
   console.log(`[Pos] 📍 Bot queued for #${state.vehicleNumber} — target: ${effectivePosition}, queue now: ${queueSizeAtFire}`);
 
   // Upsert the 'fired' decision — replaces any prior 'waiting' record for today.
@@ -2855,7 +3050,15 @@ async function poll() {
   // The ±10 target cannot be achieved while SAFETY_BUFFER inflates burst drift 3×.
   const inBurstWindow  = isWithinBurstWindow();
   const safetyBufferS  = inBurstWindow ? 0 : SAFETY_BUFFER_SECS;
-  const horizonSeconds = pollAgeSeconds + (effectiveBotExecMs / 1000) + safetyBufferS;
+  // SAN commit latency (decision → slot stamped) — the storm-day blind spot the
+  // bot-run-time horizon above cannot see (see COMMIT_LATENCY_LEAD). Folded in
+  // only when the flag is ON; the estimate is 0 until we have enough fresh
+  // samples, so this is a no-op on any morning without measured stalls. It never
+  // relaxes the ±10 contract — the lead it feeds is still clamped by POS_MAX_LEAD
+  // and growthLeadCap downstream, so on a full storm it is already pinned and on
+  // moderate mornings it only corrects an under-predicted horizon.
+  const commitLatencyS = COMMIT_LATENCY_LEAD ? commitLatencyEstimateMs() / 1000 : 0;
+  const horizonSeconds = pollAgeSeconds + (effectiveBotExecMs / 1000) + commitLatencyS + safetyBufferS;
 
   // During burst, a single-tick spike (e.g. 75 drivers join in 1–5 s) pushes
   // the measured growth rate to 15–75/s. Raw: drift = 75 × 15 s = 1 125 →
@@ -2922,6 +3125,12 @@ async function poll() {
 
   // Track the soonest fire across all armed drivers — drives adaptive polling.
   let minSecondsUntilFire = Infinity;
+  // True once any driver this tick is still pending a morning fire (firing now,
+  // fire in flight, or genuinely waiting on queue growth). Goes false only when
+  // every driver is terminal for the day — fired, missed, no-target, or a
+  // carryover awaiting purge. Drives the "morning done → drop 1 s polling back to
+  // the normal rate" cadence release below.
+  let positionFirePending = false;
 
   // Drivers who should hold a pre-armed fire session (collected from 'wait'
   // decisions below, reconciled with botService after the loop).
@@ -2941,6 +3150,37 @@ async function poll() {
   // the tail (safe to lend as probes). Collected here, reconciled after the loop.
   const borrowCandidates = [];
 
+  // ── Dynamic fleet prearm signal ──────────────────────────────────────────
+  // The day's EARLIEST still-unfired target and when the queue is projected to
+  // reach it. Drives prearm (below): the whole fleet arms as soon as the queue
+  // is genuinely MOVING, or that earliest fire is within PREARM_LEAD_SECS —
+  // never for the idle stretches. Fired drivers are excluded so the plateau (all
+  // targets already reached) contributes no earliest target and prearms nothing.
+  let earliestTargetToday = Infinity;
+  for (const [, s] of watches) {
+    if (s.isActive === false || s.borrowedAsProbe || s.positionFiredToday) continue;
+    const t = resolveTargetPosition(s, todayDayKey);
+    if (typeof t === 'number' && t > 0 && t < earliestTargetToday) earliestTargetToday = t;
+  }
+  const { stormBuilding } = computeStormReadiness({
+    onsetActive:    onsetState.active,
+    growthRate:     effectiveGrowthRate,
+    earliestTarget: earliestTargetToday,
+    waitingCount,
+    leadSecs:       PREARM_LEAD_SECS,
+  });
+  // Smart mode: dynamic signal OR the 03:30 PT wall-clock floor (window-bounded)
+  // — deterministic "armed by" guarantee; the clock only ever arms EARLIER.
+  // Fail-safe: with SMART_CADENCE off, revert prearm to the pre-change rule —
+  // every waiting driver arms across the whole burst window.
+  const prearmReady = computePrearmReady({
+    smart:         SMART_CADENCE,
+    stormBuilding,
+    inWatchWindow: inBurstWindow,
+    minutesPT:     currentMinutesPT(),
+    clockMinutes:  PREARM_CLOCK_MIN,
+  });
+
   for (const [driverId, state] of watches) {
     // A driver currently lent to the tail probe is "checked out": don't fire,
     // prearm, or time them. They resume normal scheduling the instant they're
@@ -2959,6 +3199,17 @@ async function poll() {
 
     if (Number.isFinite(decision.secondsUntilFire) && decision.secondsUntilFire < minSecondsUntilFire) {
       minSecondsUntilFire = decision.secondsUntilFire;
+    }
+
+    // Any driver still firing, mid-fire, or genuinely waiting on queue growth
+    // keeps the morning "live" (carryover-purge waiters don't — they fire on the
+    // purge, not on queue growth). Same eligibility as prearm.
+    if (
+      decision.action === 'fire' ||
+      decision.action === 'skip_bot_inflight' ||
+      (decision.action === 'wait' && decision.reason !== 'awaiting_overnight_purge')
+    ) {
+      positionFirePending = true;
     }
 
     // Apply side effects per decision action
@@ -2995,15 +3246,18 @@ async function poll() {
         // (NOT carryovers — they're still inside V Holding, so arming would
         // just park on the WAIT screen). queue_shrinking waiters are included:
         // the purge settles within a poll or two and they fire right after.
-        // Three triggers, any one suffices: inside the burst window; projected
-        // fire is near; or the queue has reached the position-locked storm
-        // zone (PREARM_QUEUE_POS) — the last one covers storms that drift
-        // outside the 4:00–5:30 window and drivers whose rate-based
-        // secondsUntilFire estimate a chunk storm would invalidate.
+        // Any one trigger suffices:
+        //   • stormBuilding — the fleet-wide dynamic signal: queue moving, or the
+        //     day's earliest target within the 20-min lead (replaces the old
+        //     "whole burst window" rule so we don't hold sessions warm all idle);
+        //   • this driver's own projected fire is near (PREARM_AHEAD_SECS);
+        //   • the queue has reached the position-locked storm zone
+        //     (PREARM_QUEUE_POS) — a backstop for a chunk storm that invalidates
+        //     the rate-based estimate in one tick.
         if (
           decision.action === 'wait' &&
           decision.reason !== 'awaiting_overnight_purge' &&
-          (inBurstWindow ||
+          (prearmReady ||
             decision.secondsUntilFire <= PREARM_AHEAD_SECS ||
             waitingCount >= PREARM_QUEUE_POS)
         ) {
@@ -3211,21 +3465,55 @@ async function poll() {
   }
 
   // Set the adaptive interval for the next scheduled poll.
-  // During the burst window (4:00–5:30 AM PT) lock to POLL_BURST_MS (1 s)
-  // regardless of secsToFire — the growth rate estimate is unreliable right
-  // after a fire (the queue temporarily dips as the newly-added driver appears,
-  // making the rate look slower than it really is). The relaxation to 30 s that
-  // cost us 10 drivers on Jun 05 happened exactly here.
-  // 1 s vs 5 s: at 5 s the queue can jump 50 positions in one tick, skipping a
-  // 40-position target window entirely. At 1 s the same jump is 5 ticks of ~10
-  // positions, giving multiple chances to fire before the window closes.
-  const newDelayMs = isWithinBurstWindow()
-    ? POLL_BURST_MS
-    : expectedNextPollMs(minSecondsUntilFire);
+  //
+  // Inside the storm-watch window (3:00–8:00 AM PT) we lock to POLL_BURST_MS (1 s)
+  // — but ONLY while the queue is actually active. The 1 s cadence is what keeps a
+  // burst catchable (at 5 s the queue can jump 50 positions in one tick, skipping a
+  // 40-wide target window whole; the Jun 05 relaxation to 30 s here cost 10
+  // drivers), so we drop to it the instant anything stirs: onset armed, any
+  // measurable growth, the queue climbing into storm range, or a fire imminent —
+  // all well before the ramp. Through the genuinely flat calm and the post-storm
+  // plateau we idle at BURST_IDLE_POLL_MS (5 s — still far tighter than the old
+  // out-of-window relaxation), so a 5-hour window is not 5 hours of 1 s SAN hits.
+  // A nearer scheduled fire can still pull the idle cadence faster than the floor.
+  // "Active" = the queue is MOVING (or a fire is imminent) — not merely sitting
+  // high. An absolute-level test would keep us at 1 s through the whole post-storm
+  // plateau (queue parked at ~270 with nothing left to fire); growth rate and an
+  // imminent fire are the true ramp signals and both fall silent on the plateau.
+  //
+  // And once the morning's fires are ALL done — the highest (last) target has
+  // fired, or every driver is otherwise terminal (fired / missed / no-target /
+  // carryover awaiting purge) — there is nothing left to catch, so we leave the
+  // watch window's fast cadence entirely and fall back to the normal adaptive
+  // rate even though the clock is still inside the window. This drops the
+  // post-firing SAN polling from the 5 s idle floor to the full idle interval for
+  // the rest of the morning (the plateau can run hours). It re-tightens on its
+  // own the moment a fire becomes pending again (a requeue, a carryover leaving,
+  // a target edit) — positionFirePending flips back true next tick.
+  const inWatchWindow = inBurstWindow; // reuse the tick's single timezone read
+  const queueActive   = isQueueActive({
+    onsetActive:         onsetState.active,
+    growthRate:          effectiveGrowthRate,
+    minSecondsUntilFire,
+  });
+  const adaptiveMs = expectedNextPollMs(minSecondsUntilFire);
+  const newDelayMs = computePollDelayMs({
+    smart:       SMART_CADENCE,
+    inWatchWindow,
+    firePending: positionFirePending,
+    queueActive,
+    burstMs:     POLL_BURST_MS,
+    idleMs:      BURST_IDLE_POLL_MS,
+    adaptiveMs,
+  });
   if (newDelayMs !== currentPollDelayMs) {
-    const reason = isWithinBurstWindow()
-      ? 'burst window lock'
-      : `nearest fire in ${Number.isFinite(minSecondsUntilFire) ? minSecondsUntilFire.toFixed(0) + 's' : '∞'}`;
+    const reason = !SMART_CADENCE
+      ? (inWatchWindow ? 'burst window lock (fail-safe: smart cadence OFF)' : 'adaptive')
+      : (inWatchWindow && positionFirePending)
+        ? (queueActive ? 'storm-watch: queue active (1 s)' : 'storm-watch: idle')
+        : inWatchWindow
+          ? 'storm-watch: morning firing complete → normal cadence'
+          : `nearest fire in ${Number.isFinite(minSecondsUntilFire) ? minSecondsUntilFire.toFixed(0) + 's' : '∞'}`;
     console.log(`[Monitor] Poll cadence ${currentPollDelayMs/1000}s → ${newDelayMs/1000}s (${reason})`);
     currentPollDelayMs = newDelayMs;
   }
@@ -3848,7 +4136,8 @@ async function startMonitor() {
   console.log(
     `[Monitor] Started — poll cadence ${POLL_INTERVAL_MS / 1000}s idle / ` +
     `${POLL_NEAR_FIRE_MS / 1000}s near fire / ${POLL_AT_FIRE_MS / 1000}s at fire / ` +
-    `${POLL_BURST_MS / 1000}s burst (4:00–5:${String(BURST_WINDOW_END_MIN).padStart(2, '0')} AM PT), ` +
+    `${POLL_BURST_MS / 1000}s burst / ${BURST_IDLE_POLL_MS / 1000}s idle ` +
+    `(${BURST_START_HOUR}:00–${BURST_END_HOUR}:00 AM PT storm-watch, activity-gated), ` +
     `auto-refresh every ${AUTO_REFRESH_MS / 1000}s, ` +
     `bot concurrency: ${BOT_CONCURRENCY}, ` +
     `watching ${watches.size} driver(s)`,
@@ -4102,6 +4391,14 @@ module.exports = {
   _norm:                      norm,
   _isWithinOperatingHours:    isWithinOperatingHours,
   _evaluatePositionScheduler: evaluatePositionScheduler,
+  // Storm-watch cadence & prearm (pure) — see stormWatchCadence.test.js
+  _computeStormReadiness:     computeStormReadiness,
+  _computePrearmReady:        computePrearmReady,
+  _parsePrearmClockPT:        parsePrearmClockPT,
+  _isQueueActive:             isQueueActive,
+  _computePollDelayMs:        computePollDelayMs,
+  _resolveTargetPosition:     resolveTargetPosition,
+  _expectedNextPollMs:        expectedNextPollMs,
   _onsetStep:                 onsetStep,
   _onsetCapNow:               onsetCapNow,
   _onsetBacklogBoost:         onsetBacklogBoost,
@@ -4119,6 +4416,10 @@ module.exports = {
   _computeMedian:             computeMedian,
   _normaliseLatencySample:    normaliseLatencySample,
   _resetLatencySamples:       () => { botLatencySamples.length = 0; },
+  // SAN commit-latency instrumentation — see commitLatency.test.js
+  _recordCommitLatency:       recordCommitLatency,
+  _commitLatencyEstimateMs:   commitLatencyEstimateMs,
+  _resetCommitLatencySamples: () => { commitLatencySamples.length = 0; },
   _recordFleetLanding:        recordFleetLanding,
   _borrowAllowedInCalm:       borrowAllowedInCalm,
   _borrowRetireBuffer:        borrowRetireBuffer,

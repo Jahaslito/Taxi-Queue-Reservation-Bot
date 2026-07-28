@@ -221,6 +221,14 @@ async function bootstrap() {
 
     const { startCardEnforcement } = require('./src/services/cardEnforcementService');
     startCardEnforcement();
+
+    // DB retention sweep (queue_snapshots + logs). Self-gates on RETENTION_ENABLED
+    // (default off) — calling unconditionally is safe; the env flag alone decides.
+    require('./src/services/retentionService').start();
+
+    // Oracle-shadow daily report (position-accuracy ceilings; LOG-ONLY, never
+    // touches live decisions). Self-gates on MONITOR_ORACLE_SHADOW (default on).
+    require('./src/services/oracleShadowService').start();
   });
 }
 

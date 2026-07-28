@@ -30,12 +30,22 @@ services:
       timeout: 5s
       retries: 5
     # Guarantee Postgres a FLOOR of RAM (reservation) so an app spike can't
-    # starve it — but deliberately NO hard limit: Postgres legitimately bursts
-    # above baseline (large sorts, VACUUM, the nightly pg_dump), and a ceiling
-    # would risk an OOM-kill mid-query. Bounding the APP at 4G already prevents
-    # it from eating the whole box, so the db ceiling isn't needed.
+    # starve it, plus a hard ceiling so the app can safely run more Chromiums.
+    #
+    # ⚠️ 2026-07-28 — capped at 1 GB (was uncapped). Verified safe: this is stock
+    # postgres:16-alpine (no tuning) driving a light OLTP queue workload (only 2
+    # heavy query patterns in the codebase). Live idle RSS was 107 MiB; the worst
+    # realistic stack — post-storm autovacuum (maintenance_work_mem 64M × ~3
+    # workers ≈ 192M) + 20 pool backends × work_mem + shared_buffers 128M —
+    # totals well under 500 MB, so 1 GB is ~2× headroom. pg_dump streams (it does
+    # NOT balloon server RSS), so the old "nightly dump burst" fear doesn't hold
+    # here. CAVEAT: queue_snapshots and logs have no retention yet — a pruning
+    # migration keeps this ceiling true long-term (tracked separately). If the db
+    # ever nears this cap, add retention first; do NOT quietly raise the cap.
     deploy:
       resources:
+        limits:
+          memory: 1024M
         reservations:
           memory: 512M
 
@@ -106,6 +116,23 @@ services:
       MONITOR_POS_START_HOUR:       ${MONITOR_POS_START_HOUR:-3}
       MONITOR_POS_END_HOUR:         ${MONITOR_POS_END_HOUR:-23}
       MONITOR_MAX_TERMINAL_CHECKS:  ${MONITOR_MAX_TERMINAL_CHECKS:-5}
+      # Storm-watch window (PT hours, all days). WIDENED 2026-07-27 from the old
+      # fixed 4:00–5:30 to 3:00–8:00 so an early (July onsets ~04:00), late
+      # (Sunday peaks ~05:40, some 06:44), or shifted storm is never caught at the
+      # slow cadence. Affordable because the 1 s poll inside is ACTIVITY-GATED: 1 s
+      # (BURST_POLL_MS) only while the queue is moving; BURST_IDLE_POLL_MS through
+      # the calm + post-storm plateau. Governs prearm readiness + zero-buffer burst
+      # drift too. Narrow it here if SAN ever rate-limits the sustained polling.
+      MONITOR_BURST_START_HOUR:     ${MONITOR_BURST_START_HOUR:-3}
+      MONITOR_BURST_END_HOUR:       ${MONITOR_BURST_END_HOUR:-8}
+      MONITOR_BURST_POLL_MS:        ${MONITOR_BURST_POLL_MS:-1000}
+      MONITOR_BURST_IDLE_POLL_MS:   ${MONITOR_BURST_IDLE_POLL_MS:-5000}
+      # MASTER FAIL-SAFE for the 2026-07-27 cadence/prearm changes. Set to 0 to
+      # revert to the pre-change behavior — 1 s poll locked across the whole
+      # window + every waiting driver pre-armed across it (no activity-gating, no
+      # early release). Flip this (no code deploy) if the smart logic is ever
+      # suspected of missing or delaying a fire; it trades SAN load for readiness.
+      MONITOR_SMART_CADENCE:        ${MONITOR_SMART_CADENCE:-true}
       MONITOR_EMERGENCY_SURGE_RATE: ${MONITOR_EMERGENCY_SURGE_RATE:-0.5}
       MONITOR_SAFETY_BUFFER_MS:     ${MONITOR_SAFETY_BUFFER_MS:-10000}
       MONITOR_QUEUE_URL:            ${MONITOR_QUEUE_URL}
@@ -151,6 +178,18 @@ services:
       # positions EARLY a position fire may happen (drift + bias). See
       # POS_MAX_LEAD in monitorService for the full derivation.
       MONITOR_POS_MAX_LEAD:  ${MONITOR_POS_MAX_LEAD:-10}
+      # SAN commit-latency awareness (2026-07-28). The drift horizon measures the
+      # BOT's run time (decision → click) but was blind to SAN's own commit
+      # latency (click → slot stamped). On the 07-27 storm that gap stalled to
+      # 22–42 s as a ~34/s onset drained through the fire pool, so every pending
+      # fire landed 150+ past target (overshoot ↔ commit latency r=0.869). We now
+      # MEASURE that gap per fire and, when this is ON, fold its rolling median
+      # into the horizon. NEVER relaxes the ±10 contract — the lead it feeds is
+      # still clamped by POS_MAX_LEAD and growthLeadCap, so a full storm is
+      # already pinned (no-op) and only moderate mornings tighten. DEFAULT OFF:
+      # the instrumentation/logging runs regardless; flip to 1 only after a live
+      # storm confirms the measured latencies look sane in the logs.
+      MONITOR_COMMIT_LATENCY_LEAD:  ${MONITOR_COMMIT_LATENCY_LEAD:-false}
       # ±10 accuracy contract — overshoot half. Pre-armed fire sessions park a
       # logged-in page on SAN's "Add To Queue" screen for drivers near their
       # fire window, making the fire a ~1 s click (vs ~3.5 s cold launch) with
@@ -163,10 +202,31 @@ services:
       # old cap of 10 left 7 drivers cold → landings +46…+127 past target).
       MONITOR_PREARM_ENABLED:    ${MONITOR_PREARM_ENABLED:-true}
       MONITOR_PREARM_AHEAD_SECS: ${MONITOR_PREARM_AHEAD_SECS:-240}
+      # Fleet-wide dynamic prearm lead (2026-07-27). The whole fleet arms when the
+      # queue starts MOVING toward the day's earliest target, or that earliest
+      # target is projected within this many seconds of being reached — replacing
+      # the old "arm for the whole burst window" rule that held sessions warm
+      # through the idle pre-storm hour and post-storm plateau. 20 min is a
+      # generous lead (arming takes seconds) so no driver ever fires cold.
+      MONITOR_PREARM_LEAD_SECS:  ${MONITOR_PREARM_LEAD_SECS:-1200}
+      # Wall-clock prearm floor (2026-07-28, deliberate safety margin): the whole
+      # fleet is armed from this PT time no matter what the projections say — a
+      # deterministic "armed by" guarantee layered OVER the dynamic triggers
+      # above, which can still arm earlier on movement (never later). 03:30 gives
+      # ~30 min before the earliest onset ever observed (04:00; onsets drifting
+      # ~7 min/wk earlier through July — move this up if the trend continues).
+      # Window-bounded so the fleet is not held armed all day. 'HH:MM' PT;
+      # malformed values fall back to 03:30.
+      MONITOR_PREARM_CLOCK_PT:   ${MONITOR_PREARM_CLOCK_PT:-03:30}
       # Arm every waiting driver once the queue reaches this position — bursts
-      # are position-locked (onset at queue 60–85 every morning), so proximity
-      # in POSITION, not projected fire time, is what predicts the storm.
-      MONITOR_PREARM_QUEUE_POS:  ${MONITOR_PREARM_QUEUE_POS:-45}
+      # are position-locked, so proximity in POSITION, not projected fire time,
+      # is what predicts the storm.
+      # ⚠️ 2026-07-28 — 45→22: July storms now BEGIN at queue 26–36 (was 44–55 in
+      # June), so the 45 backstop armed only after the storm had started. 22 sits
+      # just under the July onset floor (26). Cost is only session-hours (arming
+      # never fires anyone); the dynamic prearm (movement / 20-min lead) usually
+      # beats this backstop anyway. Track the regime — see ZONE_MIN note above.
+      MONITOR_PREARM_QUEUE_POS:  ${MONITOR_PREARM_QUEUE_POS:-22}
       # De-lag (fleet-landing true-tail probe). THE consumer of the tail/borrow
       # probe samples: fires drivers on our own fleet's live landings (now also
       # fed early by the fire-visibility watch) when SAN's ~5 s stepped display
@@ -198,7 +258,17 @@ services:
       # change. The 07-19 backlog package (CAP_MAX/horizon guard below) is a
       # no-op unless this is live.
       MONITOR_ONSET_FIRE:        ${MONITOR_ONSET_FIRE:-1}
-      MONITOR_ONSET_ZONE_MIN:    ${MONITOR_ONSET_ZONE_MIN:-40}
+      # ⚠️ 2026-07-28 — ZONE_MIN 40→20: the storm regime moved out from under the
+      # old floor. 57-day re-analysis: July onsets begin at queue 26–36 (20 of 21
+      # days BELOW 40), so at 40 the detector could not arm until the storm was
+      # already a chunk past its start. Safe by the calm-guard: 9-week replay
+      # found pre-storm flurries in the 20–40 band on 37/57 days but their worst
+      # step was +5 ⇒ dynamic cap = max(10, 2×step) = 10 on every one — identical
+      # to the normal lead, no extra undershoot, no overshoot vector (onset fires
+      # only land EARLY). Zone-20 catches the leading edge on 45/57 days.
+      # Regime is still drifting — recalibrate from the last ~10 storms' onset
+      # levels if overshoot medians rise again (see storm-dow re-analysis 07-28).
+      MONITOR_ONSET_ZONE_MIN:    ${MONITOR_ONSET_ZONE_MIN:-20}
       MONITOR_ONSET_ZONE_MAX:    ${MONITOR_ONSET_ZONE_MAX:-90}
       MONITOR_ONSET_RATE:        ${MONITOR_ONSET_RATE:-1.2}
       MONITOR_ONSET_STEP:        ${MONITOR_ONSET_STEP:-5}
@@ -261,16 +331,35 @@ services:
       # a genuinely benched "Not Authorized" driver falls through (reported as
       # Not-Authorized, never "already in queue").
       BOT_FIRE_RELEASE_VERIFY_ATTEMPTS: ${BOT_FIRE_RELEASE_VERIFY_ATTEMPTS:-12}
-      BOT_ARMED_MAX:             ${BOT_ARMED_MAX:-40}
+      # ⚠️ 2026-07-28 — 40→48 to match the widened pool's slot capacity (12
+      # browsers × 4 sessions below); at 40 the cap bound BELOW capacity, and on
+      # 07-27 it starved 9 of 78 drivers (targets 111–165, the crush band) to the
+      # cold path → landings +74…+154 past target. Keep this equal to
+      # BOT_ARMED_BROWSERS_MAX × BOT_ARMED_SESSIONS_PER_BROWSER when resizing.
+      BOT_ARMED_MAX:             ${BOT_ARMED_MAX:-48}
       # Roster-scaled armed pool: BOT_ARMED_BROWSERS is the FLOOR; one extra
       # browser opens per BOT_ARMED_SESSIONS_PER_BROWSER armed sessions, up to
       # BOT_ARMED_BROWSERS_MAX (07-06: 12 same-tick claims on 3 browsers = 4
       # serialized clicks each → 9.7 s per fire; ~36 armed now get 6 browsers
       # → ~2 clicks per browser in the same batch). Each extra browser costs
       # ~180 MB; MAX past 8 needs a matching pm2 max_memory_restart bump.
-      BOT_ARMED_BROWSERS:             ${BOT_ARMED_BROWSERS:-3}
-      BOT_ARMED_BROWSERS_MAX:         ${BOT_ARMED_BROWSERS_MAX:-8}
-      BOT_ARMED_SESSIONS_PER_BROWSER: ${BOT_ARMED_SESSIONS_PER_BROWSER:-6}
+      #
+      # ⚠️ 2026-07-28 — WIDENED to cut the 07-27 drain term (Lever 1). Same-tick
+      # armed clicks serialise PER BROWSER on that browser's event loop, so
+      # firing throughput scales with browser COUNT, not MONITOR_CONCURRENCY (the
+      # armed path bypasses that jobQueue). On 07-27 the ARMED_MAX=40 roster on
+      # 8 browsers = ~5 serialized clicks/browser feeding a ~34/s onset. Fewer
+      # sessions per browser (6→4) forces the pool to open browsers earlier, and
+      # a higher MAX (8→12) lands ~3–4 clicks/browser. Sized for the 8 GB droplet:
+      # 12-browser worst-case RSS ≈ 4.1 GB, under the pm2 restart (4608M) with a
+      # 512M graceful-restart gap below the Docker app cap (5120M). This became
+      # affordable by capping co-located Postgres at 1 GB (see the db service; it
+      # idles at 107 MiB) instead of leaving it uncapped. Box budget: 5 GB app +
+      # 1 GB db + ~1 GB OS/nginx ≈ 7 GB of 7.75. Past 12 needs a bigger droplet —
+      # verify with `docker stats` at ~10 browsers during a live storm first.
+      BOT_ARMED_BROWSERS:             ${BOT_ARMED_BROWSERS:-4}
+      BOT_ARMED_BROWSERS_MAX:         ${BOT_ARMED_BROWSERS_MAX:-12}
+      BOT_ARMED_SESSIONS_PER_BROWSER: ${BOT_ARMED_SESSIONS_PER_BROWSER:-4}
       BOT_ARM_OPS_CONCURRENCY:   ${BOT_ARM_OPS_CONCURRENCY:-4}
       # Adaptive fire-confirmation timeout: floor .. max, driven by 2 × rolling
       # p95 of armed-fire durations. A timeout is verified against V Holding
@@ -343,6 +432,38 @@ services:
       # Playwright screenshot dir (debug)
       BOT_DEBUG_DIR: /tmp/san-bot-debug
 
+      # ── DB retention sweep (2026-07-28) ──────────────────────────────────────
+      # Prunes the two UNBOUNDED tables (queue_snapshots ~18k rows/storm-day,
+      # logs) so the 1 GB Postgres cap stays true long-term. position_tracking is
+      # left alone (small; feeds bias/accuracy history). ON/OFF is pure env — flip
+      # RETENTION_ENABLED and recreate the container, no code deploy. Default OFF.
+      # Windows floor at 90 d to preserve the ~9-week storm-profile analytics;
+      # set a table's *_DAYS to 0 to skip just that table. Batched deletes over
+      # already-indexed age columns keep locks/WAL short on the capped db.
+      RETENTION_ENABLED:               ${RETENTION_ENABLED:-false}
+      RETENTION_QUEUE_SNAPSHOTS_DAYS:  ${RETENTION_QUEUE_SNAPSHOTS_DAYS:-90}
+      RETENTION_LOGS_DAYS:             ${RETENTION_LOGS_DAYS:-90}
+      RETENTION_BATCH_SIZE:            ${RETENTION_BATCH_SIZE:-5000}
+      # Sweep cadence (ms). Default MONTHLY (30 d = 2592000000). The 90-day window
+      # is a MOVING line so the sweep repeats; monthly holds the table at ≤~120 d
+      # worst case — still well under the 1 GB cap. First run is ~60 s after boot,
+      # then every interval. Not a wall-clock time — it's uptime-relative.
+      RETENTION_SWEEP_INTERVAL_MS:     ${RETENTION_SWEEP_INTERVAL_MS:-2592000000}
+
+      # ── Oracle-shadow daily report (2026-07-28) ──────────────────────────────
+      # LOG-ONLY hindsight analysis, runs once a day after the position morning:
+      # replays queue_snapshots + position_tracking through the three ceiling
+      # models (independent oracle / fleet-constrained oracle / causal replay,
+      # incl. the 'hardcap' candidate policy: depth-clamped early fire, born-over
+      # guard, ≤+40 enforcement) and logs scorecards + the gap decomposition
+      # (capacity vs observability vs implementation loss). Never touches live
+      # decisions — grep '[OracleShadow]'. Feeds the ±10/≤+40 goal work.
+      MONITOR_ORACLE_SHADOW:        ${MONITOR_ORACLE_SHADOW:-1}
+      ORACLE_SHADOW_HOUR_PT:        ${ORACLE_SHADOW_HOUR_PT:-10}
+      # Fleet-oracle click-start rate cap (clicks/s): ~10/s on the 12-browser
+      # click path; raise after HTTP-fire is live.
+      ORACLE_SHADOW_CLICKS_PER_SEC: ${ORACLE_SHADOW_CLICKS_PER_SEC:-8}
+
     volumes:
       - ./logs:/app/logs   # daily log files persist across container restarts
       - ./data:/app/data   # runtime state (bot latency samples, etc.) persists across restarts
@@ -360,10 +481,17 @@ services:
     # (ecosystem.config.js) BELOW this hard cap so pm2 restarts the app
     # gracefully before Docker's OOM killer fires. Was 1536M when the droplet
     # was 2 GB — raised 2026-06-16.
+    #
+    # ⚠️ 2026-07-28 — raised 4096M → 5120M for the 12-browser armed pool (Lever 1,
+    # see BOT_ARMED_BROWSERS_MAX). Worst-case app RSS ≈ 4.1 GB; pm2 restarts at
+    # 4608M (512M gap under this cap). Affordable because Postgres is now capped
+    # at 1 GB (see the db service): box budget 5 GB app + 1 GB db + ~1 GB
+    # OS/nginx ≈ 7 GB of 7.75. Do NOT raise further without shrinking that
+    # headroom check — going past 12 browsers needs a bigger droplet.
     deploy:
       resources:
         limits:
-          memory: 4096M
+          memory: 5120M
         reservations:
           memory: 1024M
 

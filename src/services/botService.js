@@ -1316,8 +1316,11 @@ const credentialLockout = require('./credentialLockoutService');
 // collapses everyone's secsToFire to zero on one tick, and anyone unarmed at
 // that moment falls to the concurrency-3 cold path at peak burst (2026-06-30:
 // the old cap of 10 left 7 drivers cold → landings +46…+127 past target).
-// ~35 MB per context ⇒ 40 armed ≈ 1.4 GB, fits the 4096M container limit.
-const ARMED_MAX             = parseInt(process.env.BOT_ARMED_MAX             ?? '40', 10);
+// ~35 MB per context ⇒ 48 armed ≈ 1.7 GB, inside the 5120M container limit.
+// Sized to the pool's slot capacity (BOT_ARMED_BROWSERS_MAX × sessions per
+// browser = 12 × 4); a cap below that starves fires to the cold path (07-27:
+// 40 left 9 of 78 cold → +74…+154 past target).
+const ARMED_MAX             = parseInt(process.env.BOT_ARMED_MAX             ?? '48', 10);
 // Shared Chromium processes armed contexts are spread across. Same-tick armed
 // clicks serialise per browser process (06-30: 9 clicks on one tick took
 // 2.2–2.5 s each on a single browser; 07-06: 12 claims across 3 browsers = 4
@@ -1475,6 +1478,15 @@ const armCooldownUntil = new Map();
 const notAvailableStreak = new Map();
 // driverIds with an arm operation currently in flight (dedup across sync ticks)
 const armingInFlight = new Set();
+// driverIds in the most recent syncFireSessions wanted set — null until the
+// first sync so direct calls (tests) are never gated. An arm op can spend
+// seconds queued on the arm-ops semaphore or mid-login while its driver fires
+// anyway (usually cold) and leaves the wanted set; without a re-check the op
+// finishes a full SAN login and parks a session nobody will use, on browsers
+// that are busy draining fire clicks (07-27: 35 logins ran inside the fire
+// minute, several for drivers whose fire was already in flight). armFireSession
+// re-checks this set after acquiring the semaphore and again before parking.
+let lastSyncWantedIds = null;
 // driverIds whose session has been CLAIMED for an in-flight fire (removed from
 // armedSessions, not yet disposed). Tracked so closeArmedBrowserIfIdle can't
 // close the shared browser under a click that hasn't happened yet.
@@ -1745,6 +1757,12 @@ async function armFireSession({ driverId, vehicleNumber, getCredentials }) {
 
   let context = null;
   try {
+    // The driver may have fired (usually cold) while this op sat queued on the
+    // semaphore — abort before spending a login on them.
+    if (lastSyncWantedIds && !lastSyncWantedIds.has(driverId)) {
+      console.log(`[Arm] #${vehicleNumber} arm skipped — dropped from wanted set while queued (fired or unscheduled meanwhile)`);
+      return;
+    }
     const creds = await getCredentials();
     if (!creds) throw new Error('credentials unavailable');
     const { sanUsername, sanPassword } = creds;
@@ -1795,6 +1813,14 @@ async function armFireSession({ driverId, vehicleNumber, getCredentials }) {
     }
 
     notAvailableStreak.delete(driverId);
+    // The driver may have fired mid-login — don't park a session nobody will
+    // use (the next sync would only disarm it again).
+    if (lastSyncWantedIds && !lastSyncWantedIds.has(driverId)) {
+      await context.close().catch(() => {});
+      console.log(`[Arm] #${vehicleNumber} armed too late — no longer wanted (fired mid-login); session released`);
+      await closeArmedBrowserIfIdle();
+      return;
+    }
     armedSessions.set(driverId, {
       driverId,
       vehicleNumber,
@@ -2180,6 +2206,7 @@ async function fireArmedSession(driverId) {
  */
 async function syncFireSessions(wanted) {
   const wantedById = new Map(wanted.map((w) => [w.driverId, w]));
+  lastSyncWantedIds = new Set(wantedById.keys());
 
   // Disarm sessions whose driver no longer wants one (fired, seen, target gone).
   const ops = [];

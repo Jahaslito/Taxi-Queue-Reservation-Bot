@@ -1,15 +1,17 @@
 name: Deploy → Production
 
 # ─── Triggers ─────────────────────────────────────────────────────────────────
-# 1. Push a version tag:  git tag v1.2.0 && git push origin v1.2.0
-# 2. Manual trigger in GitHub Actions UI (workflow_dispatch)
+# 1. Push to main: deploy the latest commit (no staging anymore)
+# 2. Push a version tag:  git tag v1.2.0 && git push origin v1.2.0
+# 3. Manual trigger in GitHub Actions UI (workflow_dispatch)
 #
-# Both paths require a human approval in the GitHub "production" Environment
+# All paths require a human approval in the GitHub "production" Environment
 # before the SSH deploy command actually runs.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
   push:
+    branches: [main]
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"   # e.g. v1.0.0, v2.3.1
 

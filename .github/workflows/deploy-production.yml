@@ -78,12 +78,17 @@ jobs:
             echo "── Previous version: $PREVIOUS_SHA ──"
 
             echo "── Pulling ref: ${{ steps.ref.outputs.ref }} ──"
-            git fetch --tags origin
-            # Use reset --hard directly (instead of checkout + reset) so any
-            # uncommitted local drift on the droplet — e.g. emergency hotfix
-            # scp'd before this commit hit git — is wiped cleanly. The target
-            # ref is the source of truth.
-            git reset --hard ${{ steps.ref.outputs.ref }}
+            # Fetch the SPECIFIC ref so FETCH_HEAD is the remote tip of exactly
+            # what we're deploying — correct for both a branch (main) and a tag
+            # (v1.2.0). Resetting to a bare name like `main` uses the droplet's
+            # LOCAL branch, which can be stale/divergent (2026-07-29: local main
+            # was pinned at a May commit, so `reset --hard main` silently checked
+            # out ancient code missing 12 migrations → boot failure + rollback).
+            git fetch --tags --force origin "${{ steps.ref.outputs.ref }}"
+            # reset --hard (not checkout) so any uncommitted droplet drift — e.g.
+            # an emergency hotfix scp'd before it hit git — is wiped clean.
+            # FETCH_HEAD is always the freshly-fetched remote ref above.
+            git reset --hard FETCH_HEAD
             # Remove untracked files / dirs too so the working tree exactly
             # matches the committed state.
             git clean -fd

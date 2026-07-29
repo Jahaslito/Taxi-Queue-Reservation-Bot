@@ -20,6 +20,16 @@ class Admin {
   static exists() {
     return db(TABLE).select('id').first();
   }
+
+  /**
+   * Overwrite an existing admin's password hash.
+   * Returns the number of rows updated (0 if the username doesn't exist).
+   */
+  static updatePassword(username, password_hash) {
+    return db(TABLE)
+      .where({ username })
+      .update({ password_hash, updated_at: db.fn.now() });
+  }
 }
 
 module.exports = Admin;

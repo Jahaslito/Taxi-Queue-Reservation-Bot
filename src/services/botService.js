@@ -2026,6 +2026,17 @@ async function fireClaimedSession(session) {
   const startTime = Date.now();
   const { page, vehicleNumber } = session;
 
+  // ── Fire-latency decomposition (observe-only diagnostics) ────────────────
+  // Splits the decision→landing "commit latency" into OUR side (decision →
+  // Add click dispatched: claim + browser event-loop serialization) vs SAN/
+  // observe (dispatched → slot stamped). dispatchedAtMs is stamped the instant
+  // the Add click returns; inFlightAtDispatch is the concurrent unconfirmed-fire
+  // depth (the serialization pressure this click contended with). Both ride out
+  // on the result for monitorService to log against _posFiredAtMs. Pure
+  // diagnostics — nothing here changes what/when we fire.
+  let dispatchedAtMs = null;
+  let inFlightAtDispatch = null;
+
   // Fast path: replay the add over HTTP (no Chromium contention). Returns null
   // when disabled/unconfigured or on any uncertainty → the click below runs.
   const httpResult = await fireViaHttp(session);
@@ -2063,10 +2074,18 @@ async function fireClaimedSession(session) {
     if (!fastClicked) {
       await page.click(`button:has-text("${SAN_TEXT.ADD_TO_QUEUE_BUTTON}")`, { timeout: 2000 });
     }
+    // Add click has returned → the SignalR frame is on its way out. Stamp our-
+    // side dispatch time here: decision→here is the claim + event-loop
+    // serialization cost, the portion a parallel fire path could remove.
+    dispatchedAtMs = Date.now();
     // Click dispatched — the add is committed whenever SAN processes it. Watch
     // V Holding for it from here: not-yet-visible age is the live backlog
     // signal, and first visibility is an early landing (see the watch above).
     beginFireVisibility(vehicleNumber);
+    // Concurrent unconfirmed fires right now (self included) = the serialization
+    // depth this click contended with. Correlating our-side latency against this
+    // is the go/no-go: latency that scales with depth is ours to cut.
+    inFlightAtDispatch = pendingFireVis.size;
 
     // Wait only a SHORT window for the WAIT screen (see FIRE_RELEASE_MS). On a
     // calm day it renders in ~1-2 s and we read the slot straight from the page
@@ -2107,6 +2126,8 @@ async function fireClaimedSession(session) {
         success:         true,
         alreadyQueued:   false,
         viaArmedSession: true,
+        dispatchedAtMs,
+        inFlightAtDispatch,
         ...info,
         durationMs:      Date.now() - startTime,
         message:         `Added to queue — Position: ${info.position}, Location: ${info.location}`,
@@ -2136,6 +2157,8 @@ async function fireClaimedSession(session) {
         alreadyQueued:        false,
         viaArmedSession:      true,
         recoveredFromTimeout: true,
+        dispatchedAtMs,
+        inFlightAtDispatch,
         ...landed,
         durationMs:           elapsedMs,
         message:              `Added to queue — Position: ${landed.position}, Location: ${landed.location}`,
@@ -2167,6 +2190,8 @@ async function fireClaimedSession(session) {
         // Same flag the cold addToQueue recovery uses (see its catch handler),
         // so downstream consumers treat both timeout-recoveries uniformly.
         recoveredFromTimeout: true,
+        dispatchedAtMs,
+        inFlightAtDispatch,
         ...landed,
         durationMs:      Date.now() - startTime,
         message:         `Added to queue — Position: ${landed.position}, Location: ${landed.location}`,

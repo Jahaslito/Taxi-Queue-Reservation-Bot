@@ -1582,9 +1582,23 @@ async function _runBot(driverId, state, triggerType = 'monitor_requeue', botOpts
     // same state can't reuse a stale fire time.
     if (state._posFiredAtMs) {
       const commitMs = Date.now() - state._posFiredAtMs;
+      // Decompose the latency into OUR side (decision → click dispatched: claim
+      // + browser event-loop serialization) vs SAN/observe (dispatched → slot
+      // stamped: network + SAN processing + V-Holding display tick). This is the
+      // go/no-go for the parallel-fire lever: if `our` dominates on storm ticks
+      // and scales with `inflight`, the latency is ours to cut; if `san` does,
+      // no client-side fire path can help. dispatchedAtMs is unset on the cold/
+      // HTTP paths, so guard it.
+      let split = '';
+      if (Number.isFinite(result.dispatchedAtMs)) {
+        const ourMs = result.dispatchedAtMs - state._posFiredAtMs;
+        const sanMs = Date.now() - result.dispatchedAtMs;
+        split = ` [our ${(ourMs / 1000).toFixed(1)}s + san/obs ${(sanMs / 1000).toFixed(1)}s`
+          + `, inflight ${result.inFlightAtDispatch ?? '?'}]`;
+      }
       state._posFiredAtMs = null;
       recordCommitLatency(commitMs);
-      console.log(`[Pos] ⏱ #${state.vehicleNumber} SAN commit latency ${(commitMs / 1000).toFixed(1)}s ` +
+      console.log(`[Pos] ⏱ #${state.vehicleNumber} SAN commit latency ${(commitMs / 1000).toFixed(1)}s${split} ` +
         `(median ${(commitLatencyEstimateMs() / 1000).toFixed(1)}s over ${commitLatencySamples.length} fires)`);
     }
     PositionTracking.updateActualPosition(trackingId, result.position)

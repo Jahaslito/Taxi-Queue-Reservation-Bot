@@ -879,6 +879,64 @@ describe('evaluatePositionScheduler — safety rails', () => {
     });
   });
 
+  // Predictive velocity×latency lead (MONITOR_PREDICTIVE_LEAD) — burst-window
+  // lead sized to measured drift (D = velocity × (floor + slope×inflight)),
+  // replacing the flat POS_MAX_LEAD clamp. Loaded with the flag ON via
+  // isolateModules; the default `monitor` (flag unset) must stay dormant.
+  describe('predictive velocity×latency lead', () => {
+    let evalPred;
+    let savedFlag;
+    beforeAll(() => {
+      savedFlag = process.env.MONITOR_PREDICTIVE_LEAD;
+      process.env.MONITOR_PREDICTIVE_LEAD = '1';
+      jest.isolateModules(() => {
+        evalPred = require('../../src/services/monitorService')._evaluatePositionScheduler;
+      });
+    });
+    afterAll(() => {
+      if (savedFlag === undefined) delete process.env.MONITOR_PREDICTIVE_LEAD;
+      else process.env.MONITOR_PREDICTIVE_LEAD = savedFlag;
+    });
+
+    // target 100; estimatedDrift/bias 0 so the flat path would give lead 0.
+    const predCtx = { ...baseCtx, estimatedDrift: 0, biasCorrection: 0, inBurstWindow: true };
+
+    test('lead = velocity × predicted latency → fires when queue ≥ target − D', () => {
+      // v=2.0, inflight=20 → predLat = 5 + 0.25·20 = 10s → D = 20 → fire at ≥80
+      const fire = evalPred(makeState(), { ...predCtx, observedVelocity: 2.0, currentInflight: 20, waitingCount: 80 });
+      const wait = evalPred(makeState(), { ...predCtx, observedVelocity: 2.0, currentInflight: 20, waitingCount: 79 });
+      expect(fire.action).toBe('fire');
+      expect(wait.action).toBe('wait');
+    });
+
+    test('lead capped at PRED_LEAD_CAP (40)', () => {
+      // v=2.5, inflight=60 → predLat=20s → raw D=50, capped to 40 → fire at ≥60 (not 50)
+      const at60 = evalPred(makeState(), { ...predCtx, observedVelocity: 2.5, currentInflight: 60, waitingCount: 60 });
+      const at59 = evalPred(makeState(), { ...predCtx, observedVelocity: 2.5, currentInflight: 60, waitingCount: 59 });
+      expect(at60.action).toBe('fire');
+      expect(at59.action).toBe('wait');
+    });
+
+    test('pre-storm velocity ≈ 0 → D ≈ 0 → does not fire early', () => {
+      // v=0 (queue not moving) → D=0 → projection 80 < target 100 → wait
+      const d = evalPred(makeState(), { ...predCtx, observedVelocity: 0, currentInflight: 20, waitingCount: 80 });
+      expect(d.action).toBe('wait');
+    });
+
+    test('only active inside the burst window', () => {
+      const d = evalPred(makeState(), { ...predCtx, inBurstWindow: false, observedVelocity: 2.0, currentInflight: 20, waitingCount: 80 });
+      expect(d.action).toBe('wait'); // flat clamp, lead 0
+    });
+
+    test('flag OFF ⇒ predictive path dormant even in burst window', () => {
+      const d = _evaluatePositionScheduler(
+        makeState(),
+        { ...baseCtx, estimatedDrift: 0, inBurstWindow: true, observedVelocity: 2.0, currentInflight: 20, waitingCount: 80 },
+      );
+      expect(d.action).toBe('wait');
+    });
+  });
+
   // Scheduler-level credential lockout — added 2026-05-29 after #631 fired
   // despite the warmer having confirmed bad credentials at 03:00.
   describe('credential lockout — skip_locked_out', () => {

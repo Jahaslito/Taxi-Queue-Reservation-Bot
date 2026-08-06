@@ -166,6 +166,22 @@ const POS_DRIFT_FLOOR  = parseInt(process.env.MONITOR_POS_DRIFT_FLOOR  ?? '5',  
 // burst poll. Raising this above 10 trades undershoot risk for burst
 // overshoot protection; don't, unless the ±10 contract itself changes.
 const POS_MAX_LEAD     = parseInt(process.env.MONITOR_POS_MAX_LEAD     ?? '10', 10);
+// ─── Predictive velocity×latency lead (MONITOR_PREDICTIVE_LEAD) ───────────────
+// Storm overshoot = queue drift during SAN's commit latency, which the flat
+// POS_MAX_LEAD=10 clamp cannot cover (landings averaged +33 above queue-at-fire
+// while lead was pinned at 10). Inside the burst window, size the lead to the
+// drift we can measure at click time: D = clamp(velocity × predictedLatency, 0,
+// cap). velocity = trailing-window slope of observed V Holding depth (capped so
+// a one-tick spike can't inflate it); predictedLatency = floor + slope × inflight
+// (inflight = our own clicked-but-uncommitted fires — botService.currentInflight).
+// 8-day replay (see OVERSHOOT-PREDICTIVE-LEAD.md): ±10 37.6%→75.9%, >+40
+// 13.2%→1.5%, median +16→+1. Default OFF — flip the flag to 0 for instant revert.
+const PREDICTIVE_LEAD    = (process.env.MONITOR_PREDICTIVE_LEAD ?? '0') === '1';
+const PRED_LAT_FLOOR_S   = parseFloat(process.env.MONITOR_PRED_LAT_FLOOR ?? '5');    // s, exogenous storm floor
+const PRED_LAT_SLOPE_S   = parseFloat(process.env.MONITOR_PRED_LAT_SLOPE ?? '0.25'); // s per inflight
+const PRED_LEAD_CAP      = parseInt(process.env.MONITOR_PRED_LEAD_CAP    ?? '40', 10);
+const PRED_VEL_CAP       = parseFloat(process.env.MONITOR_PRED_VEL_CAP   ?? '2.5');  // /s
+const PRED_VEL_WINDOW_S  = parseFloat(process.env.MONITOR_PRED_VEL_WINDOW ?? '8');   // s trailing slope window
 // Pre-armed fire sessions: park a logged-in page on SAN's "Add To Queue"
 // screen for every driver whose fire is near, so the fire itself is a ~1 s
 // click instead of a ~3.5 s Chromium launch (see botService "Pre-armed fire
@@ -183,14 +199,14 @@ const PREARM_AHEAD_SECS = parseInt(process.env.MONITOR_PREARM_AHEAD_SECS ?? '240
 // is still below the movement threshold (the 07-26 04:47 case). 20 min is a
 // generous lead — arming the fleet takes seconds — so no driver fires cold.
 const PREARM_LEAD_SECS  = parseInt(process.env.MONITOR_PREARM_LEAD_SECS ?? '1200', 10);
-// Wall-clock prearm floor (2026-07-28, user request): arm the whole fleet from
-// this PT time regardless of what the projections say — a deterministic "armed
-// by" guarantee on top of the dynamic triggers (which can still arm EARLIER on
-// movement, never later). 03:30 leaves ~30 min before the earliest onset ever
-// observed (04:00, and drifting ~7 min/wk earlier — move this up if the trend
-// continues). Bounded to the storm-watch window so the fleet doesn't sit armed
-// all day. Format 'HH:MM' PT; parse failures fall back to 03:30.
-const PREARM_CLOCK_MIN  = parsePrearmClockPT(process.env.MONITOR_PREARM_CLOCK_PT ?? '03:30');
+// Wall-clock prearm floor (2026-07-28, user request; moved 03:30→03:20 2026-08-06):
+// arm the whole fleet from this PT time regardless of what the projections say —
+// a deterministic "armed by" guarantee on top of the dynamic triggers (which can
+// still arm EARLIER on movement, never later). 03:20 leaves ~40 min before the
+// earliest onset ever observed (04:00, and drifting ~7 min/wk earlier — move this
+// up if the trend continues). Bounded to the storm-watch window so the fleet
+// doesn't sit armed all day. Format 'HH:MM' PT; parse failures fall back to 03:30.
+const PREARM_CLOCK_MIN  = parsePrearmClockPT(process.env.MONITOR_PREARM_CLOCK_PT ?? '03:20');
 // Position-proximity arming: bursts are POSITION-locked, not time-locked —
 // storm onset lands at queue 60–85 every morning (May–Jun logs: median 71)
 // while its clock time swings 42 minutes. secondsUntilFire is a rate-based
@@ -1061,6 +1077,31 @@ const BIAS_CAP_POSITIONS = parseInt(process.env.MONITOR_BIAS_CAP ?? '10', 10);
 // Circular buffer of recent {count, observedAt} snapshots for short-window rate.
 // Oldest entry first; capped at SHORT_WINDOW_POLLS + 1 entries.
 const recentObservations = [];
+
+// Time-bounded observation buffer for the predictive-lead velocity (independent
+// of poll cadence — recentObservations is capped by COUNT and won't reliably
+// span PRED_VEL_WINDOW_S once adaptive polling tightens). Holds ~2× the window.
+const velocityObservations = []; // [{ t: ms, q: count }], oldest first
+function recordVelocityObservation(count, atMs) {
+  velocityObservations.push({ t: atMs, q: count });
+  const cutoff = atMs - PRED_VEL_WINDOW_S * 2 * 1000;
+  while (velocityObservations.length > 2 && velocityObservations[0].t < cutoff) {
+    velocityObservations.shift();
+  }
+}
+// Trailing slope (positions/sec) over the last PRED_VEL_WINDOW_S, floored at 0
+// and capped at PRED_VEL_CAP so a single-tick surge can't inflate the lead.
+function observedVelocity(nowMs) {
+  if (velocityObservations.length < 2) return 0;
+  const newest = velocityObservations[velocityObservations.length - 1];
+  const target = nowMs - PRED_VEL_WINDOW_S * 1000;
+  // oldest sample at or before the window start (fall back to the oldest we have)
+  let base = velocityObservations[0];
+  for (const o of velocityObservations) { if (o.t <= target) base = o; else break; }
+  const dt = (newest.t - base.t) / 1000;
+  if (dt <= 0) return 0;
+  return Math.min(Math.max(0, (newest.q - base.q) / dt), PRED_VEL_CAP);
+}
 
 // ─── Adaptive polling (poll faster as drivers approach their fire window) ────
 // Current effective interval (ms). Recalculated at the end of every poll based
@@ -2112,6 +2153,8 @@ function evaluatePositionScheduler(state, ctx) {
     onsetSafeHorizon        = ONSET_SAFE_HORIZON,
     onsetMidHorizon         = ONSET_MID_HORIZON,
     onsetMidCap             = ONSET_MID_CAP,
+    observedVelocity        = 0,
+    currentInflight         = 0,
   } = ctx;
 
   // Inactive drivers have no business being scheduled. isActive is synced to the
@@ -2252,8 +2295,27 @@ function evaluatePositionScheduler(state, ctx) {
   const growthLeadCap    = growthLeadEnabled
     ? Math.max(2, Math.ceil(2 + effectiveGrowthRate * 3))
     : Infinity;
-  const lead             = Math.min(rawLead, maxLeadPositions, growthLeadCap);
-  const leadClamped      = lead !== rawLead;
+  let   lead             = Math.min(rawLead, maxLeadPositions, growthLeadCap);
+  let   leadClamped      = lead !== rawLead;
+
+  // Predictive velocity×latency lead (PREDICTIVE_LEAD) — BURST WINDOW ONLY.
+  // The flat clamp above pins the lead at ≤10, which cannot cover the drift the
+  // queue accrues during SAN's commit latency on a storm (landings ran +33 above
+  // queue-at-fire). Replace it with the drift we can measure at click time:
+  //   D = clamp(observedVelocity × (floor + slope×inflight), 0, PRED_LEAD_CAP)
+  // projectedLanding = effectiveQueue + D then becomes a genuine landing estimate,
+  // so the fire rail (≥ target) and the past-max rail (> max) both stay correct.
+  // Self-correcting: pre-storm velocity ≈ 0 ⇒ D ≈ 0 ⇒ fires at queue ≈ target, so
+  // low targets don't fire early; D only grows once the queue is actually moving.
+  // 8-day replay: ±10 37.6%→75.9%, >+40 13.2%→1.5% (see OVERSHOOT-PREDICTIVE-LEAD.md).
+  if (PREDICTIVE_LEAD && inBurstWindow) {
+    const predLatS = PRED_LAT_FLOOR_S + PRED_LAT_SLOPE_S * currentInflight;
+    lead        = Math.min(Math.round(observedVelocity * predLatS), PRED_LEAD_CAP);
+    leadClamped = false; // predictive path is not the flat clamp — see predLeadNote
+  }
+  const predLeadNote = (PREDICTIVE_LEAD && inBurstWindow)
+    ? ` [pred-lead ${lead} = v${observedVelocity.toFixed(2)}×${(PRED_LAT_FLOOR_S + PRED_LAT_SLOPE_S * currentInflight).toFixed(1)}s (inflight ${currentInflight})]`
+    : '';
 
   // Fleet-landing true-tail probe (FLEET_PROBE_ENABLED): if a FRESH genuine
   // landing shows the real tail is above SAN's (stale) displayed count, fire on
@@ -2276,9 +2338,9 @@ function evaluatePositionScheduler(state, ctx) {
 
   const displayedProjection = waitingCount + lead;   // SAN's stale view — drives the past-max rail
   const projectedLanding    = effectiveQueue + lead; // probe-aware — drives the fire decision
-  const leadNote            = leadClamped
+  const leadNote            = (leadClamped
     ? ` (lead clamped ${rawLead.toFixed(1)} → ${lead})`
-    : '';
+    : '') + predLeadNote;
 
   // If the projection says we'd land ABOVE maxAcceptable, the train has left
   // the station: every second we wait, the queue grows further past max. The
@@ -2548,6 +2610,8 @@ async function poll() {
   // Maintain rolling observation buffer (oldest first)
   recentObservations.push({ count: waitingCount, observedAt: lastObservationAt });
   if (recentObservations.length > SHORT_WINDOW_POLLS + 1) recentObservations.shift();
+  // Time-bounded buffer for the predictive-lead velocity (see observedVelocity).
+  recordVelocityObservation(waitingCount, lastObservationAt);
 
   // Hoisted so the snapshot recording below has access to the raw signals.
   let lastPollRate        = null;
@@ -3135,6 +3199,11 @@ async function poll() {
     inBurstWindow,
     onsetActive:             onsetState.active,
     onsetCap:                onsetCapNow(onsetState, onsetBoost),
+    // Predictive-lead inputs (see PREDICTIVE_LEAD). Fleet-wide per tick; the
+    // botService require is cached and guarded so decision-only tests (which
+    // pass their own ctx) never pull in Playwright.
+    observedVelocity:        observedVelocity(Date.now()),
+    currentInflight:         (() => { try { return require('./botService').currentInflight(); } catch { return 0; } })(),
   };
 
   // Track the soonest fire across all armed drivers — drives adaptive polling.

@@ -25,6 +25,7 @@ process.env.BOT_ARM_FIRE_TIMEOUT_MAX_MS    = '45000';
 process.env.BOT_ARM_VERIFY_ATTEMPTS        = '3';
 process.env.BOT_ARM_VERIFY_PAUSE_MS        = '5';
 process.env.BOT_FIRE_RELEASE_VERIFY_ATTEMPTS = '3'; // keep the fast-release confirm window small in tests
+process.env.BOT_FIRE_RELEASE_VERIFY_ATTEMPTS_MAX = '8'; // small cap so the clamp is exercised
 process.env.BOT_ARM_OPS_CONCURRENCY        = '4';
 process.env.BOT_SESSION_PERSIST_PATH       = '/tmp/armed-recovery-test-sessions.json';
 
@@ -132,7 +133,36 @@ describe('adaptive fire timeout', () => {
   });
 });
 
+describe('fast-release verify window adapts to commit latency', () => {
+  // Fresh far-future base so the other describe's samples are pruned (15 min window).
+  const base = Date.now() + 7200_000;
+
+  // This suite: BOT_FIRE_RELEASE_VERIFY_ATTEMPTS=3 (floor), cap=8; ARM_FIRE_TIMEOUT_MS=12000.
+  test('calm day → the configured floor (unchanged behaviour)', () => {
+    // no fresh samples → adaptive window at the 12 s floor → ratio 1 → base attempts (3)
+    expect(bot._fireReleaseVerifyAttempts(base)).toBe(3);
+  });
+
+  test('high-latency storm → attempts scale up with commit latency', () => {
+    // p95 = 12 s → adaptive window = 2×12 s = 24 s = 2× the 12 s floor → 2× base = 6
+    for (const ms of [12000, 12000, 12000, 12000, 12000]) bot._recordArmedFireDuration(ms, base + 1000);
+    expect(bot._fireReleaseVerifyAttempts(base + 1000)).toBe(6);
+    // production semantics: at the real 12-attempt floor this is a ~24-attempt / ~36 s
+    // window — enough to catch the 08-05 fires that committed at ~19 s (fixed ~18 s window false-failed).
+  });
+
+  test('clamped at the absolute max attempts', () => {
+    // 2×40 s clamps adaptive to the 45 s max → ratio 3.75 → 3×3.75≈11, clamped to the cap (8)
+    bot._recordArmedFireDuration(40000, base + 2000);
+    expect(bot._fireReleaseVerifyAttempts(base + 2000)).toBe(8);
+  });
+});
+
 describe('verify-on-timeout recovery', () => {
+  // Isolate from latency samples recorded by the adaptive-window suites above, so
+  // the fast-release confirm window sits at its floor (deterministic fetch count).
+  beforeEach(() => bot._resetArmedFireLatencies());
+
   test('timeout + vehicle present in V Holding → recovered genuine landing', async () => {
     mockWaiting = new Map([['9999', 57]]);
     mockFetch.mockClear();

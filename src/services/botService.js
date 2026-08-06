@@ -1447,6 +1447,23 @@ function adaptiveFireTimeoutMs(now = Date.now()) {
   return Math.min(ARM_FIRE_TIMEOUT_MAX_MS, Math.max(ARM_FIRE_TIMEOUT_MS, 2 * p95));
 }
 
+// Fast-release confirm window (attempts), adaptive to measured commit latency.
+// The fixed 12-attempt (~18s) window was SHORTER than the worst storm's commit
+// latency (08-05: 4 peak fires committed at 18–19s → false "not in V Holding" →
+// cold re-fire → "already in queue"). Scale the attempt count by how far the
+// measured latency (adaptiveFireTimeoutMs: 2×p95, floor 12s, cap 45s) sits above
+// the calm floor, floored at the calm default (so calm mornings are unchanged)
+// and capped absolutely (so it can't run away). Pause-independent by design —
+// each attempt is one lightweight V Holding GET (no held browser), cheap under load.
+const FIRE_RELEASE_VERIFY_ATTEMPTS_MAX = Math.max(FIRE_RELEASE_VERIFY_ATTEMPTS,
+  parseInt(process.env.BOT_FIRE_RELEASE_VERIFY_ATTEMPTS_MAX ?? '30', 10));
+function fireReleaseVerifyAttempts(now = Date.now()) {
+  const ratio  = adaptiveFireTimeoutMs(now) / ARM_FIRE_TIMEOUT_MS; // 1 (calm) … 3.75 (max)
+  const scaled = Math.round(FIRE_RELEASE_VERIFY_ATTEMPTS * ratio);
+  return Math.min(FIRE_RELEASE_VERIFY_ATTEMPTS_MAX,
+                  Math.max(FIRE_RELEASE_VERIFY_ATTEMPTS, scaled));
+}
+
 // ─── HTTP-fire latency cut (overshoot fix — see ±10 accuracy notes) ───────────
 // The armed *click* serialises on the shared Chromium: 8 simultaneous fires on
 // 2026-06-14 each took ~5 s (one timed out at 2 s) because the contexts contend
@@ -2143,8 +2160,10 @@ async function fireClaimedSession(session) {
     await disposeClaimedSession(session, 'fast-release: confirming via V Holding');
     // Persistent confirm (no held browser) — never concede to cold while the
     // committed add is merely slow to appear, so the table shows a real landing,
-    // not "already in queue" (see FIRE_RELEASE_VERIFY_ATTEMPTS).
-    const landed = await verifyAddLanded(vehicleNumber, FIRE_RELEASE_VERIFY_ATTEMPTS);
+    // not "already in queue". The window is adaptive to measured commit latency
+    // (see fireReleaseVerifyAttempts) so a high-latency storm can't false-fail a
+    // slow-but-committed add into a cold re-fire.
+    const landed = await verifyAddLanded(vehicleNumber, fireReleaseVerifyAttempts());
     const elapsedMs = Date.now() - startTime;
     recordArmedFireDuration(elapsedMs);
     if (landed) {
@@ -2288,7 +2307,9 @@ module.exports = {
   _extractGenericErrorFromText:   extractGenericErrorFromText,
   // Exposed for unit tests — adaptive fire timeout + roster-scaled pool.
   _adaptiveFireTimeoutMs:         adaptiveFireTimeoutMs,
+  _fireReleaseVerifyAttempts:     fireReleaseVerifyAttempts,
   _recordArmedFireDuration:       recordArmedFireDuration,
+  _resetArmedFireLatencies:       () => { armedFireLatencies.length = 0; },
   _desiredArmedSlots:             desiredArmedSlots,
   _verifyAddLanded:               verifyAddLanded,
   // Exposed for tailProbeService — same login/search/read flows the bot uses,
@@ -2301,6 +2322,9 @@ module.exports = {
   // Fire-visibility watch — backlog signal + early landings (see the section).
   setFireVisibilityListener,
   oldestUnseenFireAgeMs,
+  // Concurrent clicked-but-uncommitted fires (predictive-lead latency input —
+  // same count logged as inFlightAtDispatch). Fleet-wide, cheap, always safe.
+  currentInflight:                () => pendingFireVis.size,
   // Exposed for unit tests.
   _beginFireVisibility:           beginFireVisibility,
   _resolveFireVisibility:         resolveFireVisibility,

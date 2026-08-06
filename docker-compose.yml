@@ -212,12 +212,12 @@ services:
       # Wall-clock prearm floor (2026-07-28, deliberate safety margin): the whole
       # fleet is armed from this PT time no matter what the projections say — a
       # deterministic "armed by" guarantee layered OVER the dynamic triggers
-      # above, which can still arm earlier on movement (never later). 03:30 gives
-      # ~30 min before the earliest onset ever observed (04:00; onsets drifting
+      # above, which can still arm earlier on movement (never later). 03:20 gives
+      # ~40 min before the earliest onset ever observed (04:00; onsets drifting
       # ~7 min/wk earlier through July — move this up if the trend continues).
       # Window-bounded so the fleet is not held armed all day. 'HH:MM' PT;
       # malformed values fall back to 03:30.
-      MONITOR_PREARM_CLOCK_PT:   ${MONITOR_PREARM_CLOCK_PT:-03:30}
+      MONITOR_PREARM_CLOCK_PT:   ${MONITOR_PREARM_CLOCK_PT:-03:20}
       # Arm every waiting driver once the queue reaches this position — bursts
       # are position-locked, so proximity in POSITION, not projected fire time,
       # is what predicts the storm.

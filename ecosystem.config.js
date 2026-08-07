@@ -12,8 +12,11 @@ module.exports = {
       // container. Was 1400M for the 2 GB droplet — raised 2026-06-16 for 8 GB.
       // ⚠️ 2026-07-28 — 3584M → 4608M for the 12-browser armed pool (Lever 1).
       // Docker app cap raised in lockstep 4096M → 5120M to keep this 512M gap.
-      // Worst-case 12-browser RSS ≈ 4.1 GB sits just under this restart point.
-      max_memory_restart: '4608M',
+      // ⚠️ 2026-08-07 — 4608M → 11264M for the 16 GB droplet + 25-browser / 100-
+      // armed pool. Docker app cap raised in lockstep 5120M → 12288M to keep a
+      // ~1 GB graceful-restart gap. Worst-case 25-browser RSS ≈ 8.4 GB sits well
+      // under this restart point.
+      max_memory_restart: '11264M',
 
       // Logging
       out_file:   '/tmp/san-queue-out.log',

@@ -42,6 +42,55 @@ function getProxyConfig() {
   return { server: process.env.PROXY_SERVER, username, password: process.env.PROXY_PASSWORD || '' };
 }
 
+// ── Proxy scope: prearm + fire ONLY, morning-rush ONLY ───────────────────────
+// The proxy exists to dodge a possible per-IP throttle on SAN's ADD path during
+// the storm. It is therefore used ONLY for the two add-to-queue actions (arming a
+// parked page and firing) and ONLY inside the morning-rush window. Everything else
+// — requeue/remove, session warming, and all V Holding reads — always uses the
+// origin IP, so a flaky proxy can never break a read or a remove. On any proxy
+// failure the breaker (getProxyConfig → shouldUseProxy) also falls back to origin.
+// Window is PT wall-clock, env-tunable; defaults span the whole position morning.
+function clockPtToMin(str, fallbackMin) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(str).trim());
+  if (!m) return fallbackMin;
+  const h = +m[1], min = +m[2];
+  return (h > 23 || min > 59) ? fallbackMin : h * 60 + min;
+}
+const PROXY_WINDOW_FROM = clockPtToMin(process.env.PROXY_ACTIVE_FROM_PT ?? '03:00', 180);
+const PROXY_WINDOW_TO   = clockPtToMin(process.env.PROXY_ACTIVE_TO_PT   ?? '08:00', 480);
+function ptMinutesNow(now = new Date()) {
+  const s = now.toLocaleTimeString('en-US', { timeZone: 'America/Los_Angeles', hour12: false, hour: '2-digit', minute: '2-digit' });
+  const [h, m] = s.split(':').map(Number);
+  return h * 60 + m;
+}
+function withinProxyWindow(now = new Date()) {
+  const m = ptMinutesNow(now);
+  return m >= PROXY_WINDOW_FROM && m < PROXY_WINDOW_TO;
+}
+
+// ── Proxy A/B test (BOT_PROXY_AB) ────────────────────────────────────────────
+// Splits the proxy-eligible fires into a PROXY arm (rotating IP) and an ORIGIN
+// control arm within the SAME storm, so tomorrow's log answers "does SAN throttle
+// our origin IP?" un-confounded. BOT_PROXY_AB_ORIGIN_PCT = control-arm share.
+// Default OFF (arm = null → no split, no tag).
+const PROXY_AB            = process.env.BOT_PROXY_AB === '1';
+const PROXY_AB_ORIGIN_PCT = Math.max(0, Math.min(100, parseInt(process.env.BOT_PROXY_AB_ORIGIN_PCT ?? '30', 10)));
+function proxyAbArm(vehicleNumber) {
+  if (!PROXY_AB) return null; // A/B off → normal behaviour, no split, no tag
+  const bucket = crypto.createHash('md5').update(String(vehicleNumber)).digest()[0] % 100;
+  return bucket < PROXY_AB_ORIGIN_PCT ? 'origin' : 'proxy';
+}
+
+// The ONE proxy entry point for the arm + fire paths. Origin outside the rush
+// window; otherwise the A/B origin arm forces direct and the proxy arm (or A/B
+// off) defers to getProxyConfig (breaker-guarded). Returns { proxyConfig, abArm }.
+function fireProxyConfig(vehicleNumber, now = new Date()) {
+  if (!withinProxyWindow(now)) return { proxyConfig: null, abArm: null };
+  const abArm       = proxyAbArm(vehicleNumber);
+  const proxyConfig = abArm === 'origin' ? null : getProxyConfig();
+  return { proxyConfig, abArm };
+}
+
 const DEBUG_DIR = process.env.BOT_DEBUG_DIR ?? '/tmp/san-bot-debug';
 fs.mkdirSync(DEBUG_DIR, { recursive: true });
 
@@ -390,9 +439,10 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
       ]
     });
 
-    const proxyConfig  = getProxyConfig();
+    const { proxyConfig, abArm } = fireProxyConfig(vehicleNumber); // proxy only for a fire, in-window
     const savedSession = getStoredSession(sanUsername);
 
+    if (abArm) console.log(`[AB] #${vehicleNumber} arm=${abArm} proxied=${!!proxyConfig} (cold)`);
     if (proxyConfig) {
       console.log(`[Bot] ${vehicleNumber} → Using proxy session ${proxyConfig.username.split('-session-')[1] ?? '?'}`);
     }
@@ -874,10 +924,9 @@ async function removeFromQueue(sanUsername, sanPassword, vehicleNumber) {
       ],
     });
 
-    const proxyConfig  = getProxyConfig();
+    const proxyConfig  = null; // origin only — remove/requeue never uses the proxy (see fireProxyConfig)
     const savedSession = getStoredSession(sanUsername);
 
-    if (proxyConfig)  console.log(`[Bot] ${vehicleNumber} (remove) → proxy session active`);
     if (savedSession) console.log(`[Bot] ${vehicleNumber} (remove) → restoring saved session for ${sanUsername}`);
 
     const context = await browser.newContext({
@@ -1125,12 +1174,9 @@ async function warmSession({ sanUsername, sanPassword, vehicleNumber }) {
       ],
     });
 
-    const proxyConfig  = getProxyConfig();
+    const proxyConfig  = null; // origin only — session warming (pre-rush login) never uses the proxy
     const savedSession = getStoredSession(sanUsername);
 
-    if (proxyConfig) {
-      console.log(`[Warm] ${vehicleNumber} → proxy session ${proxyConfig.username.split('-session-')[1] ?? '?'}`);
-    }
     if (savedSession) {
       console.log(`[Warm] ${vehicleNumber} → trying restored session for ${sanUsername}`);
     }
@@ -1787,7 +1833,7 @@ async function armFireSession({ driverId, vehicleNumber, getCredentials }) {
     const slot         = pickArmedSlot();
     armingSlotInFlight.set(driverId, slot);
     const browser      = await ensureArmedBrowser(slot);
-    const proxyConfig  = getProxyConfig();
+    const { proxyConfig, abArm } = fireProxyConfig(vehicleNumber); // proxy only for arming, in-window
     const savedSession = getStoredSession(sanUsername);
 
     context = await browser.newContext({
@@ -1849,6 +1895,8 @@ async function armFireSession({ driverId, vehicleNumber, getCredentials }) {
       armedAt:        Date.now(),
       lastVerifiedAt: Date.now(),
       refreshing:     null,
+      abArm,                     // proxy A/B arm ('proxy'|'origin'|null) for the fire tag
+      proxied:        !!proxyConfig,
     });
     console.log(`[Arm] ✓ #${vehicleNumber} armed — fire is now a single click`);
   } catch (err) {
@@ -2103,6 +2151,11 @@ async function fireClaimedSession(session) {
     // depth this click contended with. Correlating our-side latency against this
     // is the go/no-go: latency that scales with depth is ours to cut.
     inFlightAtDispatch = pendingFireVis.size;
+    // Proxy A/B tag (BOT_PROXY_AB): join this to the fire's commit-latency line by
+    // vehicle to compare PROXY vs ORIGIN latency during a SAN stall (see proxyAbArm).
+    if (session.abArm) {
+      console.log(`[AB] #${vehicleNumber} arm=${session.abArm} proxied=${session.proxied} inflight=${inFlightAtDispatch}`);
+    }
 
     // Wait only a SHORT window for the WAIT screen (see FIRE_RELEASE_MS). On a
     // calm day it renders in ~1-2 s and we read the slot straight from the page
@@ -2308,6 +2361,9 @@ module.exports = {
   // Exposed for unit tests — adaptive fire timeout + roster-scaled pool.
   _adaptiveFireTimeoutMs:         adaptiveFireTimeoutMs,
   _fireReleaseVerifyAttempts:     fireReleaseVerifyAttempts,
+  _proxyAbArm:                    proxyAbArm,
+  _fireProxyConfig:               fireProxyConfig,
+  _withinProxyWindow:             withinProxyWindow,
   _recordArmedFireDuration:       recordArmedFireDuration,
   _resetArmedFireLatencies:       () => { armedFireLatencies.length = 0; },
   _desiredArmedSlots:             desiredArmedSlots,

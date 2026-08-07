@@ -163,6 +163,26 @@ services:
       PROXY_ENABLED:         ${PROXY_ENABLED:-true}
       PROXY_FAIL_THRESHOLD:  ${PROXY_FAIL_THRESHOLD:-3}
       PROXY_COOLDOWN_MS:     ${PROXY_COOLDOWN_MS:-300000}
+      # Proxy A/B test (2026-08-06). Tests whether SAN throttles OUR origin IP
+      # during a storm (a burst of ~50 adds from one IP) — the 08-06 disaster was
+      # an 83s SAN commit stall while other drivers' adds committed fine. When ON
+      # *and* the proxy is configured, fires are split deterministically by vehicle
+      # into a PROXY arm (rotating residential IP) and an ORIGIN control arm (proxy
+      # forced off), so ONE storm yields both — un-confounded. Each fire logs an
+      # [AB] tag; analyse with `node scripts/proxy-ab-report.js logs/<date>.log`.
+      # ORIGIN_PCT = control-arm share. DEFAULT OFF (no split, behaviour unchanged).
+      # Default ON (2026-08-07): run the proxy A/B next storm. Harmless if the
+      # proxy creds below are unset — every fire just tags [AB] and stays on origin.
+      BOT_PROXY_AB:            ${BOT_PROXY_AB:-1}
+      BOT_PROXY_AB_ORIGIN_PCT: ${BOT_PROXY_AB_ORIGIN_PCT:-30}
+      # Proxy is SCOPED — used ONLY for the two add-to-queue actions (arming a
+      # parked page + firing) and ONLY inside this PT wall-clock window (the
+      # morning rush). Requeue/remove, session warming, and every V Holding read
+      # always use the origin IP, so a flaky proxy can't break a read or a remove;
+      # the breaker also falls back to origin on proxy failure. Widen/narrow to the
+      # storm window; outside it no fire is proxied.
+      PROXY_ACTIVE_FROM_PT: ${PROXY_ACTIVE_FROM_PT:-03:00}
+      PROXY_ACTIVE_TO_PT:   ${PROXY_ACTIVE_TO_PT:-08:00}
 
       # Session warmer (sessionWarmerService)
       WARMER_ENABLED:        ${WARMER_ENABLED:-true}
@@ -178,6 +198,22 @@ services:
       # positions EARLY a position fire may happen (drift + bias). See
       # POS_MAX_LEAD in monitorService for the full derivation.
       MONITOR_POS_MAX_LEAD:  ${MONITOR_POS_MAX_LEAD:-10}
+      # ── Predictive velocity×latency lead (2026-08-06) ────────────────────────
+      # Inside the burst window ONLY, replaces the flat POS_MAX_LEAD clamp with a
+      # lead sized to the drift we can measure at click time:
+      #   D = clamp(observedVelocity × (floor + slope×inflight), 0, cap)
+      # 8-day replay: ±10 37.6%→~76%, >+40 13.2%→~1% (OVERSHOOT-PREDICTIVE-LEAD.md).
+      # ⚠️ Default ON (2026-08-07, user request). It is fleet-wide (no A/B control
+      # arm) — the flag itself is the kill switch: set to 0 to revert instantly, no
+      # deploy. Helps NORMAL storms; does NOTHING for a SAN-side commit stall like
+      # 08-06 (that was exogenous, not a lead problem). All four tuning constants
+      # are live-overridable; velocity is capped so a one-tick spike can't inflate D.
+      MONITOR_PREDICTIVE_LEAD: ${MONITOR_PREDICTIVE_LEAD:-1}
+      MONITOR_PRED_LAT_FLOOR:  ${MONITOR_PRED_LAT_FLOOR:-5}      # s, exogenous latency floor
+      MONITOR_PRED_LAT_SLOPE:  ${MONITOR_PRED_LAT_SLOPE:-0.25}   # s of latency per inflight fire
+      MONITOR_PRED_LEAD_CAP:   ${MONITOR_PRED_LEAD_CAP:-40}      # max lead = worst-case undershoot bound
+      MONITOR_PRED_VEL_CAP:    ${MONITOR_PRED_VEL_CAP:-2.5}      # /s, cap on the velocity used
+      MONITOR_PRED_VEL_WINDOW: ${MONITOR_PRED_VEL_WINDOW:-8}     # s, trailing velocity window
       # SAN commit-latency awareness (2026-07-28). The drift horizon measures the
       # BOT's run time (decision → click) but was blind to SAN's own commit
       # latency (click → slot stamped). On the 07-27 storm that gap stalled to
@@ -330,13 +366,23 @@ services:
       # re-add and write "already in queue" to the Position Accuracy table. Only
       # a genuinely benched "Not Authorized" driver falls through (reported as
       # Not-Authorized, never "already in queue").
-      BOT_FIRE_RELEASE_VERIFY_ATTEMPTS: ${BOT_FIRE_RELEASE_VERIFY_ATTEMPTS:-12}
+      # ⚠️ 2026-08-06 — the confirm window is now ADAPTIVE to measured commit
+      # latency (scales the attempt count by adaptiveFireTimeoutMs / floor), capped
+      # at *_MAX. The fixed ~18 s window was shorter than the 08-05/08-06 storm
+      # latency (18–89 s), so slow-but-committed adds false-failed → cold re-fire →
+      # "already in queue" and wasted browser launches mid-storm. Floor keeps calm
+      # mornings unchanged; MAX bounds the worst case (~45 s at 30 × 1.5 s polls).
+      BOT_FIRE_RELEASE_VERIFY_ATTEMPTS:     ${BOT_FIRE_RELEASE_VERIFY_ATTEMPTS:-12}
+      BOT_FIRE_RELEASE_VERIFY_ATTEMPTS_MAX: ${BOT_FIRE_RELEASE_VERIFY_ATTEMPTS_MAX:-30}
       # ⚠️ 2026-07-28 — 40→48 to match the widened pool's slot capacity (12
       # browsers × 4 sessions below); at 40 the cap bound BELOW capacity, and on
       # 07-27 it starved 9 of 78 drivers (targets 111–165, the crush band) to the
       # cold path → landings +74…+154 past target. Keep this equal to
       # BOT_ARMED_BROWSERS_MAX × BOT_ARMED_SESSIONS_PER_BROWSER when resizing.
-      BOT_ARMED_MAX:             ${BOT_ARMED_MAX:-48}
+      # ⚠️ 2026-08-07 — 48→100 on the 16 GB droplet: arm the whole storm roster
+      # (~77 today, headroom to 100) so no driver falls to the cold path. Equals
+      # BOT_ARMED_BROWSERS_MAX (25) × BOT_ARMED_SESSIONS_PER_BROWSER (4) below.
+      BOT_ARMED_MAX:             ${BOT_ARMED_MAX:-100}
       # Roster-scaled armed pool: BOT_ARMED_BROWSERS is the FLOOR; one extra
       # browser opens per BOT_ARMED_SESSIONS_PER_BROWSER armed sessions, up to
       # BOT_ARMED_BROWSERS_MAX (07-06: 12 same-tick claims on 3 browsers = 4
@@ -350,17 +396,27 @@ services:
       # armed path bypasses that jobQueue). On 07-27 the ARMED_MAX=40 roster on
       # 8 browsers = ~5 serialized clicks/browser feeding a ~34/s onset. Fewer
       # sessions per browser (6→4) forces the pool to open browsers earlier, and
-      # a higher MAX (8→12) lands ~3–4 clicks/browser. Sized for the 8 GB droplet:
-      # 12-browser worst-case RSS ≈ 4.1 GB, under the pm2 restart (4608M) with a
-      # 512M graceful-restart gap below the Docker app cap (5120M). This became
-      # affordable by capping co-located Postgres at 1 GB (see the db service; it
-      # idles at 107 MiB) instead of leaving it uncapped. Box budget: 5 GB app +
-      # 1 GB db + ~1 GB OS/nginx ≈ 7 GB of 7.75. Past 12 needs a bigger droplet —
-      # verify with `docker stats` at ~10 browsers during a live storm first.
+      # a higher MAX (8→12) lands ~3–4 clicks/browser.
+      #
+      # ⚠️ 2026-08-07 — 12→25 for the 16 GB droplet (arm 100 at 4 sessions/browser).
+      # Worst-case RSS ≈ 25×180 MB + 100×35 MB + base ≈ 8.4 GB, under the pm2
+      # restart (11264M) with a ~1 GB graceful gap below the Docker app cap
+      # (12288M). Postgres stays capped at 1 GB (see the db service; idles ~107
+      # MiB). Box budget: 12 GB app + 1 GB db + ~1 GB OS/nginx ≈ 14 GB of ~15.5.
+      # NOTE: 25 Chromiums only fire in PARALLEL if the droplet has the vCPUs to
+      # run them — same-tick armed clicks serialise per browser, so with too few
+      # cores the batching win moves to the CPU layer. Verify with `docker stats`
+      # at ~15 browsers during a live storm; if CPU-bound, trim MAX and raise
+      # BOT_ARMED_SESSIONS_PER_BROWSER to keep ARMED_MAX at 100.
       BOT_ARMED_BROWSERS:             ${BOT_ARMED_BROWSERS:-4}
-      BOT_ARMED_BROWSERS_MAX:         ${BOT_ARMED_BROWSERS_MAX:-12}
+      BOT_ARMED_BROWSERS_MAX:         ${BOT_ARMED_BROWSERS_MAX:-25}
       BOT_ARMED_SESSIONS_PER_BROWSER: ${BOT_ARMED_SESSIONS_PER_BROWSER:-4}
-      BOT_ARM_OPS_CONCURRENCY:   ${BOT_ARM_OPS_CONCURRENCY:-4}
+      # ⚠️ 2026-08-07 — 4→8 with the 100-armed pool (16 GB / 8 vCPU). Arm AND
+      # refresh share this semaphore; a full keep-alive sweep = ARMED_MAX ÷ this ×
+      # ~4 s must stay under BOT_ARM_REFRESH_MS (90 s) or sessions go stale. At 100
+      # armed, 4-wide = ~100 s (behind); 8-wide = ~50 s. Arms are SAN-I/O-bound, so
+      # 8-wide is fine on 8 vCPU. Keep this ≈ ARMED_MAX ÷ 12 when resizing the pool.
+      BOT_ARM_OPS_CONCURRENCY:   ${BOT_ARM_OPS_CONCURRENCY:-8}
       # Adaptive fire-confirmation timeout: floor .. max, driven by 2 × rolling
       # p95 of armed-fire durations. A timeout is verified against V Holding
       # before falling back cold — the Blazor add commits when SAN processes
@@ -469,7 +525,8 @@ services:
       - ./data:/app/data   # runtime state (bot latency samples, etc.) persists across restarts
 
     # Shared memory for Chromium (prevents crashes on small droplets)
-    shm_size: '256mb'
+    # 2026-08-07 — 256mb → 512mb for the 25-browser pool on the 16 GB droplet.
+    shm_size: '512mb'
 
     networks:
       - internal
@@ -483,15 +540,15 @@ services:
     # was 2 GB — raised 2026-06-16.
     #
     # ⚠️ 2026-07-28 — raised 4096M → 5120M for the 12-browser armed pool (Lever 1,
-    # see BOT_ARMED_BROWSERS_MAX). Worst-case app RSS ≈ 4.1 GB; pm2 restarts at
-    # 4608M (512M gap under this cap). Affordable because Postgres is now capped
-    # at 1 GB (see the db service): box budget 5 GB app + 1 GB db + ~1 GB
-    # OS/nginx ≈ 7 GB of 7.75. Do NOT raise further without shrinking that
-    # headroom check — going past 12 browsers needs a bigger droplet.
+    # see BOT_ARMED_BROWSERS_MAX).
+    # ⚠️ 2026-08-07 — raised 5120M → 12288M for the 16 GB droplet + 25-browser /
+    # 100-armed pool. Worst-case app RSS ≈ 8.4 GB; pm2 restarts at 11264M (~1 GB
+    # gap under this cap). Postgres stays capped at 1 GB (see the db service):
+    # box budget 12 GB app + 1 GB db + ~1 GB OS/nginx ≈ 14 GB of ~15.5.
     deploy:
       resources:
         limits:
-          memory: 5120M
+          memory: 12288M
         reservations:
           memory: 1024M
 

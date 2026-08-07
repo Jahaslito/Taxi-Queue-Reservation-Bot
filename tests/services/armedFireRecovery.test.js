@@ -158,6 +158,50 @@ describe('fast-release verify window adapts to commit latency', () => {
   });
 });
 
+describe('proxy A/B arm (BOT_PROXY_AB)', () => {
+  const load = (env) => {
+    let mod;
+    const saved = {};
+    for (const k of Object.keys(env)) { saved[k] = process.env[k]; process.env[k] = env[k]; }
+    jest.isolateModules(() => { mod = require('../../src/services/botService'); });
+    for (const k of Object.keys(env)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+    return mod;
+  };
+
+  test('A/B off → null (no split, unchanged behaviour)', () => {
+    expect(load({ BOT_PROXY_AB: '0' })._proxyAbArm('0582')).toBeNull();
+  });
+
+  test('A/B on → deterministic per-vehicle arm', () => {
+    const m = load({ BOT_PROXY_AB: '1', BOT_PROXY_AB_ORIGIN_PCT: '30' });
+    const a = m._proxyAbArm('0582');
+    expect(['proxy', 'origin']).toContain(a);
+    expect(m._proxyAbArm('0582')).toBe(a); // stable
+  });
+
+  test('origin share roughly matches BOT_PROXY_AB_ORIGIN_PCT', () => {
+    const m = load({ BOT_PROXY_AB: '1', BOT_PROXY_AB_ORIGIN_PCT: '30' });
+    let origin = 0; const N = 500;
+    for (let v = 0; v < N; v++) if (m._proxyAbArm(String(1000 + v)) === 'origin') origin++;
+    const pct = 100 * origin / N;
+    expect(pct).toBeGreaterThan(20);
+    expect(pct).toBeLessThan(40);
+  });
+
+  test('fireProxyConfig: proxy is scoped to the morning-rush window', () => {
+    const m = load({ BOT_PROXY_AB: '1', PROXY_ACTIVE_FROM_PT: '03:00', PROXY_ACTIVE_TO_PT: '08:00' });
+    const inRush = new Date('2026-08-07T04:30:00-07:00');
+    const midday = new Date('2026-08-07T12:00:00-07:00');
+    expect(m._withinProxyWindow(inRush)).toBe(true);
+    expect(m._withinProxyWindow(midday)).toBe(false);
+    // outside the window: no proxy, no A/B tag, regardless of vehicle
+    expect(m._fireProxyConfig('4016', midday)).toEqual({ proxyConfig: null, abArm: null });
+    // inside the window: A/B arm is assigned (proxyConfig is null here only because
+    // PROXY_SERVER is unset in tests — the gate we assert is the arm/window scope)
+    expect(['proxy', 'origin']).toContain(m._fireProxyConfig('4016', inRush).abArm);
+  });
+});
+
 describe('verify-on-timeout recovery', () => {
   // Isolate from latency samples recorded by the adaptive-window suites above, so
   // the fast-release confirm window sits at its floor (deterministic fetch count).

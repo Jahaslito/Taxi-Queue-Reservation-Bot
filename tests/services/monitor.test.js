@@ -883,42 +883,56 @@ describe('evaluatePositionScheduler — safety rails', () => {
   // lead sized to measured drift (D = velocity × (floor + slope×inflight)),
   // replacing the flat POS_MAX_LEAD clamp. Loaded with the flag ON via
   // isolateModules; the default `monitor` (flag unset) must stay dormant.
-  describe('predictive velocity×latency lead', () => {
-    let evalPred;
-    let savedFlag;
+  describe('predictive velocity×latency lead (recalibrated + hard −30 floor)', () => {
+    let evalPred, setLanding;
+    let savedFlag, savedProbe;
     beforeAll(() => {
-      savedFlag = process.env.MONITOR_PREDICTIVE_LEAD;
+      savedFlag  = process.env.MONITOR_PREDICTIVE_LEAD;
+      savedProbe = process.env.MONITOR_FLEET_PROBE;
       process.env.MONITOR_PREDICTIVE_LEAD = '1';
+      process.env.MONITOR_FLEET_PROBE     = '1'; // needed for the hard-floor-vs-probe cases
       jest.isolateModules(() => {
-        evalPred = require('../../src/services/monitorService')._evaluatePositionScheduler;
+        const m = require('../../src/services/monitorService');
+        evalPred   = m._evaluatePositionScheduler;
+        setLanding = m._setFleetLanding;
       });
     });
     afterAll(() => {
-      if (savedFlag === undefined) delete process.env.MONITOR_PREDICTIVE_LEAD;
-      else process.env.MONITOR_PREDICTIVE_LEAD = savedFlag;
+      if (savedFlag  === undefined) delete process.env.MONITOR_PREDICTIVE_LEAD; else process.env.MONITOR_PREDICTIVE_LEAD = savedFlag;
+      if (savedProbe === undefined) delete process.env.MONITOR_FLEET_PROBE;     else process.env.MONITOR_FLEET_PROBE     = savedProbe;
     });
+    beforeEach(() => setLanding(0, 0)); // no fresh landing unless a case sets one
 
     // target 100; estimatedDrift/bias 0 so the flat path would give lead 0.
     const predCtx = { ...baseCtx, estimatedDrift: 0, biasCorrection: 0, inBurstWindow: true };
 
-    test('lead = velocity × predicted latency → fires when queue ≥ target − D', () => {
-      // v=2.0, inflight=20 → predLat = 5 + 0.25·20 = 10s → D = 20 → fire at ≥80
-      const fire = evalPred(makeState(), { ...predCtx, observedVelocity: 2.0, currentInflight: 20, waitingCount: 80 });
-      const wait = evalPred(makeState(), { ...predCtx, observedVelocity: 2.0, currentInflight: 20, waitingCount: 79 });
+    test('lead = velocity × predicted latency (slope 0.7) → fires when queue ≥ target − D', () => {
+      // v=1.0, inflight=20 → predLat = 5 + 0.7·20 = 19s → D = 19 → fire at ≥81 (floor 70 not binding)
+      const fire = evalPred(makeState(), { ...predCtx, observedVelocity: 1.0, currentInflight: 20, waitingCount: 81 });
+      const wait = evalPred(makeState(), { ...predCtx, observedVelocity: 1.0, currentInflight: 20, waitingCount: 80 });
       expect(fire.action).toBe('fire');
       expect(wait.action).toBe('wait');
     });
 
-    test('lead capped at PRED_LEAD_CAP (40)', () => {
-      // v=2.5, inflight=60 → predLat=20s → raw D=50, capped to 40 → fire at ≥60 (not 50)
-      const at60 = evalPred(makeState(), { ...predCtx, observedVelocity: 2.5, currentInflight: 60, waitingCount: 60 });
-      const at59 = evalPred(makeState(), { ...predCtx, observedVelocity: 2.5, currentInflight: 60, waitingCount: 59 });
-      expect(at60.action).toBe('fire');
-      expect(at59.action).toBe('wait');
+    test('lead capped at PRED_LEAD_CAP (30)', () => {
+      // v=2.5, inflight=60 → predLat=47s → raw D=117, capped to 30 → fire at ≥70 (not 53)
+      const at70 = evalPred(makeState(), { ...predCtx, observedVelocity: 2.5, currentInflight: 60, waitingCount: 70 });
+      const at69 = evalPred(makeState(), { ...predCtx, observedVelocity: 2.5, currentInflight: 60, waitingCount: 69 });
+      expect(at70.action).toBe('fire');
+      expect(at69.action).toBe('wait');
+    });
+
+    test('aggressive lead gated to target ≥ MIN_TARGET — a target 60 driver stays on the flat path', () => {
+      // target 60 (<70): predictive dormant ⇒ flat lead 0 ⇒ 40 < 60 ⇒ wait, even though the
+      // recalibrated lead (D capped 30) would otherwise have fired it early at 40.
+      const d = evalPred(
+        makeState({ scheduledPosition: 60, maxAcceptablePosition: 100 }),
+        { ...predCtx, observedVelocity: 2.5, currentInflight: 60, waitingCount: 40 },
+      );
+      expect(d.action).toBe('wait');
     });
 
     test('pre-storm velocity ≈ 0 → D ≈ 0 → does not fire early', () => {
-      // v=0 (queue not moving) → D=0 → projection 80 < target 100 → wait
       const d = evalPred(makeState(), { ...predCtx, observedVelocity: 0, currentInflight: 20, waitingCount: 80 });
       expect(d.action).toBe('wait');
     });
@@ -934,6 +948,38 @@ describe('evaluatePositionScheduler — safety rails', () => {
         { ...baseCtx, estimatedDrift: 0, inBurstWindow: true, observedVelocity: 2.0, currentInflight: 20, waitingCount: 80 },
       );
       expect(d.action).toBe('wait');
+    });
+
+    // ─── HARD UNDERSHOOT FLOOR: the −30 guarantee ────────────────────────────
+    describe('hard undershoot floor (−30 guarantee)', () => {
+      // Max lead (30) + a fresh probe landing that puts the TRUE tail near target
+      // while the DISPLAYED queue is still far below target−30. Without the floor
+      // the probe-boosted projection (effectiveQueue+lead ≥ target) would fire, and
+      // if the storm stalled the driver would land ~target−49 ⇒ deep undershoot.
+      const hot = { ...predCtx, observedVelocity: 2.5, currentInflight: 60 }; // lead capped at 30
+
+      test('probe would fire early, but displayed < target−30 ⇒ HELD, not fired', () => {
+        setLanding(95, Date.now()); // true tail ~95 (effectiveQueue → 90); display far below
+        const d = evalPred(makeState(), { ...hot, waitingCount: 50 }); // 50 < 100−30
+        expect(d.action).toBe('wait');
+        expect(d.logLine).toMatch(/hard-floor/);
+      });
+
+      test('fires once the displayed queue reaches the floor (target−30)', () => {
+        setLanding(95, Date.now());
+        const d = evalPred(makeState(), { ...hot, waitingCount: 70 }); // 70 == 100−30
+        expect(d.action).toBe('fire');
+      });
+
+      test('no fire anywhere below target−30, even with the probe boosting hard', () => {
+        // Any FIRE must have waitingCount ≥ target−30, so SAN appending at the tail
+        // lands ≥ target−29 — the guarantee holds across the whole displayed range.
+        setLanding(95, Date.now());
+        for (let wc = 40; wc <= 99; wc++) {
+          const d = evalPred(makeState(), { ...hot, waitingCount: wc });
+          if (d.action === 'fire') expect(wc).toBeGreaterThanOrEqual(70); // target(100) − 30
+        }
+      });
     });
   });
 

@@ -178,10 +178,26 @@ const POS_MAX_LEAD     = parseInt(process.env.MONITOR_POS_MAX_LEAD     ?? '10', 
 // 13.2%→1.5%, median +16→+1. Default OFF — flip the flag to 0 for instant revert.
 const PREDICTIVE_LEAD    = (process.env.MONITOR_PREDICTIVE_LEAD ?? '0') === '1';
 const PRED_LAT_FLOOR_S   = parseFloat(process.env.MONITOR_PRED_LAT_FLOOR ?? '5');    // s, exogenous storm floor
-const PRED_LAT_SLOPE_S   = parseFloat(process.env.MONITOR_PRED_LAT_SLOPE ?? '0.25'); // s per inflight
-const PRED_LEAD_CAP      = parseInt(process.env.MONITOR_PRED_LEAD_CAP    ?? '40', 10);
+// 2026-08-07 recalibration: on the first 25-browser/100-armed storm the 0.25
+// slope under-predicted the self-inflicted commit latency (native inflight ran
+// to 58, latency to 20s), so the lead covered <½ the drift. 7-storm replay
+// (08-01..07) puts the drift↔inflight slope near 0.7 for target≥70.
+const PRED_LAT_SLOPE_S   = parseFloat(process.env.MONITOR_PRED_LAT_SLOPE ?? '0.7');  // s per inflight
+const PRED_LEAD_CAP      = parseInt(process.env.MONITOR_PRED_LEAD_CAP    ?? '30', 10);
 const PRED_VEL_CAP       = parseFloat(process.env.MONITOR_PRED_VEL_CAP   ?? '2.5');  // /s
 const PRED_VEL_WINDOW_S  = parseFloat(process.env.MONITOR_PRED_VEL_WINDOW ?? '8');   // s trailing slope window
+// Only the deep targets suffer the storm-commit overshoot; low targets fire early
+// at low inflight and already land ~±10, so the aggressive lead is gated to
+// target ≥ this. Below it, the flat/bias lead path is unchanged.
+const PRED_LEAD_MIN_TARGET = parseInt(process.env.MONITOR_PRED_LEAD_MIN_TARGET ?? '70', 10);
+// HARD UNDERSHOOT FLOOR (positions). For gated targets we NEVER fire when the
+// DISPLAYED queue is more than this far below target. waitingCount ≤ true tail
+// (SAN's display only lags) and SAN appends at the tail, so worst-case landing
+// is ≥ waitingCount+1 ≥ target − FLOOR + 1 ⇒ undershoot can never be worse than
+// −(FLOOR−1). This bound holds independently of the predictive lead, the fleet
+// probe over-reading, or the storm stalling on the click — it is the guarantee,
+// not a tuned value. Set to 30 ⇒ worst-case undershoot −29.
+const PRED_LEAD_HARD_FLOOR = parseInt(process.env.MONITOR_PRED_LEAD_HARD_FLOOR ?? '30', 10);
 // Pre-armed fire sessions: park a logged-in page on SAN's "Add To Queue"
 // screen for every driver whose fire is near, so the fire itself is a ~1 s
 // click instead of a ~3.5 s Chromium launch (see botService "Pre-armed fire
@@ -2308,12 +2324,14 @@ function evaluatePositionScheduler(state, ctx) {
   // Self-correcting: pre-storm velocity ≈ 0 ⇒ D ≈ 0 ⇒ fires at queue ≈ target, so
   // low targets don't fire early; D only grows once the queue is actually moving.
   // 8-day replay: ±10 37.6%→75.9%, >+40 13.2%→1.5% (see OVERSHOOT-PREDICTIVE-LEAD.md).
-  if (PREDICTIVE_LEAD && inBurstWindow) {
+  const predLeadActive = PREDICTIVE_LEAD && inBurstWindow
+    && effectivePosition >= PRED_LEAD_MIN_TARGET;
+  if (predLeadActive) {
     const predLatS = PRED_LAT_FLOOR_S + PRED_LAT_SLOPE_S * currentInflight;
     lead        = Math.min(Math.round(observedVelocity * predLatS), PRED_LEAD_CAP);
     leadClamped = false; // predictive path is not the flat clamp — see predLeadNote
   }
-  const predLeadNote = (PREDICTIVE_LEAD && inBurstWindow)
+  const predLeadNote = predLeadActive
     ? ` [pred-lead ${lead} = v${observedVelocity.toFixed(2)}×${(PRED_LAT_FLOOR_S + PRED_LAT_SLOPE_S * currentInflight).toFixed(1)}s (inflight ${currentInflight})]`
     : '';
 
@@ -2387,8 +2405,26 @@ function evaluatePositionScheduler(state, ctx) {
   const onsetEligible = (ONSET_FIRE_LIVE || ONSET_FIRE_SHADOW)
     && onsetActive && onsetGap > 0 && onsetGap <= onsetAllow;
 
+  // ─── HARD UNDERSHOOT FLOOR (gated targets — the −30 guarantee) ────────────
+  // Never let ANY fire path (predictive lead OR onset OR fleet-probe) place a
+  // gated driver while the DISPLAYED queue is still more than the floor below
+  // target. waitingCount is a lower bound on the true tail (SAN's display only
+  // lags) and SAN appends at the tail, so the worst-case landing is ≥
+  // waitingCount + 1 ≥ target − FLOOR + 1 ⇒ undershoot can never be worse than
+  // −(FLOOR−1), independent of prediction error, a probe over-read, or the storm
+  // stalling on the click. It only ever HOLDS a fire (never fires earlier), so it
+  // cannot cause a miss — a growing storm lifts the displayed queue past the
+  // floor within seconds and the driver fires then.
+  const hardFloorHold = PREDICTIVE_LEAD
+    && effectivePosition >= PRED_LEAD_MIN_TARGET
+    && waitingCount < effectivePosition - PRED_LEAD_HARD_FLOOR;
+  const hardFloorNote = hardFloorHold
+    ? ` [hard-floor: hold until displayed ≥ ${effectivePosition - PRED_LEAD_HARD_FLOOR} (−30 guarantee)]`
+    : '';
+
   const projectionReached = projectedLanding >= effectivePosition;
-  const shouldFire        = projectionReached || (ONSET_FIRE_LIVE && onsetEligible);
+  const shouldFire        = !hardFloorHold
+    && (projectionReached || (ONSET_FIRE_LIVE && onsetEligible));
 
   // secondsUntilFire drives adaptive polling — how soon do we expect to fire?
   // Negative projection (already past target) → 0; no growth → Infinity.
@@ -2436,7 +2472,7 @@ function evaluatePositionScheduler(state, ctx) {
     logLine: `[Pos] ${veh} — waiting (queue: ${effectiveQueue}${probeNote}, drift: ${estimatedDrift}, ` +
              `bias: ${biasCorrection.toFixed(1)}, projected: ${projectedLanding.toFixed(1)}${leadNote}, ` +
              `target: ${effectivePosition}, max: ${maxAcceptable}, ` +
-             `secsToFire: ${Number.isFinite(secondsUntilFire) ? secondsUntilFire.toFixed(0) : '∞'})${shadowNote}`,
+             `secsToFire: ${Number.isFinite(secondsUntilFire) ? secondsUntilFire.toFixed(0) : '∞'})${hardFloorNote}${shadowNote}`,
     metrics: {
       ...baseMetrics,
       queueSize:        waitingCount,

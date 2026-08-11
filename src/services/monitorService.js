@@ -183,21 +183,72 @@ const PRED_LAT_FLOOR_S   = parseFloat(process.env.MONITOR_PRED_LAT_FLOOR ?? '5')
 // to 58, latency to 20s), so the lead covered <½ the drift. 7-storm replay
 // (08-01..07) puts the drift↔inflight slope near 0.7 for target≥70.
 const PRED_LAT_SLOPE_S   = parseFloat(process.env.MONITOR_PRED_LAT_SLOPE ?? '0.7');  // s per inflight
-const PRED_LEAD_CAP      = parseInt(process.env.MONITOR_PRED_LEAD_CAP    ?? '30', 10);
+// 2026-08-11 recalibration — INFLIGHT-SCALED band lead. A fresh 10-day live
+// analysis (logs 08-01..08-10, 563 fire+landing pairs in 70-199) found the flat
+// `lead = PRED_LEAD_CAP` branch below leaves TWO problems on the table:
+//   1. The lead is undersized. Drift (landed − queueAtFire) is p50 +44, p90 +74,
+//      max +186 — far past a flat 30. Landings sat median +31 above target.
+//   2. The flat lead can't distinguish the fires that actually drift from the
+//      ones that don't. The only signal available AT CLICK TIME that tracks
+//      drift is `currentInflight` (corr 0.59; velocity is a trailing slope and
+//      is useless here — corr −0.08). OLS over the band: drift ≈ 19 + 0.86·inflight
+//      (monotonic by bucket: drift p50 5/28/39/47/71 as inflight rises through
+//      0-5/6-15/16-30/31-45/46+). So SIZE the moving-queue lead to inflight:
+//        D = clamp(INTERCEPT + SLOPE·inflight, FLOOR, CAP)
+//      Sim (transform error = drift − D, all 10 days): >+40 12%→1%, median +13→+3,
+//      p90 42→28, and the undershoot guarantee HOLDS structurally per-day (worst
+//      −23) because the deep leads (D→45) only ever apply to high-inflight fires,
+//      whose min drift is 22-27 — they never stall. Low-inflight fires get D≈20-30,
+//      so their floor stays shallow. See OVERSHOOT-PREDICTIVE-LEAD.md §2026-08-11.
+const PRED_DRIFT_INTERCEPT = parseFloat(process.env.MONITOR_PRED_DRIFT_INTERCEPT ?? '19');   // positions
+const PRED_DRIFT_SLOPE     = parseFloat(process.env.MONITOR_PRED_DRIFT_SLOPE     ?? '0.86');  // positions per inflight
+const PRED_LEAD_FLOOR      = parseInt(process.env.MONITOR_PRED_LEAD_FLOOR   ?? '20', 10);     // min moving-queue lead
+const PRED_LEAD_CAP      = parseInt(process.env.MONITOR_PRED_LEAD_CAP    ?? '45', 10);
 const PRED_VEL_CAP       = parseFloat(process.env.MONITOR_PRED_VEL_CAP   ?? '2.5');  // /s
 const PRED_VEL_WINDOW_S  = parseFloat(process.env.MONITOR_PRED_VEL_WINDOW ?? '8');   // s trailing slope window
 // Only the deep targets suffer the storm-commit overshoot; low targets fire early
 // at low inflight and already land ~±10, so the aggressive lead is gated to
 // target ≥ this. Below it, the flat/bias lead path is unchanged.
 const PRED_LEAD_MIN_TARGET = parseInt(process.env.MONITOR_PRED_LEAD_MIN_TARGET ?? '70', 10);
+// …and gated to target ≤ this. The overshoot is NOT a "deep target" problem, it
+// is an AVALANCHE-BAND problem: SAN sweeps positions ~60→200 in about 25 s
+// (dwell 0.17–0.22 s per position), while positions below ~55 and above ~200
+// crawl (0.5 s and 5.1 s per position). Measured over 08-01..09: err p50 is +21
+// / +36 / +43 / +39 / +41 across bands 70-84 / 85-99 / 100-119 / 120-149 /
+// 150-199, but only +6 at 200-299 and −1 above 300. Those slow bands already
+// land inside ±10 (55% and 100%); giving them the aggressive lead would push
+// them to a −24 median. Before this bound existed the gate was open-ended, so
+// any lead increase silently taxed the one band that was already correct.
+const PRED_LEAD_MAX_TARGET = parseInt(process.env.MONITOR_PRED_LEAD_MAX_TARGET ?? '199', 10);
+// Minimum observed velocity (positions/s) before we spend the FULL undershoot
+// budget. The queue must actually be moving: on a dead-calm morning the storm
+// may never arrive, and firing target−30 into a stalled queue lands at −29 for
+// no reason. Any real onset is ≫ this (sustained 4–9/s, 1 s peaks to 42/s).
+const PRED_LEAD_MOVE_RATE  = parseFloat(process.env.MONITOR_PRED_LEAD_MOVE_RATE ?? '0.5');
 // HARD UNDERSHOOT FLOOR (positions). For gated targets we NEVER fire when the
 // DISPLAYED queue is more than this far below target. waitingCount ≤ true tail
 // (SAN's display only lags) and SAN appends at the tail, so worst-case landing
 // is ≥ waitingCount+1 ≥ target − FLOOR + 1 ⇒ undershoot can never be worse than
 // −(FLOOR−1). This bound holds independently of the predictive lead, the fleet
 // probe over-reading, or the storm stalling on the click — it is the guarantee,
-// not a tuned value. Set to 30 ⇒ worst-case undershoot −29.
-const PRED_LEAD_HARD_FLOOR = parseInt(process.env.MONITOR_PRED_LEAD_HARD_FLOOR ?? '30', 10);
+// not a tuned value.
+// 2026-08-11: raised 30 → 45 to match PRED_LEAD_CAP, so the inflight-scaled lead
+// can actually fire at target−45 during a confirmed avalanche (the hard floor
+// only ever HOLDS a fire; at 30 it silently re-capped any lead >30 back to 30).
+// The STATED worst-case undershoot loosens to −44; the REALIZED worst over 10
+// days is −23, because a lead reaches 45 only at high inflight, which only
+// happens mid-storm where the queue never stalls. This is a product decision
+// (approved 2026-08-11): −44 guarantee in exchange for >+40 tail 36%→~1%.
+// IMPORTANT: this −45 floor applies ONLY inside the avalanche band
+// [MIN_TARGET, MAX_TARGET] (70-199) — the only band that gets the aggressive
+// inflight-scaled lead. Targets ≥200 crawl (≈5 s/position), already land ±10,
+// and would only be exposed to a deep undershoot by the probe/onset paths, so
+// they keep the original −30 guarantee via PRED_LEAD_OUTER_FLOOR below.
+const PRED_LEAD_HARD_FLOOR = parseInt(process.env.MONITOR_PRED_LEAD_HARD_FLOOR ?? '45', 10);
+// Undershoot floor for gated targets OUTSIDE the avalanche band (target > MAX_TARGET).
+// Unchanged from the pre-2026-08-11 guarantee (−30) — the band-only loosening
+// must not silently weaken the deep-target contract.
+const PRED_LEAD_OUTER_FLOOR = parseInt(process.env.MONITOR_PRED_LEAD_OUTER_FLOOR ?? '30', 10);
 // Pre-armed fire sessions: park a logged-in page on SAN's "Add To Queue"
 // screen for every driver whose fire is near, so the fire itself is a ~1 s
 // click instead of a ~3.5 s Chromium launch (see botService "Pre-armed fire
@@ -2314,25 +2365,53 @@ function evaluatePositionScheduler(state, ctx) {
   let   lead             = Math.min(rawLead, maxLeadPositions, growthLeadCap);
   let   leadClamped      = lead !== rawLead;
 
-  // Predictive velocity×latency lead (PREDICTIVE_LEAD) — BURST WINDOW ONLY.
+  // Avalanche-band lead (PREDICTIVE_LEAD) — BURST WINDOW ONLY, target in
+  // [PRED_LEAD_MIN_TARGET, PRED_LEAD_MAX_TARGET].
   // The flat clamp above pins the lead at ≤10, which cannot cover the drift the
   // queue accrues during SAN's commit latency on a storm (landings ran +33 above
-  // queue-at-fire). Replace it with the drift we can measure at click time:
-  //   D = clamp(observedVelocity × (floor + slope×inflight), 0, PRED_LEAD_CAP)
-  // projectedLanding = effectiveQueue + D then becomes a genuine landing estimate,
-  // so the fire rail (≥ target) and the past-max rail (> max) both stay correct.
-  // Self-correcting: pre-storm velocity ≈ 0 ⇒ D ≈ 0 ⇒ fires at queue ≈ target, so
-  // low targets don't fire early; D only grows once the queue is actually moving.
-  // 8-day replay: ±10 37.6%→75.9%, >+40 13.2%→1.5% (see OVERSHOOT-PREDICTIVE-LEAD.md).
+  // queue-at-fire). This block replaces it for the band that actually suffers.
+  // It used to size the lead as D = clamp(velocity × (floor + slope×inflight)):
+  // that shape was retired on 2026-08-10 after 9 live storms — see the block
+  // below and the 08-10 addendum in OVERSHOOT-PREDICTIVE-LEAD.md. The surviving
+  // property is the one that matters: projectedLanding = effectiveQueue + lead
+  // stays a genuine landing estimate, so the fire rail (≥ target) and the
+  // past-max rail (> max) both remain correct.
   const predLeadActive = PREDICTIVE_LEAD && inBurstWindow
-    && effectivePosition >= PRED_LEAD_MIN_TARGET;
+    && effectivePosition >= PRED_LEAD_MIN_TARGET
+    && effectivePosition <= PRED_LEAD_MAX_TARGET;
+  // Inside the avalanche band, once the queue is genuinely moving, SIZE the lead
+  // to the drift we can predict at click time from INFLIGHT:
+  //   D = clamp(PRED_DRIFT_INTERCEPT + PRED_DRIFT_SLOPE·inflight, FLOOR, CAP)
+  // Why inflight and not the old v×latency: a fresh 10-day live analysis (563
+  // band fires, logs 08-01..08-10) found velocity is a trailing slope that can't
+  // see the avalanche step (corr with drift −0.08), while inflight — our own
+  // clicked-but-uncommitted fires — LEADS the drift (corr 0.59), because our own
+  // pending adds are what push the queue past the target. It also fixes the flat
+  // `lead = CAP` shape this replaced: that under-covered the high-drift fires and
+  // over-fired the calm ones. Sim (transform error = drift − D, 10 days): the
+  // flat-30 branch gave >+40 12% / median +13; this gives >+40 1% / median +3,
+  // and the −30… now −45 guarantee below HOLDS structurally (worst −23), because
+  // D reaches CAP only at high inflight, which only happens mid-storm where the
+  // queue never stalls. See OVERSHOOT-PREDICTIVE-LEAD.md §2026-08-11.
+  const predLeadMoving = observedVelocity >= PRED_LEAD_MOVE_RATE;
   if (predLeadActive) {
-    const predLatS = PRED_LAT_FLOOR_S + PRED_LAT_SLOPE_S * currentInflight;
-    lead        = Math.min(Math.round(observedVelocity * predLatS), PRED_LEAD_CAP);
+    if (predLeadMoving) {
+      lead = Math.max(
+        PRED_LEAD_FLOOR,
+        Math.min(PRED_LEAD_CAP, Math.round(PRED_DRIFT_INTERCEPT + PRED_DRIFT_SLOPE * currentInflight)),
+      );
+    } else {
+      // Queue not yet moving: keep the old conservative velocity estimate so a
+      // morning whose storm never arrives does not land the whole fleet deep.
+      const predLatS = PRED_LAT_FLOOR_S + PRED_LAT_SLOPE_S * currentInflight;
+      lead = Math.min(Math.round(observedVelocity * predLatS), PRED_LEAD_CAP);
+    }
     leadClamped = false; // predictive path is not the flat clamp — see predLeadNote
   }
   const predLeadNote = predLeadActive
-    ? ` [pred-lead ${lead} = v${observedVelocity.toFixed(2)}×${(PRED_LAT_FLOOR_S + PRED_LAT_SLOPE_S * currentInflight).toFixed(1)}s (inflight ${currentInflight})]`
+    ? (predLeadMoving
+        ? ` [pred-lead ${lead} = clamp(${PRED_DRIFT_INTERCEPT}+${PRED_DRIFT_SLOPE}×${currentInflight} inflight, ${PRED_LEAD_FLOOR}, ${PRED_LEAD_CAP}) (v${observedVelocity.toFixed(2)}/s moving)]`
+        : ` [pred-lead ${lead} = v${observedVelocity.toFixed(2)}×${(PRED_LAT_FLOOR_S + PRED_LAT_SLOPE_S * currentInflight).toFixed(1)}s (inflight ${currentInflight}, queue static)]`)
     : '';
 
   // Fleet-landing true-tail probe (FLEET_PROBE_ENABLED): if a FRESH genuine
@@ -2415,11 +2494,17 @@ function evaluatePositionScheduler(state, ctx) {
   // stalling on the click. It only ever HOLDS a fire (never fires earlier), so it
   // cannot cause a miss — a growing storm lifts the displayed queue past the
   // floor within seconds and the driver fires then.
+  // Banded floor: −45 only inside the avalanche band [MIN, MAX] (where the
+  // aggressive inflight-scaled lead runs); −30 for deeper targets (≥200), which
+  // keep the original guarantee.
+  const hardFloorPositions = effectivePosition <= PRED_LEAD_MAX_TARGET
+    ? PRED_LEAD_HARD_FLOOR
+    : PRED_LEAD_OUTER_FLOOR;
   const hardFloorHold = PREDICTIVE_LEAD
     && effectivePosition >= PRED_LEAD_MIN_TARGET
-    && waitingCount < effectivePosition - PRED_LEAD_HARD_FLOOR;
+    && waitingCount < effectivePosition - hardFloorPositions;
   const hardFloorNote = hardFloorHold
-    ? ` [hard-floor: hold until displayed ≥ ${effectivePosition - PRED_LEAD_HARD_FLOOR} (−30 guarantee)]`
+    ? ` [hard-floor: hold until displayed ≥ ${effectivePosition - hardFloorPositions} (−${hardFloorPositions} guarantee)]`
     : '';
 
   const projectionReached = projectedLanding >= effectivePosition;

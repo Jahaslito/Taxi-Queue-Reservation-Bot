@@ -879,11 +879,11 @@ describe('evaluatePositionScheduler — safety rails', () => {
     });
   });
 
-  // Predictive velocity×latency lead (MONITOR_PREDICTIVE_LEAD) — burst-window
-  // lead sized to measured drift (D = velocity × (floor + slope×inflight)),
+  // Predictive band lead (MONITOR_PREDICTIVE_LEAD) — burst-window lead sized to
+  // inflight when the queue is moving: D = clamp(19 + 0.86·inflight, 20, 45),
   // replacing the flat POS_MAX_LEAD clamp. Loaded with the flag ON via
   // isolateModules; the default `monitor` (flag unset) must stay dormant.
-  describe('predictive velocity×latency lead (recalibrated + hard −30 floor)', () => {
+  describe('predictive inflight-scaled band lead (recalibrated + hard −45 floor)', () => {
     let evalPred, setLanding;
     let savedFlag, savedProbe;
     beforeAll(() => {
@@ -906,25 +906,56 @@ describe('evaluatePositionScheduler — safety rails', () => {
     // target 100; estimatedDrift/bias 0 so the flat path would give lead 0.
     const predCtx = { ...baseCtx, estimatedDrift: 0, biasCorrection: 0, inBurstWindow: true };
 
-    test('lead = velocity × predicted latency (slope 0.7) → fires when queue ≥ target − D', () => {
-      // v=1.0, inflight=20 → predLat = 5 + 0.7·20 = 19s → D = 19 → fire at ≥81 (floor 70 not binding)
-      const fire = evalPred(makeState(), { ...predCtx, observedVelocity: 1.0, currentInflight: 20, waitingCount: 81 });
-      const wait = evalPred(makeState(), { ...predCtx, observedVelocity: 1.0, currentInflight: 20, waitingCount: 80 });
+    // Once the queue is MOVING, the lead is sized to INFLIGHT — the only click-time
+    // signal that tracks drift (corr 0.59; velocity is a trailing slope, corr
+    // −0.08). D = clamp(round(19 + 0.86·inflight), 20, 45). At inflight 20,
+    // D = round(36.2) = 36 ⇒ fires at queue ≥ 100−36 = 64.
+    test('moving queue in the avalanche band → lead sized to inflight, no earlier', () => {
+      const fire = evalPred(makeState(), { ...predCtx, observedVelocity: 1.0, currentInflight: 20, waitingCount: 64 });
+      const wait = evalPred(makeState(), { ...predCtx, observedVelocity: 1.0, currentInflight: 20, waitingCount: 63 });
       expect(fire.action).toBe('fire');
       expect(wait.action).toBe('wait');
     });
 
-    test('lead capped at PRED_LEAD_CAP (30)', () => {
-      // v=2.5, inflight=60 → predLat=47s → raw D=117, capped to 30 → fire at ≥70 (not 53)
-      const at70 = evalPred(makeState(), { ...predCtx, observedVelocity: 2.5, currentInflight: 60, waitingCount: 70 });
-      const at69 = evalPred(makeState(), { ...predCtx, observedVelocity: 2.5, currentInflight: 60, waitingCount: 69 });
-      expect(at70.action).toBe('fire');
-      expect(at69.action).toBe('wait');
+    test('lead SCALES with inflight once the queue is moving', () => {
+      // inflight 0 → D=clamp(19,20,45)=20 ⇒ fires at ≥80; inflight 60 → D=45 ⇒ fires at ≥55.
+      // The deep lead is reserved for the high-inflight (confirmed-avalanche) fires.
+      expect(evalPred(makeState(), { ...predCtx, observedVelocity: 1.0, currentInflight: 0, waitingCount: 80 }).action).toBe('fire');
+      expect(evalPred(makeState(), { ...predCtx, observedVelocity: 1.0, currentInflight: 0, waitingCount: 79 }).action).toBe('wait');
+      expect(evalPred(makeState(), { ...predCtx, observedVelocity: 1.0, currentInflight: 60, waitingCount: 55 }).action).toBe('fire');
+      expect(evalPred(makeState(), { ...predCtx, observedVelocity: 1.0, currentInflight: 60, waitingCount: 54 }).action).toBe('wait');
+    });
+
+    test('a barely-creeping queue falls back to the conservative estimate', () => {
+      // v=0.2 < MOVE_RATE(0.5) ⇒ estimator path: predLat = 5+0.7·20 = 19s ⇒ D = 4
+      // ⇒ needs queue ≥ 96, so 70 (which the full budget would have fired) waits.
+      const d = evalPred(makeState(), { ...predCtx, observedVelocity: 0.2, currentInflight: 20, waitingCount: 70 });
+      expect(d.action).toBe('wait');
+    });
+
+    // The band has an UPPER bound as well as a lower one. Positions above ~200
+    // crawl (≈5.1 s per position vs 0.17–0.22 s inside the avalanche) and
+    // already land inside ±10; handing them the full budget would drag their
+    // median from +6 to about −24.
+    test('aggressive lead gated to target ≤ MAX_TARGET — a target 250 driver stays on the flat path', () => {
+      const d = evalPred(
+        makeState({ scheduledPosition: 250, maxAcceptablePosition: 290 }),
+        { ...predCtx, observedVelocity: 2.5, currentInflight: 60, waitingCount: 225 },
+      );
+      expect(d.action).toBe('wait'); // flat lead 0 ⇒ needs the displayed queue at 250
+    });
+
+    test('lead capped at PRED_LEAD_CAP (45)', () => {
+      // inflight=90 → raw D=round(19+0.86·90)=96, capped to 45 → fire at ≥55 (not 4)
+      const at55 = evalPred(makeState(), { ...predCtx, observedVelocity: 2.5, currentInflight: 90, waitingCount: 55 });
+      const at54 = evalPred(makeState(), { ...predCtx, observedVelocity: 2.5, currentInflight: 90, waitingCount: 54 });
+      expect(at55.action).toBe('fire');
+      expect(at54.action).toBe('wait');
     });
 
     test('aggressive lead gated to target ≥ MIN_TARGET — a target 60 driver stays on the flat path', () => {
       // target 60 (<70): predictive dormant ⇒ flat lead 0 ⇒ 40 < 60 ⇒ wait, even though the
-      // recalibrated lead (D capped 30) would otherwise have fired it early at 40.
+      // inflight-scaled lead (D capped 45) would otherwise have fired it early at 40.
       const d = evalPred(
         makeState({ scheduledPosition: 60, maxAcceptablePosition: 100 }),
         { ...predCtx, observedVelocity: 2.5, currentInflight: 60, waitingCount: 40 },
@@ -950,35 +981,54 @@ describe('evaluatePositionScheduler — safety rails', () => {
       expect(d.action).toBe('wait');
     });
 
-    // ─── HARD UNDERSHOOT FLOOR: the −30 guarantee ────────────────────────────
-    describe('hard undershoot floor (−30 guarantee)', () => {
-      // Max lead (30) + a fresh probe landing that puts the TRUE tail near target
-      // while the DISPLAYED queue is still far below target−30. Without the floor
+    // ─── HARD UNDERSHOOT FLOOR: the −45 guarantee ────────────────────────────
+    describe('hard undershoot floor (−45 guarantee)', () => {
+      // Max lead (45) + a fresh probe landing that puts the TRUE tail near target
+      // while the DISPLAYED queue is still far below target−45. Without the floor
       // the probe-boosted projection (effectiveQueue+lead ≥ target) would fire, and
-      // if the storm stalled the driver would land ~target−49 ⇒ deep undershoot.
-      const hot = { ...predCtx, observedVelocity: 2.5, currentInflight: 60 }; // lead capped at 30
+      // if the storm stalled the driver would land deep below target ⇒ undershoot.
+      const hot = { ...predCtx, observedVelocity: 2.5, currentInflight: 60 }; // lead capped at 45
 
-      test('probe would fire early, but displayed < target−30 ⇒ HELD, not fired', () => {
+      test('probe would fire early, but displayed < target−45 ⇒ HELD, not fired', () => {
         setLanding(95, Date.now()); // true tail ~95 (effectiveQueue → 90); display far below
-        const d = evalPred(makeState(), { ...hot, waitingCount: 50 }); // 50 < 100−30
+        const d = evalPred(makeState(), { ...hot, waitingCount: 50 }); // 50 < 100−45
         expect(d.action).toBe('wait');
         expect(d.logLine).toMatch(/hard-floor/);
       });
 
-      test('fires once the displayed queue reaches the floor (target−30)', () => {
+      test('fires once the displayed queue reaches the floor (target−45)', () => {
         setLanding(95, Date.now());
-        const d = evalPred(makeState(), { ...hot, waitingCount: 70 }); // 70 == 100−30
+        const d = evalPred(makeState(), { ...hot, waitingCount: 55 }); // 55 == 100−45
         expect(d.action).toBe('fire');
       });
 
-      test('no fire anywhere below target−30, even with the probe boosting hard', () => {
-        // Any FIRE must have waitingCount ≥ target−30, so SAN appending at the tail
-        // lands ≥ target−29 — the guarantee holds across the whole displayed range.
+      test('no fire anywhere below target−45, even with the probe boosting hard', () => {
+        // Any FIRE must have waitingCount ≥ target−45, so SAN appending at the tail
+        // lands ≥ target−44 — the guarantee holds across the whole displayed range.
         setLanding(95, Date.now());
         for (let wc = 40; wc <= 99; wc++) {
           const d = evalPred(makeState(), { ...hot, waitingCount: wc });
-          if (d.action === 'fire') expect(wc).toBeGreaterThanOrEqual(70); // target(100) − 30
+          if (d.action === 'fire') expect(wc).toBeGreaterThanOrEqual(55); // target(100) − 45
         }
+      });
+
+      // BAND-CONFINED FLOOR: the −45 loosening is ONLY for 70-199 (the band that
+      // gets the aggressive lead). Deeper targets keep the original −30 guarantee.
+      test('a 70-199 target uses the −45 floor', () => {
+        const d = evalPred(makeState({ scheduledPosition: 100, maxAcceptablePosition: 140 }),
+          { ...hot, waitingCount: 50 }); // 50 < 100−45 ⇒ held
+        expect(d.action).toBe('wait');
+        expect(d.logLine).toMatch(/hold until displayed ≥ 55 \(−45 guarantee\)/);
+      });
+
+      test('a target ≥200 keeps the −30 floor, NOT −45', () => {
+        // target 250: aggressive lead is gated off (>MAX_TARGET), so the floor must
+        // stay at −30. At displayed 210 (< 250−30=220) it is HELD with a −30 note;
+        // a −45 floor would instead have released it at 205.
+        const d = evalPred(makeState({ scheduledPosition: 250, maxAcceptablePosition: 290 }),
+          { ...hot, waitingCount: 210 });
+        expect(d.action).toBe('wait');
+        expect(d.logLine).toMatch(/hold until displayed ≥ 220 \(−30 guarantee\)/);
       });
     });
   });

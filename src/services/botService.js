@@ -91,22 +91,45 @@ function fireProxyConfig(vehicleNumber, now = new Date()) {
   return { proxyConfig, abArm };
 }
 
-const DEBUG_DIR = process.env.BOT_DEBUG_DIR ?? '/tmp/san-bot-debug';
-fs.mkdirSync(DEBUG_DIR, { recursive: true });
-
+// Screenshots are intentionally saved for ONE case only: an add/registration
+// attempt that SAN rejects with "Vehicle not available for registration" (the
+// "not eligible" error). See captureNotEligible below. Everything else that
+// used to screenshot now logs text only — debugCapture no longer writes any
+// files, so the debug dir contains not-eligible captures and nothing else.
 async function debugCapture(page, vehicleNumber, label) {
-  const ts   = Date.now();
-  const slug = `${vehicleNumber}_${label}_${ts}`;
-  const img  = path.join(DEBUG_DIR, `${slug}.png`);
-  const txt  = path.join(DEBUG_DIR, `${slug}.txt`);
   try {
-    await page.screenshot({ path: img, fullPage: true });
     const body = await page.textContent('body').catch(() => '(no body)');
-    const content = `URL: ${page.url()}\n\n${body}`;
-    fs.writeFileSync(txt, content, 'utf8');
-    console.log(`[Bot:debug] ${vehicleNumber} — ${label}\n  screenshot: ${img}\n  text:       ${txt}\n  url:        ${page.url()}\n  body(200):  ${body.replace(/\s+/g, ' ').slice(0, 200)}`);
+    console.log(`[Bot:debug] ${vehicleNumber} — ${label}\n  url:        ${page.url()}\n  body(200):  ${body.replace(/\s+/g, ' ').slice(0, 200)}`);
   } catch (e) {
     console.warn(`[Bot:debug] capture failed (${label}): ${e.message}`);
+  }
+}
+
+// Persistent capture for "not eligible" (VEHICLE_NOT_AVAILABLE) add failures.
+// Writes to ./data (a mounted volume) rather than /tmp so the PNG + text survive
+// container restarts and are reachable on the host at data/not-eligible-captures/.
+// Each event yields <vehicle>_not_eligible_<timestamp>.{png,txt}; the .txt holds
+// the vehicle number, the error, and the full SAN page text.
+const NOT_ELIGIBLE_DIR = process.env.BOT_NOT_ELIGIBLE_DIR
+  ?? path.join(process.cwd(), 'data', 'not-eligible-captures');
+
+async function captureNotEligible(page, vehicleNumber, errorMessage) {
+  try {
+    fs.mkdirSync(NOT_ELIGIBLE_DIR, { recursive: true });
+    const ts   = new Date().toISOString().replace(/[:.]/g, '-');
+    const slug = `${vehicleNumber}_not_eligible_${ts}`;
+    const img  = path.join(NOT_ELIGIBLE_DIR, `${slug}.png`);
+    const txt  = path.join(NOT_ELIGIBLE_DIR, `${slug}.txt`);
+    await page.screenshot({ path: img, fullPage: true });
+    const body = await page.textContent('body').catch(() => '(no body)');
+    fs.writeFileSync(
+      txt,
+      `Vehicle:  ${vehicleNumber}\nError:    ${errorMessage}\nURL:      ${page.url()}\nTime:     ${ts}\n\n--- SAN page text ---\n${body}\n`,
+      'utf8',
+    );
+    console.log(`[Bot:not-eligible] #${vehicleNumber} → "${errorMessage}"\n  screenshot: ${img}\n  text:       ${txt}`);
+  } catch (e) {
+    console.warn(`[Bot:not-eligible] capture failed for #${vehicleNumber}: ${e.message}`);
   }
 }
 
@@ -618,6 +641,7 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
 
     if (bodyText.includes(SAN_TEXT.VEHICLE_NOT_AVAILABLE)) {
       console.log(`[Bot] ${vehicleNumber} → ${SAN_TEXT.VEHICLE_NOT_AVAILABLE} (SAN business-rule rejection)`);
+      await captureNotEligible(page, vehicleNumber, DRIVER_ERROR_COPY.VEHICLE_NOT_AVAILABLE);
       return {
         success:               false,
         vehicleNotAvailable:   true, // signal for callers — short cooldown, not a creds problem
@@ -2179,6 +2203,7 @@ async function fireClaimedSession(session) {
       if (bodyText.includes(SAN_TEXT.VEHICLE_NOT_AVAILABLE)) {
         recordArmedFireDuration(Date.now() - startTime);
         console.log(`[Arm] #${vehicleNumber} → ${SAN_TEXT.VEHICLE_NOT_AVAILABLE} (SAN business-rule rejection)`);
+        await captureNotEligible(page, vehicleNumber, DRIVER_ERROR_COPY.VEHICLE_NOT_AVAILABLE);
         return {
           success:             false,
           vehicleNotAvailable: true,

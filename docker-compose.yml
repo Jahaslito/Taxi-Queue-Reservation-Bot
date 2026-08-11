@@ -208,20 +208,33 @@ services:
       # deploy. Helps NORMAL storms; does NOTHING for a SAN-side commit stall like
       # 08-06 (that was exogenous, not a lead problem). All four tuning constants
       # are live-overridable; velocity is capped so a one-tick spike can't inflate D.
-      # ⚠️ 2026-08-07 RECALIBRATION + HARD −30 FLOOR (user request, live). Slope
-      # 0.25→0.7 (0.25 covered <½ the drift on the 100-armed storm); cap 40→30;
-      # aggressive lead gated to target ≥ MIN_TARGET (low targets already land ±10);
-      # HARD_FLOOR guarantees undershoot ≥ −(FLOOR−1) = −29 by construction — a
-      # gated driver is never fired while the DISPLAYED queue is >FLOOR below target,
-      # so worst-case landing ≥ target−FLOOR+1 no matter what the lead/probe say.
-      # 7-storm replay (08-01..07): 0 fires below −30 on every day. Kill switch:
-      # MONITOR_PREDICTIVE_LEAD=0 reverts instantly (flat lead), no deploy.
+      # ⚠️ 2026-08-11 RECALIBRATION — INFLIGHT-SCALED BAND LEAD + −45 FLOOR (live).
+      # Fresh 10-day live analysis (563 band fires, logs 08-01..08-10): the flat
+      # cap-30 lead still left 70-199 at ±10 9% / median +31 / >+40 36%, and the
+      # effective lead only reached ~14 (the avalanche leaps past the threshold
+      # between polls). Fix: once the queue is MOVING, size the lead to INFLIGHT —
+      # the one click-time signal that tracks drift (corr 0.59; velocity is useless
+      # here, −0.08):  D = clamp(round(INTERCEPT + SLOPE·inflight), FLOOR, CAP).
+      # Sim (10 days): >+40 12%→1%, median +13→+3, contract holds (worst −23).
+      # BOTH the aggressive lead AND the −45 floor are BAND-CONFINED to
+      # [MIN_TARGET, MAX_TARGET] = 70-199; targets ≥200 keep the −30 guarantee via
+      # OUTER_FLOOR (they crawl, already land ±10). HARD_FLOOR guarantees undershoot
+      # ≥ −(FLOOR−1) by construction — a gated driver is never fired while the
+      # DISPLAYED queue is >FLOOR below target. Product decision (approved 08-11):
+      # the band guarantee loosens −30→−44 (realized worst −23 over 10 days) to buy
+      # the >+40 tail. Kill switch: MONITOR_PREDICTIVE_LEAD=0 reverts instantly.
       MONITOR_PREDICTIVE_LEAD: ${MONITOR_PREDICTIVE_LEAD:-1}
-      MONITOR_PRED_LAT_FLOOR:  ${MONITOR_PRED_LAT_FLOOR:-5}       # s, exogenous latency floor
-      MONITOR_PRED_LAT_SLOPE:  ${MONITOR_PRED_LAT_SLOPE:-0.7}     # s of latency per inflight fire
-      MONITOR_PRED_LEAD_CAP:   ${MONITOR_PRED_LEAD_CAP:-30}       # max predictive lead
-      MONITOR_PRED_LEAD_MIN_TARGET: ${MONITOR_PRED_LEAD_MIN_TARGET:-70}   # aggressive lead only for target ≥ this
-      MONITOR_PRED_LEAD_HARD_FLOOR: ${MONITOR_PRED_LEAD_HARD_FLOOR:-30}   # never fire >this below target ⇒ undershoot ≥ −29
+      MONITOR_PRED_DRIFT_INTERCEPT:  ${MONITOR_PRED_DRIFT_INTERCEPT:-19}    # positions, base drift
+      MONITOR_PRED_DRIFT_SLOPE:      ${MONITOR_PRED_DRIFT_SLOPE:-0.86}      # positions of drift per inflight fire
+      MONITOR_PRED_LEAD_FLOOR:       ${MONITOR_PRED_LEAD_FLOOR:-20}         # min moving-queue lead
+      MONITOR_PRED_LEAD_CAP:         ${MONITOR_PRED_LEAD_CAP:-45}           # max predictive lead (= band floor)
+      MONITOR_PRED_LEAD_MIN_TARGET:  ${MONITOR_PRED_LEAD_MIN_TARGET:-70}    # aggressive lead + −45 floor only for target ≥ this
+      MONITOR_PRED_LEAD_MAX_TARGET:  ${MONITOR_PRED_LEAD_MAX_TARGET:-199}   # …and ≤ this (the avalanche band)
+      MONITOR_PRED_LEAD_MOVE_RATE:   ${MONITOR_PRED_LEAD_MOVE_RATE:-0.5}    # /s, queue must be moving to spend the full budget
+      MONITOR_PRED_LEAD_HARD_FLOOR:  ${MONITOR_PRED_LEAD_HARD_FLOOR:-45}    # band: never fire >45 below target ⇒ undershoot ≥ −44
+      MONITOR_PRED_LEAD_OUTER_FLOOR: ${MONITOR_PRED_LEAD_OUTER_FLOOR:-30}   # target ≥200: unchanged −30 guarantee
+      MONITOR_PRED_LAT_FLOOR:  ${MONITOR_PRED_LAT_FLOOR:-5}       # s, latency floor (static-queue fallback only)
+      MONITOR_PRED_LAT_SLOPE:  ${MONITOR_PRED_LAT_SLOPE:-0.7}     # s of latency per inflight (static-queue fallback only)
       MONITOR_PRED_VEL_CAP:    ${MONITOR_PRED_VEL_CAP:-2.5}       # /s, cap on the velocity used
       MONITOR_PRED_VEL_WINDOW: ${MONITOR_PRED_VEL_WINDOW:-8}      # s, trailing velocity window
       # SAN commit-latency awareness (2026-07-28). The drift horizon measures the

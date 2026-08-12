@@ -160,7 +160,15 @@ services:
       # PROXY_ENABLED=false → skip proxy entirely (observation mode)
       # PROXY_FAIL_THRESHOLD → consecutive failures before tripping the breaker
       # PROXY_COOLDOWN_MS    → ms to stay direct after a trip (5 min default)
-      PROXY_ENABLED:         ${PROXY_ENABLED:-true}
+      # 2026-08-12 — DISABLED. The proxy was the 08-07 overshoot regression's
+      # secondary cause: it added +3–6 s to each fire's commit latency (whole-day
+      # median commit DOUBLED 6.2 s→12.4 s when it came on 08-07) for ZERO stall
+      # benefit — no SAN stall occurred all week. Extra latency = extra drift =
+      # overshoot. shouldUseProxy()→false ⇒ every fire/arm uses the origin IP;
+      # reads/removes/warming already did. Re-enable (PROXY_ENABLED=true) only if
+      # a per-IP throttle is ever actually observed. See memory
+      # drift-is-self-inflicted-0807-regression.
+      PROXY_ENABLED:         ${PROXY_ENABLED:-false}
       PROXY_FAIL_THRESHOLD:  ${PROXY_FAIL_THRESHOLD:-3}
       PROXY_COOLDOWN_MS:     ${PROXY_COOLDOWN_MS:-300000}
       # Proxy A/B test (2026-08-06). Tests whether SAN throttles OUR origin IP
@@ -173,7 +181,11 @@ services:
       # ORIGIN_PCT = control-arm share. DEFAULT OFF (no split, behaviour unchanged).
       # Default ON (2026-08-07): run the proxy A/B next storm. Harmless if the
       # proxy creds below are unset — every fire just tags [AB] and stays on origin.
-      BOT_PROXY_AB:            ${BOT_PROXY_AB:-1}
+      # 2026-08-12 — turned OFF alongside PROXY_ENABLED=false: with the proxy
+      # disabled the A/B splits nothing (both arms resolve to origin) and its [AB]
+      # tags only add misleading log noise. Re-enable together with the proxy if
+      # the origin-throttle question is ever revisited.
+      BOT_PROXY_AB:            ${BOT_PROXY_AB:-0}
       BOT_PROXY_AB_ORIGIN_PCT: ${BOT_PROXY_AB_ORIGIN_PCT:-30}
       # Proxy is SCOPED — used ONLY for the two add-to-queue actions (arming a
       # parked page + firing) and ONLY inside this PT wall-clock window (the
@@ -447,6 +459,40 @@ services:
       # (07-06: 17 committed adds misread as failures → "already in queue" wall).
       BOT_ARM_FIRE_TIMEOUT_MS:     ${BOT_ARM_FIRE_TIMEOUT_MS:-12000}
       BOT_ARM_FIRE_TIMEOUT_MAX_MS: ${BOT_ARM_FIRE_TIMEOUT_MAX_MS:-45000}
+      # Warm re-fire ladder (default OFF). The big storm overshoots are the COLD
+      # fallback, not lead/drift error: when an armed click never dispatches (the
+      # CPU-starved renderer can't ready the visible Add button under a same-tick
+      # fire batch, so page.click blows its 2 s actionability timeout) the driver
+      # drops to the concurrency-gated cold path and lands 48–63 s / +74…+165 late
+      # (06-30, 07-27, 08-11 #093/#0190/#239/#258 all ~250 for a ~90 target). ON:
+      # (1) fire SAN's own hidden Blazor button (survives a not-yet-ready visible
+      # button), and (2) on a genuine miss (nothing dispatched, driver absent from
+      # V Holding) re-dispatch WARM on the still-open circuit — up to _ATTEMPTS
+      # sub-second clicks within _MS — before ever conceding to cold. Double-add-
+      # safe: enters only when no add went out, stops re-clicking once one lands,
+      # then confirms patiently via V Holding. Observe the `[Arm] ♻` lines.
+      # Values: 1 = ON (re-fire), 'shadow' = OBSERVE ONLY (log where it WOULD
+      # re-fire, take no action, leave the primary dispatch as the original
+      # text-search — zero behaviour change), 0 = OFF.
+      # 2026-08-12 — ENABLED IN SHADOW (the re-dispatch is the higher-risk half,
+      # deferred): the next storm's `[Arm] ♻ … SHADOW` lines show how many misses
+      # survive BOT_FIRE_DISPATCH_MAX below before we take the re-fire live. Flip
+      # to 1 to act; kill switch BOT_WARM_REFIRE=0.
+      BOT_WARM_REFIRE:             ${BOT_WARM_REFIRE:-shadow}
+      BOT_WARM_REFIRE_ATTEMPTS:    ${BOT_WARM_REFIRE_ATTEMPTS:-3}
+      BOT_WARM_REFIRE_MS:          ${BOT_WARM_REFIRE_MS:-2500}
+      # Fire-dispatch concurrency cap (default 0 = OFF/unbounded). Root-cause
+      # PREVENTIVE for the click jam the warm ladder recovers from: the fire batch
+      # launches every armed click in one tick (triggerPositionSchedule bypasses
+      # the jobQueue on purpose), so 30 same-tick clicks on 25 browsers / 8 vCPU
+      # starve the renderers → 2 s click timeouts → cold → +160. Cap how many
+      # clicks DISPATCH at once at ≈ the vCPU count; the gate releases the instant
+      # the click is out (before the WAIT-screen wait), so the (N+1)th waits only
+      # a sub-second dispatch — net FASTER than today's timeout-smeared ~13 s
+      # batch, not a pacing delay. Set to 8 on the 8-vCPU droplet to activate.
+      # 2026-08-12 — ENABLED at 8 (= vCPU count). Pure preventive: bounds an
+      # existing action, never adds one. Kill switch: BOT_FIRE_DISPATCH_MAX=0.
+      BOT_FIRE_DISPATCH_MAX:       ${BOT_FIRE_DISPATCH_MAX:-8}
       # Persistent vehicle_not_available = broken SAN account/vehicle data
       # (the #142/#70/#4006 class): after N consecutive not-available arm
       # attempts, suspend re-arming that driver for the suspend window instead

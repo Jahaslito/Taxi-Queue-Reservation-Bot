@@ -797,6 +797,105 @@ async function verifyAddLanded(vehicleNumber, attempts = ARM_VERIFY_ATTEMPTS) {
   return null;
 }
 
+/**
+ * Dispatch SAN's "Add To Queue" from INSIDE the page — no Playwright
+ * actionability pipeline (scroll-into-view, hit-testing, trial clicks), which
+ * is where a contended/just-unthrottled renderer spends its time. Prefers SAN's
+ * OWN hidden-button path: the visible Add button's onclick is just
+ * `elementFunctions.prepareStatusPageElements('hiddenAddToQueue')`, which clicks
+ * the hidden Blazor button that carries the SignalR add. Firing that directly
+ * doesn't depend on the visible button being rendered AND enabled — the exact
+ * state a CPU-starved renderer fails to reach under a same-tick fire batch
+ * (2026-08-11: 4 fires fell through the visible-button search → page.click →
+ * 2 s timeout → cold path → +160). Falls back to the visible-button text search
+ * (the original path) so anything the hidden path can't reach still fires.
+ * Returns the method that fired ('hidden-handler' | 'hidden-id' |
+ * 'visible-button') or null if NOTHING was clickable — both truthy/falsy so the
+ * `if (!clicked)` callers still work. INSTRUMENTED: it reports which path fired
+ * and, when the preferred hidden-Blazor paths are unavailable (a renamed
+ * element / missing handler — the "wrong element name" failure), WARNS with the
+ * exact presence flags and any in-page error so the fallback is never silent.
+ * Used only when BOT_WARM_REFIRE is on.
+ */
+async function dispatchAddInPage(page, label, vehicleNumber) {
+  const r = await page.evaluate((lbl) => {
+    const out = {
+      // Presence flags (read-only) — the diagnostics that answer "is the
+      // hidden-button selector still valid on this page?".
+      hadHandler:    (typeof elementFunctions !== 'undefined')
+                     && (typeof elementFunctions.prepareStatusPageElements === 'function'),
+      hadHiddenId:   !!document.getElementById('hiddenAddToQueue'),
+      hadVisibleBtn: [...document.querySelectorAll('button')]
+                       .some((b) => b.textContent.trim().includes(lbl) && !b.disabled),
+      via:   null,
+      error: null,
+    };
+    // 1) SAN's own handler (most faithful — mirrors the button's onclick).
+    try {
+      if (out.hadHandler) {
+        // eslint-disable-next-line no-undef
+        elementFunctions.prepareStatusPageElements('hiddenAddToQueue');
+        out.via = 'hidden-handler';
+        return out;
+      }
+    } catch (e) { out.error = String((e && e.message) || e); /* fall through */ }
+    // 2) The hidden Blazor button by id (same SignalR target, no wrapper).
+    try {
+      const hidden = document.getElementById('hiddenAddToQueue');
+      if (hidden) { hidden.click(); out.via = 'hidden-id'; return out; }
+    } catch (e) { out.error = String((e && e.message) || e); }
+    // 3) Original path: the visible button by text, only when enabled.
+    const btn = [...document.querySelectorAll('button')]
+      .find((b) => b.textContent.trim().includes(lbl) && !b.disabled);
+    if (btn) { btn.click(); out.via = 'visible-button'; return out; }
+    return out; // via stays null — nothing clickable
+  }, label).catch((e) => ({ via: null, error: `evaluate-threw: ${(e && e.message) || e}`,
+                             hadHandler: false, hadHiddenId: false, hadVisibleBtn: false }));
+
+  // Surface failures of the preferred hidden path so a wrong element name can't
+  // hide behind the fallback. via=null is a hard miss; via='visible-button'
+  // means BOTH hidden strategies were unavailable and we degraded to the old
+  // path (works, but the hidden-button premise is broken and worth knowing).
+  if (!r.via) {
+    console.warn(`[Arm] ✗ #${vehicleNumber} dispatchAddInPage found NOTHING clickable `
+      + `(handler=${r.hadHandler} hiddenId=${r.hadHiddenId} visible=${r.hadVisibleBtn}`
+      + `${r.error ? ` err=${r.error}` : ''})`);
+  } else if (r.via === 'visible-button') {
+    console.warn(`[Arm] ⚠ #${vehicleNumber} dispatchAddInPage fell back to the visible button — `
+      + `hidden Blazor path UNAVAILABLE (handler=${r.hadHandler} hiddenId=${r.hadHiddenId}`
+      + `${r.error ? ` err=${r.error}` : ''})`);
+  }
+  return r.via;
+}
+
+// Read-only presence check for the add selectors — NO click, no side effect.
+// Shadow mode runs this to validate `elementFunctions.prepareStatusPageElements`
+// + `#hiddenAddToQueue` on the LIVE storm page, so a wrong element name is
+// caught (with the reason) BEFORE the re-fire is taken live. Healthy confirmation
+// logs once per process; a missing hidden path warns every time it's seen.
+let _addSelectorsConfirmed = false;
+async function probeAddElements(page, vehicleNumber, label) {
+  const p = await page.evaluate((lbl) => ({
+    hadHandler:    (typeof elementFunctions !== 'undefined')
+                   && (typeof elementFunctions.prepareStatusPageElements === 'function'),
+    hadHiddenId:   !!document.getElementById('hiddenAddToQueue'),
+    hadVisibleBtn: [...document.querySelectorAll('button')]
+                     .some((b) => b.textContent.trim().includes(lbl) && !b.disabled),
+  }), label).catch((e) => ({ error: String((e && e.message) || e) }));
+  if (p.error) {
+    console.warn(`[Arm] ♻ #${vehicleNumber} SHADOW probe — page.evaluate failed: ${p.error}`);
+  } else if (!p.hadHandler && !p.hadHiddenId) {
+    console.warn(`[Arm] ♻ #${vehicleNumber} SHADOW probe — HIDDEN BLAZOR ADD PATH MISSING `
+      + `(handler=${p.hadHandler} hiddenId=${p.hadHiddenId} visible=${p.hadVisibleBtn}); `
+      + `warm re-fire ON would degrade to the visible button — CHECK the element names before going live`);
+  } else if (!_addSelectorsConfirmed) {
+    _addSelectorsConfirmed = true;
+    console.log(`[Arm] ♻ #${vehicleNumber} SHADOW probe — hidden Blazor add path PRESENT `
+      + `(handler=${p.hadHandler} hiddenId=${p.hadHiddenId} visible=${p.hadVisibleBtn}); `
+      + `dispatchAddInPage selectors validated on the live page`);
+  }
+}
+
 // ─── Fire-visibility watch (live SAN-backlog signal + early landings) ─────────
 // SAN stamps a fire's position when its server PROCESSES the click, but the
 // WAIT-screen confirmation streams back much later under storm load (07-12/…/
@@ -1556,6 +1655,75 @@ const HTTP_FIRE_TIMEOUT_MS  = parseInt(process.env.BOT_HTTP_FIRE_TIMEOUT_MS  ?? 
 // (set from the capture). Anything else the click triggers is ignored.
 const HTTP_FIRE_URL_MATCH   = process.env.BOT_HTTP_FIRE_URL_MATCH ?? 'gtcvms.com';
 
+// ─── Warm re-fire ladder (BOT_WARM_REFIRE) ───────────────────────────────────
+// The big storm overshoots are NOT lead/drift error — they are the cold
+// fallback. When an armed click misses (the CPU-starved renderer can't ready
+// the visible Add button under a same-tick fire batch, so page.click blows its
+// 2 s actionability timeout), today the driver drops to the concurrency-gated
+// cold path and lands 48–63 s later, +74…+165 past target (06-30, 07-27, and
+// 2026-08-11 #093/#0190/#239/#258 all landed ~250 for a ~90 target). But the
+// armed circuit is still open and parked on requestTrip — a re-dispatch is
+// another sub-second in-page click. When ON, this (1) prefers SAN's own hidden
+// Blazor button (dispatchAddInPage) so the click never depends on the visible
+// button being rendered+enabled, and (2) on a genuine miss (nothing dispatched,
+// driver absent from V Holding) re-fires warm within a tight budget before ever
+// conceding to cold. Double-add-safe by construction (see fireClaimedSession's
+// catch): we only enter when dispatchedAtMs === null (no add ever went out) and
+// we STOP re-clicking the instant one dispatch succeeds. Default OFF ⇒ the fast
+// path stays byte-for-byte the original text-search click. Fully observable via
+// the `[Arm] ♻` lines — turn on and validate the tail on the next storm.
+// BOT_WARM_REFIRE: '1' = ON (re-fire warm), 'shadow' = OBSERVE ONLY (log where
+// the ladder WOULD engage but fall through to cold, and leave the primary
+// dispatch as the original text-search — zero behaviour change), anything else
+// = OFF. Shadow lets a storm reveal how often the ladder would trigger (and,
+// with BOT_FIRE_DISPATCH_MAX on, how many misses the cap doesn't already
+// prevent) before taking the higher-risk re-dispatch action live.
+const WARM_REFIRE_MODE      = String(process.env.BOT_WARM_REFIRE ?? '').toLowerCase();
+const WARM_REFIRE_ENABLED   = WARM_REFIRE_MODE === '1';
+const WARM_REFIRE_SHADOW    = WARM_REFIRE_MODE === 'shadow';
+const WARM_REFIRE_ATTEMPTS  = Math.max(1, parseInt(process.env.BOT_WARM_REFIRE_ATTEMPTS ?? '3', 10));
+const WARM_REFIRE_BUDGET_MS = parseInt(process.env.BOT_WARM_REFIRE_MS ?? '2500', 10);
+
+// ─── Fire-dispatch concurrency cap (BOT_FIRE_DISPATCH_MAX) ────────────────────
+// Root-cause preventive for the same-tick click jam that the warm re-fire ladder
+// recovers from. The fire batch launches every armed click in ONE tick (monitor
+// triggerPositionSchedule → runFire, deliberately bypassing the launch-capped
+// jobQueue). With 25 browsers on 8 vCPU that starves the renderers, so the Add
+// button never readies and page.click blows its 2 s timeout (2026-08-11: 30
+// fires at 04:03:17 → 4 timed out → cold path → +160). This caps how many clicks
+// DISPATCH concurrently at ≈ core count: the (N+1)th waits only for a sub-second
+// dispatch to RETURN — the gate releases the instant the click is out, BEFORE
+// the WAIT-screen wait / fast-release — not for a whole fire to confirm. Net
+// FASTER than the status quo, which already smears the batch across ~13 s via
+// timeouts+retries. Set to the vCPU count (8) to activate; 0 = disabled
+// (unbounded, current behaviour). Gates BOTH the first dispatch and each warm
+// re-fire dispatch, so a wave of misses can't re-starve the renderers.
+const FIRE_DISPATCH_MAX = Math.max(0, parseInt(process.env.BOT_FIRE_DISPATCH_MAX ?? '0', 10));
+
+/** Minimal FIFO counting semaphore — bounds concurrent fire dispatches. */
+function makeSemaphore(max) {
+  let active = 0;
+  const waiters = [];
+  // Release atomically hands the freed slot to the next waiter (re-reserves it
+  // before waking) so a run() arriving in the same tick can't also claim it —
+  // no over-admission. Single-threaded ⇒ the active--/active++ pair is atomic.
+  const release = () => {
+    active--;
+    if (waiters.length > 0) { active++; waiters.shift()(); }
+  };
+  return {
+    async run(fn) {
+      if (active < max) active++;
+      else await new Promise((resolve) => waiters.push(resolve)); // slot handed to us
+      try { return await fn(); }
+      finally { release(); }
+    },
+  };
+}
+const fireDispatchGate = FIRE_DISPATCH_MAX > 0 ? makeSemaphore(FIRE_DISPATCH_MAX) : null;
+/** Run the click dispatch under the concurrency cap (pass-through when off). */
+const withFireGate = (fn) => (fireDispatchGate ? fireDispatchGate.run(fn) : fn());
+
 /** driverId → armed session record */
 const armedSessions = new Map();
 // driverId → epoch ms until which arm attempts are suppressed (failure cooldown)
@@ -2147,22 +2315,36 @@ async function fireClaimedSession(session) {
 
   const cap = installFireCapture(page, vehicleNumber, 'armed');
   try {
+    // Shadow mode: validate the hidden-button selectors on the LIVE page before
+    // the (unchanged) original dispatch — read-only, no click. This is what lets
+    // shadow catch a wrong element name and say why, without acting.
+    if (WARM_REFIRE_SHADOW) await probeAddElements(page, vehicleNumber, SAN_TEXT.ADD_TO_QUEUE_BUTTON);
     // Fast path: dispatch the click INSIDE the page — runs the button's own
     // onclick (elementFunctions.prepareStatusPageElements → hidden Blazor
     // button → SignalR frame) with none of Playwright's actionability
     // pipeline (scroll-into-view, hit-testing, trial clicks), which is where
     // a contended/just-unthrottled renderer spends its time. Falls back to
     // the proven page.click when the button can't be found in-page.
-    const fastClicked = await page.evaluate((label) => {
-      const btn = [...document.querySelectorAll('button')]
-        .find((b) => b.textContent.trim().includes(label) && !b.disabled);
-      if (!btn) return false;
-      btn.click();
-      return true;
-    }, SAN_TEXT.ADD_TO_QUEUE_BUTTON).catch(() => false);
-    if (!fastClicked) {
-      await page.click(`button:has-text("${SAN_TEXT.ADD_TO_QUEUE_BUTTON}")`, { timeout: 2000 });
-    }
+    // When BOT_WARM_REFIRE is on, prefer SAN's hidden-button path (survives a
+    // renderer that hasn't readied the visible button); otherwise the original
+    // visible-button text search, unchanged. The whole dispatch (in-page click +
+    // the page.click fallback) runs under the concurrency cap so no more than
+    // FIRE_DISPATCH_MAX clicks contend for the renderers at once; the gate
+    // releases as soon as the click is out, before the WAIT-screen wait below.
+    await withFireGate(async () => {
+      const fastClicked = WARM_REFIRE_ENABLED
+        ? await dispatchAddInPage(page, SAN_TEXT.ADD_TO_QUEUE_BUTTON, vehicleNumber)
+        : await page.evaluate((label) => {
+            const btn = [...document.querySelectorAll('button')]
+              .find((b) => b.textContent.trim().includes(label) && !b.disabled);
+            if (!btn) return false;
+            btn.click();
+            return true;
+          }, SAN_TEXT.ADD_TO_QUEUE_BUTTON).catch(() => false);
+      if (!fastClicked) {
+        await page.click(`button:has-text("${SAN_TEXT.ADD_TO_QUEUE_BUTTON}")`, { timeout: 2000 });
+      }
+    });
     // Add click has returned → the SignalR frame is on its way out. Stamp our-
     // side dispatch time here: decision→here is the claim + event-loop
     // serialization cost, the portion a parallel fire path could remove.
@@ -2294,6 +2476,64 @@ async function fireClaimedSession(session) {
         message:         `Added to queue — Position: ${landed.position}, Location: ${landed.location}`,
       };
     }
+    // ── Warm re-fire ladder (BOT_WARM_REFIRE) ────────────────────────────────
+    // The click NEVER dispatched (dispatchedAtMs still null ⇒ the throw was the
+    // page.click actionability timeout, not a post-dispatch confirm error) AND
+    // the driver is absent from V Holding. Today this returns null → the cold
+    // path, which lands 48–63 s / +74…+165 late during a storm. The circuit is
+    // still open and parked on requestTrip, so re-dispatch warm here instead.
+    // Double-add-safe: we enter only because NOTHING went out, and we STOP
+    // re-clicking the instant one dispatch succeeds (then confirm patiently —
+    // never re-click a committed add). If dispatchedAtMs is set, the add is
+    // already in flight and we must NOT touch it — the existing cold fallback
+    // handles it idempotently.
+    if (WARM_REFIRE_SHADOW && dispatchedAtMs === null) {
+      // Observe-only: this is exactly the miss the ladder would recover (the
+      // click never dispatched and the driver is absent). Log it and fall
+      // through to the unchanged cold fallback so the storm shows how often the
+      // ladder would fire — no re-dispatch is taken.
+      console.warn(`[Arm] ♻ #${vehicleNumber} SHADOW — would warm re-fire here (click never dispatched, driver absent); falling through to cold instead`);
+    } else if (WARM_REFIRE_ENABLED && dispatchedAtMs === null) {
+      let clicked = false;
+      const refireStart = Date.now();
+      for (let i = 1; i <= WARM_REFIRE_ATTEMPTS && !clicked; i++) {
+        if (session._disposed || (page.isClosed && page.isClosed())) break;
+        if (Date.now() - refireStart > WARM_REFIRE_BUDGET_MS) break;
+        clicked = await withFireGate(() => dispatchAddInPage(page, SAN_TEXT.ADD_TO_QUEUE_BUTTON, vehicleNumber));
+        if (!clicked) { await new Promise((r) => setTimeout(r, 150)); continue; }
+        dispatchedAtMs     = Date.now();
+        inFlightAtDispatch = pendingFireVis.size;
+        beginFireVisibility(vehicleNumber);
+        console.log(`[Arm] ♻ #${vehicleNumber} warm re-fire dispatched on attempt ${i} (${dispatchedAtMs - startTime} ms since decision)`);
+      }
+      if (clicked) {
+        // The re-dispatch committed the add — free the browser NOW (like the
+        // fast-release path, so the pool isn't jammed) and confirm via the
+        // authoritative V Holding read. Never re-click from here (double-add).
+        await disposeClaimedSession(session, 'warm re-fire dispatched — confirming via V Holding');
+        const refired = await verifyAddLanded(vehicleNumber, fireReleaseVerifyAttempts());
+        if (refired) {
+          const totalMs = Date.now() - startTime;
+          recordArmedFireDuration(totalMs);
+          console.log(`[Arm] ⚡ #${vehicleNumber} warm re-fire COMMITTED → position ${refired.position} (${totalMs} ms total)`);
+          return {
+            success:              true,
+            alreadyQueued:        false,
+            viaArmedSession:      true,
+            recoveredFromTimeout: true,
+            warmRefired:          true,
+            dispatchedAtMs,
+            inFlightAtDispatch,
+            ...refired,
+            durationMs:           totalMs,
+            message:              `Added to queue — Position: ${refired.position}, Location: ${refired.location}`,
+          };
+        }
+        console.warn(`[Arm] ♻ #${vehicleNumber} warm re-fire dispatched but not confirmed in V Holding — falling back to cold bot`);
+      } else {
+        console.warn(`[Arm] ♻ #${vehicleNumber} warm re-fire could not dispatch in ${Date.now() - refireStart} ms — falling back to cold bot`);
+      }
+    }
     // Genuinely not in the queue — the cold bot takes over. If the add lands
     // even later, the fallback finds the WAIT screen and reports alreadyQueued
     // with the real position (idempotent).
@@ -2393,6 +2633,8 @@ module.exports = {
   _resetArmedFireLatencies:       () => { armedFireLatencies.length = 0; },
   _desiredArmedSlots:             desiredArmedSlots,
   _verifyAddLanded:               verifyAddLanded,
+  _makeSemaphore:                 makeSemaphore,
+  _dispatchAddInPage:             dispatchAddInPage,
   // Exposed for tailProbeService — same login/search/read flows the bot uses,
   // so the probe can never drift from the proven page interactions.
   _driveToAddButton:              driveToAddButton,

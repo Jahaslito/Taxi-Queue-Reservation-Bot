@@ -493,6 +493,25 @@ services:
       # 2026-08-12 — ENABLED at 8 (= vCPU count). Pure preventive: bounds an
       # existing action, never adds one. Kill switch: BOT_FIRE_DISPATCH_MAX=0.
       BOT_FIRE_DISPATCH_MAX:       ${BOT_FIRE_DISPATCH_MAX:-8}
+      # Fire-pacing gate — the MEDIAN-overshoot lever (off | shadow | on).
+      # 08-12 proved the median is self-inflicted latency: firing ~30 drivers in
+      # ONE second spikes inflight → commit 6s→12s → drift 44→77 → overshoot.
+      # (Proxy-off + dispatch-cap killed the +160 TAIL but did NOT touch this.)
+      # The gate releases the target-sorted batch metered so inflight stays ≤
+      # PACE_MAX; a driver with no runway (queue within URGENCY_MARGIN of target)
+      # always fires so nothing is held past its window. Shadowed first because a
+      # fire held too long overshoots — the risk this measures before acting.
+      #   shadow → launch unchanged, LOG projected paced-vs-unpaced inflight+drift
+      #            (the go/no-go); on → actually hold over-cap non-urgent fires.
+      # Deploy in SHADOW; read the `[Pace] SHADOW` lines next storm before `on`.
+      MONITOR_FIRE_PACING:         ${MONITOR_FIRE_PACING:-shadow}
+      MONITOR_PACE_MAX_INFLIGHT:   ${MONITOR_PACE_MAX_INFLIGHT:-12}
+      MONITOR_PACE_URGENCY_MARGIN: ${MONITOR_PACE_URGENCY_MARGIN:-25}
+      # Concentration gate: only ENGAGE pacing when it would hold ≥ this many
+      # fires (a real pile-up). Below it, release all — calm mornings behave like
+      # `off` (sim: pacing hurts low-concentration days). The `[Pace]` line says
+      # ENGAGED vs "not engaged".
+      MONITOR_PACE_MIN_HOLD:       ${MONITOR_PACE_MIN_HOLD:-5}
       # Persistent vehicle_not_available = broken SAN account/vehicle data
       # (the #142/#70/#4006 class): after N consecutive not-available arm
       # attempts, suspend re-arming that driver for the suspend window instead

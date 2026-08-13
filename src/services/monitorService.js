@@ -284,6 +284,68 @@ const PREARM_CLOCK_MIN  = parsePrearmClockPT(process.env.MONITOR_PREARM_CLOCK_PT
 // under the July onset floor. Arming never fires anyone, so the only cost is
 // session-hours. Recalibrate when the regime drifts again.
 const PREARM_QUEUE_POS  = parseInt(process.env.MONITOR_PREARM_QUEUE_POS ?? '22', 10);
+
+// ─── Fire pacing gate (MONITOR_FIRE_PACING: off | shadow | on) ───────────────
+// The median overshoot is self-inflicted latency: firing ~30 drivers in ONE
+// second spikes inflight → SAN commit slows 6s→12s → drift 44→77 → overshoot
+// (08-12 proof: same storm, drift @inflight<20 = 44 vs @≥20 = 77). This gate
+// releases the sorted (most-overdue-target-first) batch metered so inflight
+// stays ≤ PACE_MAX, keeping fires in the low-drift regime the cap-45 lead can
+// cover. RISK (why shadow-first): a fire held past its window overshoots anyway,
+// so held drivers with no runway (queue already within URGENCY_MARGIN of target)
+// fire immediately; the rest retry next ~1s poll as inflight drains.
+//   off    — unchanged (launch the whole batch at once).
+//   shadow — launch unchanged, but COMPUTE + LOG what pacing would do and the
+//            projected paced-vs-unpaced peak inflight & drift. Zero behaviour
+//            change; the go/no-go data for `on`.
+//   on     — actually hold over-cap, non-urgent fires to the next tick.
+const FIRE_PACING_MODE     = String(process.env.MONITOR_FIRE_PACING ?? 'off').toLowerCase();
+const PACE_MAX_INFLIGHT    = Math.max(1, parseInt(process.env.MONITOR_PACE_MAX_INFLIGHT ?? '12', 10));
+// A driver whose live queue is already within this many positions of its target
+// has no runway to be held (holding → guaranteed overshoot) → always release.
+const PACE_URGENCY_MARGIN  = Math.max(0, parseInt(process.env.MONITOR_PACE_URGENCY_MARGIN ?? '25', 10));
+// Concentration gate: only ENGAGE pacing when it would hold at least this many
+// fires — i.e. a genuine same-tick pile-up. 10-day sim finding: pacing HELPS the
+// concentrated storm days (08-07/08/09/11/12) but HURTS the calm/low-concentration
+// days (08-05/06 got worse — re-timing penalty with no drift to save). A small
+// batch produces few holds, so this threshold makes calm mornings behave exactly
+// like `off`; only real pile-ups (batch ≳ MAX+MIN_HOLD, or high standing inflight)
+// trip it.
+const PACE_MIN_HOLD        = Math.max(1, parseInt(process.env.MONITOR_PACE_MIN_HOLD ?? '5', 10));
+// Drift model (matches the shipped predictive lead) for the projection log only.
+const paceDriftEst = (inflight) => Math.round(19 + 0.86 * inflight);
+
+// Pure pacing planner: given the batch's targets already sorted most-overdue
+// first, the live inflight, and the live queue depth, decide which fires to
+// release this tick. Releases up to (PACE_MAX − inflight) slots; a driver with
+// no runway (queue already within URGENCY_MARGIN of its target) is always
+// released (holding it would only deepen its overshoot). Returns per-item
+// release booleans + counts. Deterministic and side-effect free (unit-tested).
+function planFirePacing(sortedTargets, inflight, waitingCount, minHold = PACE_MIN_HOLD) {
+  let slots = Math.max(0, PACE_MAX_INFLIGHT - inflight);
+  const releases = [];
+  let fired = 0, held = 0, urgent = 0;
+  for (const target of sortedTargets) {
+    const noRunway = waitingCount >= target - PACE_URGENCY_MARGIN;
+    const release  = slots > 0 || noRunway;
+    if (release) {
+      if (noRunway && slots <= 0) urgent++;
+      if (slots > 0) slots--;
+      fired++;
+    } else {
+      held++;
+    }
+    releases.push(release);
+  }
+  // Concentration gate: unless the pile-up is real (≥ minHold would be held),
+  // release everyone — a calm morning must not pay the re-timing penalty for a
+  // marginal hold (sim: pacing hurts low-concentration days).
+  if (held < minHold) {
+    return { releases: sortedTargets.map(() => true), fired: sortedTargets.length, held: 0, urgent: 0, engaged: false };
+  }
+  return { releases, fired, held, urgent, engaged: true };
+}
+
 // ─── Storm-onset early fire (MONITOR_ONSET_FIRE, default OFF) ────────────────
 // SAN's display renders on a hard 5 s server tick (WS-verified 2026-07-08), so
 // a competitor batch-add can jump the queue +39 inside ONE tick (07-08:
@@ -3594,9 +3656,42 @@ async function poll() {
   if (fireBatch.length > 0) {
     fireBatch.sort((a, b) =>
       (a.decision.effectivePosition ?? Infinity) - (b.decision.effectivePosition ?? Infinity));
-    for (const { driverId, state, decision } of fireBatch) {
+
+    const launch = ({ driverId, state, decision }) =>
       triggerPositionSchedule(driverId, state, decision.effectivePosition, decision.fireOpts)
         .catch(console.error);
+
+    if (FIRE_PACING_MODE === 'off') {
+      for (const item of fireBatch) launch(item);
+    } else {
+      // Pacing gate (shadow or on). Plan against live inflight + queue depth.
+      let inflight = 0;
+      try { inflight = require('./botService').currentInflight(); } catch { /* no armed pool */ }
+      const targets = fireBatch.map((it) => it.decision.effectivePosition ?? Infinity);
+      const { releases, fired, held, urgent, engaged } = planFirePacing(targets, inflight, waitingCount);
+
+      fireBatch.forEach((item, i) => {
+        if (FIRE_PACING_MODE === 'shadow') {
+          // Observe only: launch EVERYTHING unchanged (releases[] is a pure
+          // projection); zero behaviour change.
+          launch(item);
+        } else if (releases[i]) {
+          launch(item);
+        } else {
+          // ON + held: undo the fire mark so the scheduler re-evaluates the
+          // driver next ~1 s poll (its armed session stays parked — still in the
+          // pre-arm wanted set). planFirePacing guarantees a no-runway driver is
+          // never held, so this never fires late past its window.
+          item.state.positionFiredToday = false;
+          console.log(`[Pace] ⏸ #${item.state.vehicleNumber} held (inflight ${inflight}, cap ${PACE_MAX_INFLIGHT}, target ${targets[i]}, queue ${waitingCount}) — retry next tick`);
+        }
+      });
+
+      const pacedPeak   = Math.min(PACE_MAX_INFLIGHT, inflight + fired) + urgent;
+      const unpacedPeak = inflight + fireBatch.length;
+      console.log(`[Pace] ${FIRE_PACING_MODE.toUpperCase()} — batch ${fireBatch.length}, inflight ${inflight} (cap ${PACE_MAX_INFLIGHT}): `
+        + `${engaged ? `ENGAGED fire ${fired} / hold ${held}${urgent ? ` (urgent-release ${urgent})` : ''}` : `not engaged (would hold <${PACE_MIN_HOLD}) — all ${fireBatch.length} fire`}; `
+        + `est peak inflight paced ~${pacedPeak} vs unpaced ~${unpacedPeak} → est drift ~${paceDriftEst(pacedPeak)} vs ~${paceDriftEst(unpacedPeak)}`);
     }
   }
 
@@ -4593,6 +4688,7 @@ module.exports = {
   _parseTerminalPage:         parseTerminalPage,
   _syncWatchVehicle:          syncWatchVehicle,
   _norm:                      norm,
+  _planFirePacing:            planFirePacing,
   _isWithinOperatingHours:    isWithinOperatingHours,
   _evaluatePositionScheduler: evaluatePositionScheduler,
   // Storm-watch cadence & prearm (pure) — see stormWatchCadence.test.js

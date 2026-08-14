@@ -235,15 +235,26 @@ services:
       # DISPLAYED queue is >FLOOR below target. Product decision (approved 08-11):
       # the band guarantee loosens −30→−44 (realized worst −23 over 10 days) to buy
       # the >+40 tail. Kill switch: MONITOR_PREDICTIVE_LEAD=0 reverts instantly.
+      # ⚠️ 2026-08-14 CAP 45→65 (LIVE, user-approved) — SPEND THE UNUSED UNDERSHOOT
+      # BUDGET. 3-storm data (08-11/12/13, 113 fires at inflight ≥35): drift there
+      # NEVER dropped below 51 (min 51/64/74), yet the lead capped at 45 left those
+      # fires overshooting +33/+48/+61 AND left 45+ positions of undershoot budget
+      # unspent. Raising CAP+HARD_FLOOR to 65 fires those deep-drift fires ~20 spots
+      # earlier ⇒ overshoot roughly halves. SAFE because the lead only reaches 65 at
+      # inflight ≥54 (formula), where drift ≥51 ⇒ realized worst undershoot ~−14. The
+      # THEORETICAL band guarantee loosens −45→−65 (a zero-drift high-inflight fire —
+      # never observed in 113 fires); LOW-inflight fires (drift can be 9) keep leads
+      # ≤45 and their −45 floor UNCHANGED, since the formula gates depth by inflight.
+      # Revert: MONITOR_PRED_LEAD_CAP=45 MONITOR_PRED_LEAD_HARD_FLOOR=45 (or =0 kill).
       MONITOR_PREDICTIVE_LEAD: ${MONITOR_PREDICTIVE_LEAD:-1}
       MONITOR_PRED_DRIFT_INTERCEPT:  ${MONITOR_PRED_DRIFT_INTERCEPT:-19}    # positions, base drift
       MONITOR_PRED_DRIFT_SLOPE:      ${MONITOR_PRED_DRIFT_SLOPE:-0.86}      # positions of drift per inflight fire
       MONITOR_PRED_LEAD_FLOOR:       ${MONITOR_PRED_LEAD_FLOOR:-20}         # min moving-queue lead
-      MONITOR_PRED_LEAD_CAP:         ${MONITOR_PRED_LEAD_CAP:-45}           # max predictive lead (= band floor)
-      MONITOR_PRED_LEAD_MIN_TARGET:  ${MONITOR_PRED_LEAD_MIN_TARGET:-70}    # aggressive lead + −45 floor only for target ≥ this
+      MONITOR_PRED_LEAD_CAP:         ${MONITOR_PRED_LEAD_CAP:-65}           # max predictive lead (= band floor); 08-14 45→65
+      MONITOR_PRED_LEAD_MIN_TARGET:  ${MONITOR_PRED_LEAD_MIN_TARGET:-70}    # aggressive lead + band floor only for target ≥ this
       MONITOR_PRED_LEAD_MAX_TARGET:  ${MONITOR_PRED_LEAD_MAX_TARGET:-199}   # …and ≤ this (the avalanche band)
       MONITOR_PRED_LEAD_MOVE_RATE:   ${MONITOR_PRED_LEAD_MOVE_RATE:-0.5}    # /s, queue must be moving to spend the full budget
-      MONITOR_PRED_LEAD_HARD_FLOOR:  ${MONITOR_PRED_LEAD_HARD_FLOOR:-45}    # band: never fire >45 below target ⇒ undershoot ≥ −44
+      MONITOR_PRED_LEAD_HARD_FLOOR:  ${MONITOR_PRED_LEAD_HARD_FLOOR:-65}    # band: never fire >65 below target ⇒ undershoot ≥ −64; 08-14 45→65
       MONITOR_PRED_LEAD_OUTER_FLOOR: ${MONITOR_PRED_LEAD_OUTER_FLOOR:-30}   # target ≥200: unchanged −30 guarantee
       MONITOR_PRED_LAT_FLOOR:  ${MONITOR_PRED_LAT_FLOOR:-5}       # s, latency floor (static-queue fallback only)
       MONITOR_PRED_LAT_SLOPE:  ${MONITOR_PRED_LAT_SLOPE:-0.7}     # s of latency per inflight (static-queue fallback only)
@@ -481,6 +492,14 @@ services:
       BOT_WARM_REFIRE:             ${BOT_WARM_REFIRE:-shadow}
       BOT_WARM_REFIRE_ATTEMPTS:    ${BOT_WARM_REFIRE_ATTEMPTS:-3}
       BOT_WARM_REFIRE_MS:          ${BOT_WARM_REFIRE_MS:-2500}
+      # In-context recovery (tier 2, on unless =0; only acts when WARM_REFIRE=1).
+      # When the re-dispatch finds NO add button — the armed page fell off the add
+      # screen (08-13 #258: probe saw handler/hiddenId/visible all false → cold →
+      # +187) — re-drive the SAME authenticated context back to the add screen
+      # (cookies valid ⇒ no login, ~2-5 s) and dispatch once more, instead of the
+      # 60-80 s cold path. Bounded by _MS so a slow re-drive still beats cold.
+      BOT_WARM_REFIRE_RECOVER:     ${BOT_WARM_REFIRE_RECOVER:-1}
+      BOT_WARM_REFIRE_RECOVER_MS:  ${BOT_WARM_REFIRE_RECOVER_MS:-8000}
       # Fire-dispatch concurrency cap (default 0 = OFF/unbounded). Root-cause
       # PREVENTIVE for the click jam the warm ladder recovers from: the fire batch
       # launches every armed click in one tick (triggerPositionSchedule bypasses
@@ -503,8 +522,13 @@ services:
       # fire held too long overshoots — the risk this measures before acting.
       #   shadow → launch unchanged, LOG projected paced-vs-unpaced inflight+drift
       #            (the go/no-go); on → actually hold over-cap non-urgent fires.
-      # Deploy in SHADOW; read the `[Pace] SHADOW` lines next storm before `on`.
-      MONITOR_FIRE_PACING:         ${MONITOR_FIRE_PACING:-shadow}
+      # 2026-08-14 — set ON (user request). ⚠️ NOTE: pacing and the LEAD CAP 65
+      # raise are COMPETING strategies — pacing holds inflight ≤12, and the lead is
+      # inflight-scaled, so under pacing the lead rarely climbs past ~30 (never
+      # reaches the new 65 cap). Running both partially cancels + confounds
+      # attribution; if this storm is muddy, isolate one lever next time. Kill
+      # switch: MONITOR_FIRE_PACING=shadow.
+      MONITOR_FIRE_PACING:         ${MONITOR_FIRE_PACING:-on}
       MONITOR_PACE_MAX_INFLIGHT:   ${MONITOR_PACE_MAX_INFLIGHT:-12}
       MONITOR_PACE_URGENCY_MARGIN: ${MONITOR_PACE_URGENCY_MARGIN:-25}
       # Concentration gate: only ENGAGE pacing when it would hold ≥ this many

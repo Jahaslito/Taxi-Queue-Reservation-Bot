@@ -51,6 +51,59 @@ const bot = require('../../src/services/botService');
 describe('warm re-fire ladder (BOT_WARM_REFIRE)', () => {
   beforeEach(() => bot._resetArmedFireLatencies());
 
+  test('in-context recovery: page lost its button → re-drive to the add screen → dispatch lands (no cold path)', async () => {
+    // The armed page fell off the add screen (08-13 #258). Every in-page
+    // dispatch returns "nothing clickable" until driveToAddButton re-drives the
+    // (cookie-valid) context back to the add screen; the post-recovery dispatch
+    // then succeeds and the add lands.
+    mockWaiting = new Map();
+    const st = { dispatch: 0, veh: '258', landPos: 84 };
+    const session = {
+      driverId:      830,
+      vehicleNumber: '258',
+      sanUsername:   'u',
+      getCredentials: async () => ({ sanUsername: 'u', sanPassword: 'p' }),
+      context:       { close: async () => {} },
+      page: {
+        isClosed:        () => false,
+        goto:            async () => {},
+        waitForURL:      async () => {},
+        waitForFunction: async () => {},
+        waitForSelector: async () => {},
+        url:             () => 'https://san.gtcvms.com/gsidispatch.edispatch/requestTrip', // app host, not OIDC → no login
+        fill:            async () => {},
+        isVisible:       async () => true,   // Add To Queue visible ⇒ driveToAddButton → 'armed'
+        textContent:     async () => '',     // no VEHICLE_NOT_AVAILABLE
+        screenshot:      async () => { throw new Error('no screenshots'); },
+        context:         () => ({ storageState: async () => ({}) }),
+        on: () => {}, off: () => {},
+        click:           async (sel) => {
+          if (String(sel).includes('Add To Queue')) throw new Error('page.click: Timeout 2000ms exceeded.');
+          // Search / Log In clicks during the re-drive succeed
+        },
+        evaluate:        async (fn) => {
+          const src = String(fn);
+          if (src.includes('Remove From Queue')) return false; // isWaitScreen → not queued
+          // dispatchAddInPage: fails until AFTER the re-drive (5th call), then lands
+          st.dispatch += 1;
+          if (st.dispatch >= 5) {
+            mockWaiting = new Map([[st.veh, st.landPos]]);
+            return { via: 'hidden-id', hadHandler: false, hadHiddenId: true, hadVisibleBtn: false };
+          }
+          return { via: null, hadHandler: false, hadHiddenId: false, hadVisibleBtn: false };
+        },
+      },
+    };
+
+    const result = await bot.fireClaimedSession(session);
+
+    expect(result).not.toBeNull();               // NEVER conceded to the 60 s cold path
+    expect(result.success).toBe(true);
+    expect(result.position).toBe(84);
+    expect(result.warmRefired).toBe(true);
+    expect(st.dispatch).toBeGreaterThanOrEqual(5); // proves a re-drive happened before success
+  });
+
   test('dispatch miss + driver absent → warm re-fire, later attempt lands (no cold fallback)', async () => {
     // Driver shows up in V Holding only AFTER the re-dispatch commits.
     mockWaiting = new Map();

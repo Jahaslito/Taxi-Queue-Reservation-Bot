@@ -1683,6 +1683,14 @@ const WARM_REFIRE_ENABLED   = WARM_REFIRE_MODE === '1';
 const WARM_REFIRE_SHADOW    = WARM_REFIRE_MODE === 'shadow';
 const WARM_REFIRE_ATTEMPTS  = Math.max(1, parseInt(process.env.BOT_WARM_REFIRE_ATTEMPTS ?? '3', 10));
 const WARM_REFIRE_BUDGET_MS = parseInt(process.env.BOT_WARM_REFIRE_MS ?? '2500', 10);
+// In-context recovery (tier 2 of the ladder, on unless BOT_WARM_REFIRE_RECOVER=0).
+// When the re-dispatch finds NO add button — the armed page fell off the add
+// screen (08-13 #258: handler/hiddenId/visible all false) — re-drive the SAME
+// authenticated context back to the add screen (cookies still valid ⇒ no login,
+// ~2-5 s) and dispatch once more, instead of conceding to the 60-80 s cold path.
+// Bounded by _MS so a slow re-drive still beats cold rather than hanging.
+const WARM_REFIRE_RECOVER    = process.env.BOT_WARM_REFIRE_RECOVER !== '0';
+const WARM_REFIRE_RECOVER_MS = parseInt(process.env.BOT_WARM_REFIRE_RECOVER_MS ?? '8000', 10);
 
 // ─── Fire-dispatch concurrency cap (BOT_FIRE_DISPATCH_MAX) ────────────────────
 // Root-cause preventive for the same-tick click jam that the warm re-fire ladder
@@ -2495,17 +2503,77 @@ async function fireClaimedSession(session) {
       console.warn(`[Arm] ♻ #${vehicleNumber} SHADOW — would warm re-fire here (click never dispatched, driver absent); falling through to cold instead`);
     } else if (WARM_REFIRE_ENABLED && dispatchedAtMs === null) {
       let clicked = false;
-      const refireStart = Date.now();
-      for (let i = 1; i <= WARM_REFIRE_ATTEMPTS && !clicked; i++) {
-        if (session._disposed || (page.isClosed && page.isClosed())) break;
-        if (Date.now() - refireStart > WARM_REFIRE_BUDGET_MS) break;
-        clicked = await withFireGate(() => dispatchAddInPage(page, SAN_TEXT.ADD_TO_QUEUE_BUTTON, vehicleNumber));
-        if (!clicked) { await new Promise((r) => setTimeout(r, 150)); continue; }
+      // One in-page dispatch attempt; stamps the fire state on success.
+      const tryDispatchOnce = async () => {
+        if (session._disposed || (page.isClosed && page.isClosed())) return;
+        const via = await withFireGate(() => dispatchAddInPage(page, SAN_TEXT.ADD_TO_QUEUE_BUTTON, vehicleNumber));
+        if (!via) return;
+        clicked            = true;
         dispatchedAtMs     = Date.now();
         inFlightAtDispatch = pendingFireVis.size;
         beginFireVisibility(vehicleNumber);
-        console.log(`[Arm] ♻ #${vehicleNumber} warm re-fire dispatched on attempt ${i} (${dispatchedAtMs - startTime} ms since decision)`);
+        console.log(`[Arm] ♻ #${vehicleNumber} warm re-fire dispatched (${dispatchedAtMs - startTime} ms since decision, via ${via})`);
+      };
+
+      const refireStart = Date.now();
+      for (let i = 1; i <= WARM_REFIRE_ATTEMPTS && !clicked; i++) {
+        if (Date.now() - refireStart > WARM_REFIRE_BUDGET_MS) break;
+        await tryDispatchOnce();
+        if (!clicked) await new Promise((r) => setTimeout(r, 150));
       }
+
+      // ── Tier 2: in-context recovery ──────────────────────────────────────
+      // Still nothing dispatched ⇒ the page had no add button (fell off the add
+      // screen). Re-drive the SAME authenticated context back to the add screen
+      // (cookies valid ⇒ no login, ~2-5 s) and dispatch once more, rather than
+      // conceding to the 60-80 s cold path. dispatchedAtMs is still null, so this
+      // stays double-add-safe. Bounded so a slow re-drive still beats cold.
+      if (!clicked && WARM_REFIRE_RECOVER && dispatchedAtMs === null
+          && !session._disposed && !(page.isClosed && page.isClosed())
+          && typeof session.getCredentials === 'function') {
+        try {
+          const creds = await session.getCredentials();
+          if (creds) {
+            console.log(`[Arm] ⛑ #${vehicleNumber} in-context recovery — re-driving the authenticated page to the add screen (no cold path)`);
+            const outcome = await Promise.race([
+              driveToAddButton(page, { ...creds, vehicleNumber }),
+              new Promise((_, rej) => setTimeout(() => rej(new Error(`recovery exceeded ${WARM_REFIRE_RECOVER_MS} ms`)), WARM_REFIRE_RECOVER_MS)),
+            ]);
+            if (outcome === 'armed') {
+              console.log(`[Arm] ⛑ #${vehicleNumber} recovery re-armed the page — re-dispatching`);
+              await tryDispatchOnce();
+            } else if (outcome === 'already_queued') {
+              // Re-drive landed on the WAIT screen ⇒ the add is already committed
+              // (a prior in-flight click did land). Read the slot; do NOT re-add.
+              const info = await extractQueueInfo(page).catch(() => null);
+              await disposeClaimedSession(session, 'in-context recovery found already-queued');
+              if (info && Number.isFinite(info.position)) {
+                const totalMs = Date.now() - startTime;
+                recordArmedFireDuration(totalMs);
+                console.log(`[Arm] ⛑ #${vehicleNumber} recovery found add already committed → position ${info.position} (${totalMs} ms total)`);
+                return {
+                  success:              true,
+                  alreadyQueued:        false,
+                  viaArmedSession:      true,
+                  recoveredFromTimeout: true,
+                  warmRefired:          true,
+                  inContextRecovered:   true,
+                  dispatchedAtMs,
+                  inFlightAtDispatch,
+                  ...info,
+                  durationMs:           totalMs,
+                  message:              `Added to queue — Position: ${info.position}, Location: ${info.location}`,
+                };
+              }
+            } else {
+              console.warn(`[Arm] ⛑ #${vehicleNumber} in-context recovery ended '${outcome}' — falling back to cold bot`);
+            }
+          }
+        } catch (e) {
+          console.warn(`[Arm] ⛑ #${vehicleNumber} in-context recovery failed: ${e.message} — falling back to cold bot`);
+        }
+      }
+
       if (clicked) {
         // The re-dispatch committed the add — free the browser NOW (like the
         // fast-release path, so the pool isn't jammed) and confirm via the

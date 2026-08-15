@@ -522,13 +522,17 @@ services:
       # fire held too long overshoots — the risk this measures before acting.
       #   shadow → launch unchanged, LOG projected paced-vs-unpaced inflight+drift
       #            (the go/no-go); on → actually hold over-cap non-urgent fires.
-      # 2026-08-14 — set ON (user request). ⚠️ NOTE: pacing and the LEAD CAP 65
-      # raise are COMPETING strategies — pacing holds inflight ≤12, and the lead is
-      # inflight-scaled, so under pacing the lead rarely climbs past ~30 (never
-      # reaches the new 65 cap). Running both partially cancels + confounds
-      # attribution; if this storm is muddy, isolate one lever next time. Kill
-      # switch: MONITOR_FIRE_PACING=shadow.
-      MONITOR_FIRE_PACING:         ${MONITOR_FIRE_PACING:-on}
+      # 2026-08-14 — was ON (user request); REVERTED TO SHADOW after that storm.
+      # First live storm with the gate acting proved it MANUFACTURES the tail: it
+      # held 12 mid-band drivers, DISARMED them, and they re-fired COLD ~77 s later
+      # → 0% in-band, median +133, worst +148. Every one of the day's 8 cold-path
+      # fires (>40 s latency) was pace-held; the 73 it did NOT hold were 47% in-band,
+      # worst +48. Holding is only safe if the held driver re-fires ARMED — it does
+      # not; it goes cold. Do NOT set `on` again until the hold path is rebuilt to
+      # re-fire warm (never disarm). Two holes to fix first: (1) urgency-margin
+      # escape lets the whole onset burst through (spikes inflight), (2) hold →
+      # disarm → cold re-fire. Kill switch stays `shadow`.
+      MONITOR_FIRE_PACING:         ${MONITOR_FIRE_PACING:-shadow}
       MONITOR_PACE_MAX_INFLIGHT:   ${MONITOR_PACE_MAX_INFLIGHT:-12}
       MONITOR_PACE_URGENCY_MARGIN: ${MONITOR_PACE_URGENCY_MARGIN:-25}
       # Concentration gate: only ENGAGE pacing when it would hold ≥ this many

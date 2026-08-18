@@ -25,8 +25,10 @@ const RE_FIRE = /\[Pos\] #(\S+) — ✓ queue (\d+) \+ lead [\d.]+.*?≥ target 
 const RE_ONSET = /\[Pos\] #(\S+) — ⚡ ONSET early fire: queue (\d+).*?target (\d+)/;
 // Armed path = confirmed armed click OR a verify-recovered timeout (the add
 // was committed by the armed click; SAN was just slow streaming the WAIT
-// screen back — NOT a cold fire).
-const RE_ARM  = /\[Arm\] ⚡ #(\S+) (?:fired via armed session in (\d+) ms|confirmation timed out at (\d+) ms but add COMMITTED)/;
+// screen back — NOT a cold fire). The fast-release form (BOT_FIRE_RELEASE_MS,
+// live since 08-08) is the dominant armed confirmation in current logs — its
+// absence here labeled EVERY fire "COLD" on the 08-09…08-17 reports.
+const RE_ARM  = /\[Arm\] ⚡ #(\S+) (?:fired via armed session in (\d+) ms|confirmation timed out at (\d+) ms but add COMMITTED|fast-released at \d+ ms, add COMMITTED)/;
 const RE_LAND = /\[PosTracking\] #(\S+) landed at (\d+)/;
 const RE_TPS  = /\[TailProbe\] tail sample: (\d+)/;
 const RE_FLP  = /\[fleet-probe (\d+)→(\d+)/;

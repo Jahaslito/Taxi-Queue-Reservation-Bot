@@ -256,6 +256,18 @@ services:
       MONITOR_PRED_LEAD_MOVE_RATE:   ${MONITOR_PRED_LEAD_MOVE_RATE:-0.5}    # /s, queue must be moving to spend the full budget
       MONITOR_PRED_LEAD_HARD_FLOOR:  ${MONITOR_PRED_LEAD_HARD_FLOOR:-65}    # band: never fire >65 below target ⇒ undershoot ≥ −64; 08-14 45→65
       MONITOR_PRED_LEAD_OUTER_FLOOR: ${MONITOR_PRED_LEAD_OUTER_FLOOR:-30}   # target ≥200: unchanged −30 guarantee
+      # ⚠️ 2026-08-18 — TICK-PIPE LEAD (new, default on). Every decision in a
+      # poll tick reads ONE inflight snapshot taken before any of that tick's
+      # own fires clicked, so the inflight-scaled lead never counts the very
+      # batch each fire stands behind. 08-16: all 42 fires of the leap batch
+      # read inflight 26 → identical ~41 leads → a uniform +26…+48 landing
+      # translation (median +35, in-band 11%). The pass re-evaluates the tick's
+      # still-waiting drivers with the live batch size added to inflight, lowest
+      # target first. Undershoot-safe: the added lead is backed 1:1 by our OWN
+      # already-clicked adds (SAN appends in arrival order — guaranteed drift,
+      # not a forecast), and the displayed-queue hard floor still gates every
+      # fire. Kill switch: MONITOR_TICK_PIPE_LEAD=0.
+      MONITOR_TICK_PIPE_LEAD:  ${MONITOR_TICK_PIPE_LEAD:-1}
       MONITOR_PRED_LAT_FLOOR:  ${MONITOR_PRED_LAT_FLOOR:-5}       # s, latency floor (static-queue fallback only)
       MONITOR_PRED_LAT_SLOPE:  ${MONITOR_PRED_LAT_SLOPE:-0.7}     # s of latency per inflight (static-queue fallback only)
       MONITOR_PRED_VEL_CAP:    ${MONITOR_PRED_VEL_CAP:-2.5}       # /s, cap on the velocity used
@@ -319,7 +331,15 @@ services:
       # spends undershoot. Confirm the droplet .env does NOT override it to 0.
       MONITOR_FLEET_PROBE:          ${MONITOR_FLEET_PROBE:-1}
       MONITOR_FLEET_PROBE_FRESH_MS: ${MONITOR_FLEET_PROBE_FRESH_MS:-8000}
-      MONITOR_FLEET_PROBE_MAX_LEAD: ${MONITOR_FLEET_PROBE_MAX_LEAD:-40}
+      # ⚠️ 2026-08-18 — MAX_LEAD 40→80: the cap blinded the probe through the
+      # exact leaps it exists for. 08-17: our own landings hit 147–198 within
+      # 16 s of onset while the display still read 65 — probe ceiling 65+40=105
+      # strangled effectiveQueue 40+ positions below the PROVEN tail, so the
+      # mid-band fired a render late (+36 median). A landing is a hard lower
+      # bound of the tail (that driver is standing at it); the cap only guards
+      # against a MISATTRIBUTED landing, and 8 s freshness plus highest-landing-
+      # wins already bound that. Revert: MONITOR_FLEET_PROBE_MAX_LEAD=40.
+      MONITOR_FLEET_PROBE_MAX_LEAD: ${MONITOR_FLEET_PROBE_MAX_LEAD:-80}
       # Storm-onset early fire (07-08: competitor batch jumped 66→105 in one
       # 5s render tick — every target in the gap fired born-over, +32…+50).
       # Fires corridor drivers BEFORE the chunk when the onset signature shows
@@ -354,7 +374,18 @@ services:
       MONITOR_ONSET_ZONE_MAX:    ${MONITOR_ONSET_ZONE_MAX:-90}
       MONITOR_ONSET_RATE:        ${MONITOR_ONSET_RATE:-1.2}
       MONITOR_ONSET_STEP:        ${MONITOR_ONSET_STEP:-5}
-      MONITOR_ONSET_CAP:         ${MONITOR_ONSET_CAP:-25}
+      # ⚠️ 2026-08-18 — CAP 25→29 + cumulative calm guard (MONITOR_ONSET_CUM).
+      # 08-16/17 forensics: the dynamic cap sized itself to the single biggest
+      # render step, so a ramp of +4,+6,+6 held it at 12 while the +21 leap one
+      # render later swallowed every target it crossed (+26…+48, the whole
+      # shallow cohort). The guard now sums the window's steps — a lone calm-day
+      # +5 flurry still unlocks only ~10, a multi-render ramp (the storm
+      # signature) unlocks the full cap one-two renders sooner. CAP 29 keeps the
+      # onset worst case (storm dies on the click) at −28, inside the −30
+      # contract: landing ≥ effectiveQueue+1 ≥ target−29+1. Revert:
+      # MONITOR_ONSET_CUM=0, MONITOR_ONSET_CAP=25.
+      MONITOR_ONSET_CAP:         ${MONITOR_ONSET_CAP:-29}
+      MONITOR_ONSET_CUM:         ${MONITOR_ONSET_CUM:-1}
       MONITOR_ONSET_QUIET_MS:    ${MONITOR_ONSET_QUIET_MS:-25000}
       # Backlog-aware onset cap + target-horizon guard (07-19 five-morning
       # forensics; see monitorService ONSET_CAP_MAX block). The onset cap may
@@ -371,7 +402,9 @@ services:
       # 26-45 early only carried undershoot risk (−44 on a stall). Set to 45 in
       # .env to re-enable if a future storm shows a genuine SAN-side backlog the
       # declog can't clear.
-      MONITOR_ONSET_CAP_MAX:         ${MONITOR_ONSET_CAP_MAX:-25}
+      # 2026-08-18: 25→29 alongside ONSET_CAP (CAP_MAX is the final clamp in
+      # onsetCapNow — leaving it at 25 would silently re-cap the 29).
+      MONITOR_ONSET_CAP_MAX:         ${MONITOR_ONSET_CAP_MAX:-29}
       MONITOR_ONSET_SAFE_HORIZON:    ${MONITOR_ONSET_SAFE_HORIZON:-170}
       MONITOR_ONSET_MID_HORIZON:     ${MONITOR_ONSET_MID_HORIZON:-200}
       MONITOR_ONSET_MID_CAP:         ${MONITOR_ONSET_MID_CAP:-15}
@@ -489,7 +522,15 @@ services:
       # deferred): the next storm's `[Arm] ♻ … SHADOW` lines show how many misses
       # survive BOT_FIRE_DISPATCH_MAX below before we take the re-fire live. Flip
       # to 1 to act; kill switch BOT_WARM_REFIRE=0.
-      BOT_WARM_REFIRE:             ${BOT_WARM_REFIRE:-shadow}
+      # ⚠️ 2026-08-18 — LIVE (shadow→1). Shadow evidence: 08-13 caught the exact
+      # target class (3 would-refire misses incl. #258, the +187 of that day) and
+      # its probe also found the hidden add path MISSING on the fallen-off page —
+      # which is precisely what the RECOVER tier (08-14, on below) handles by
+      # re-driving the authenticated context back to the add screen instead of
+      # clicking a wrong element. 08-15/16/17 storms had zero timeouts, so the
+      # ladder stays dormant on healthy days; it only engages where today's
+      # behavior is already the worst case (cold re-fire, +74…+187). Kill: 0.
+      BOT_WARM_REFIRE:             ${BOT_WARM_REFIRE:-1}
       BOT_WARM_REFIRE_ATTEMPTS:    ${BOT_WARM_REFIRE_ATTEMPTS:-3}
       BOT_WARM_REFIRE_MS:          ${BOT_WARM_REFIRE_MS:-2500}
       # In-context recovery (tier 2, on unless =0; only acts when WARM_REFIRE=1).

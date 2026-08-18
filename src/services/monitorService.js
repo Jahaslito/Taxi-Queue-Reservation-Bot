@@ -249,6 +249,20 @@ const PRED_LEAD_HARD_FLOOR = parseInt(process.env.MONITOR_PRED_LEAD_HARD_FLOOR ?
 // Unchanged from the pre-2026-08-11 guarantee (−30) — the band-only loosening
 // must not silently weaken the deep-target contract.
 const PRED_LEAD_OUTER_FLOOR = parseInt(process.env.MONITOR_PRED_LEAD_OUTER_FLOOR ?? '30', 10);
+// Tick-pipe lead (MONITOR_TICK_PIPE_LEAD, default on, '0' kills): every decision
+// in a poll tick reads ONE currentInflight snapshot, taken before any of that
+// tick's own fires clicked — so the inflight-scaled lead never sees the very
+// batch each fire is about to stand behind. 08-16 forensics: all 42 fires of the
+// onset-leap batch read inflight 26 and got the same ~41 lead while the true
+// pipe the k-th joined was 26+k; the whole batch landed a uniform +26…+48
+// (median +35). SAN appends in click-arrival order, so a fire behind k of our
+// own uncommitted adds lands ≥ k past its click queue BY CONSTRUCTION — the
+// same-tick batch is GUARANTEED drift, not a forecast. The tick-pipe pass (see
+// runTickPipePass) re-evaluates the tick's still-waiting drivers with the batch
+// counted into inflight, lowest target first. Undershoot-safe: the added lead is
+// backed 1:1 by already-clicked adds, and the displayed-queue hard floor above
+// still gates every fire, so the −(FLOOR−1) guarantee is untouched.
+const TICK_PIPE_LEAD = String(process.env.MONITOR_TICK_PIPE_LEAD ?? '1') !== '0';
 // Pre-armed fire sessions: park a logged-in page on SAN's "Add To Queue"
 // screen for every driver whose fire is near, so the fire itself is a ~1 s
 // click instead of a ~3.5 s Chromium launch (see botService "Pre-armed fire
@@ -389,6 +403,16 @@ const ONSET_FIRE_SHADOW = ONSET_FIRE_MODE === 'shadow';
 // flurries in the 20–40 band on 37/57 days, worst step +5 ⇒ cap = 10 on every
 // one — identical to the normal lead. Onset fires only land EARLY, so a lower
 // floor cannot add overshoot.
+// Cumulative-evidence calm guard (MONITOR_ONSET_CUM, default on, '0' reverts to
+// the single-biggest-step rule): the dynamic cap sizes the early-fire allowance
+// from the SUM of render steps in the evidence window, not the biggest one. A
+// storm ramp is many renders in quick succession — 08-16: +4,+6,+6 inside ~10 s
+// (16 cumulative) while the biggest single step was 6, so 2×max held the cap at
+// 12 and the +21 leap one render later swallowed every target it crossed at
+// +26…+48. A calm-day flurry is still a lone +5 in the 20 s window → identical
+// unlock (~10) under either rule; only sustained multi-render ramps — the
+// storm signature — unlock the full cap, one to two renders sooner.
+const ONSET_CUM         = String(process.env.MONITOR_ONSET_CUM ?? '1') !== '0';
 const ONSET_ZONE_MIN    = parseInt(process.env.MONITOR_ONSET_ZONE_MIN ?? '20', 10);
 const ONSET_ZONE_MAX    = parseInt(process.env.MONITOR_ONSET_ZONE_MAX ?? '90', 10);
 const ONSET_RATE        = parseFloat(process.env.MONITOR_ONSET_RATE   ?? '1.2');
@@ -953,8 +977,12 @@ function onsetStep(st, { queue, rate, nowMs = Date.now() }) {
  *  cap. backlogBoost (see the ONSET_CAP_MAX block) may raise it further, up to
  *  ONSET_CAP_MAX, while a deep SAN processing backlog is proven live. */
 function onsetCapNow(st, backlogBoost = 0) {
-  const maxStep = st.recentSteps.reduce((m, s) => Math.max(m, s.step), 0);
-  const base    = Math.min(ONSET_CAP, Math.max(POS_MAX_LEAD, 2 * maxStep));
+  // Violence evidence: cumulative render steps in the window (MONITOR_ONSET_CUM,
+  // see the constant block) — a ramp of small steps is a storm; one is a flurry.
+  const evidence = ONSET_CUM
+    ? st.recentSteps.reduce((a, s) => a + s.step, 0)
+    : st.recentSteps.reduce((m, s) => Math.max(m, s.step), 0);
+  const base = Math.min(ONSET_CAP, Math.max(POS_MAX_LEAD, 2 * evidence));
   return Math.min(ONSET_CAP_MAX, Math.max(base, Math.floor(backlogBoost)));
 }
 
@@ -2631,6 +2659,46 @@ function evaluatePositionScheduler(state, ctx) {
 }
 
 // ─── Core poll tick ──────────────────────────────────────────────────────────
+/**
+ * Tick-pipe re-evaluation pass (MONITOR_TICK_PIPE_LEAD — see the constant
+ * block for the full rationale). Re-runs the tick's still-waiting drivers with
+ * this tick's own fire batch counted into currentInflight, lowest target
+ * first, growing the count as fires are added — so the k-th added fire sees
+ * exactly the batch it will stand behind. Mutates fireBatch in place (the
+ * caller's target-ascending sort runs after this) and marks fired states.
+ * Pure otherwise; `evaluate` is injectable for tests.
+ */
+function runTickPipePass(fireBatch, waiters, decisionCtx, evaluate = evaluatePositionScheduler) {
+  if (!TICK_PIPE_LEAD || fireBatch.length === 0 || waiters.length === 0) return 0;
+  waiters.sort((a, b) => (a.target ?? Infinity) - (b.target ?? Infinity));
+  let addedTotal = 0;
+  // Fixpoint: an added fire deepens the pipe for every remaining waiter, which
+  // can cross another threshold. Lead is capped, targets are sorted, and each
+  // pass must add at least one fire to continue — 6 passes is far past the
+  // worst chain the cap allows.
+  for (let pass = 0, added = true; added && pass < 6; pass++) {
+    added = false;
+    for (const w of waiters) {
+      if (w.state.positionFiredToday) continue;
+      try {
+        const d2 = evaluate(w.state, {
+          ...decisionCtx,
+          currentInflight: (decisionCtx.currentInflight ?? 0) + fireBatch.length,
+        });
+        if (d2.action !== 'fire') continue;
+        console.log(`${d2.logLine} [tick-pipe: ${fireBatch.length} same-tick fires ahead]`);
+        w.state.positionFiredToday = true;
+        fireBatch.push({ driverId: w.driverId, state: w.state, decision: d2 });
+        added = true;
+        addedTotal++;
+      } catch (err) {
+        console.error(`[Pos] tick-pipe re-eval failed for #${w.state.vehicleNumber}: ${err.message}`);
+      }
+    }
+  }
+  return addedTotal;
+}
+
 async function poll() {
   if (watches.size === 0) return; // nothing to watch — skip fetch (cost = 0)
 
@@ -3412,6 +3480,11 @@ async function poll() {
   // any deliberate delay would cost real positions during a 20+/s burst.
   const fireBatch = [];
 
+  // Still-waiting drivers collected for the tick-pipe pass (MONITOR_TICK_PIPE_LEAD):
+  // after the loop they are re-evaluated with this tick's fire batch counted
+  // into inflight — see runTickPipePass.
+  const tickPipeWaiters = [];
+
   // Borrowed-probe candidates: waiting drivers whose target is still far above
   // the tail (safe to lend as probes). Collected here, reconciled after the loop.
   const borrowCandidates = [];
@@ -3541,6 +3614,20 @@ async function poll() {
           });
         }
 
+        // Tick-pipe candidate: still genuinely waiting this tick — re-evaluated
+        // after the loop with the same-tick fire batch counted into inflight.
+        if (
+          TICK_PIPE_LEAD &&
+          decision.action === 'wait' &&
+          decision.reason !== 'awaiting_overnight_purge'
+        ) {
+          tickPipeWaiters.push({
+            driverId,
+            state,
+            target: decision.metrics?.targetPosition ?? Infinity,
+          });
+        }
+
         // Borrowed-probe candidate: a genuinely-waiting driver whose real fire is
         // still far enough away — by the rate-aware retire buffer — that we can
         // ALWAYS hand them back and re-arm before it. Never carryovers (already
@@ -3648,6 +3735,12 @@ async function poll() {
     }
   }
 
+  // ─── Tick-pipe pass: count the same-tick batch into the lead ──────────────
+  // Only engages when this tick actually fired something (a leap tick). Fires
+  // it adds join fireBatch before the sort, so the batch still launches in
+  // target order with the added fires exactly where their targets place them.
+  runTickPipePass(fireBatch, tickPipeWaiters, decisionCtx);
+
   // ─── Launch this tick's fires, most-overdue target first ──────────────────
   // triggerPositionSchedule claims the armed session in its first synchronous
   // slice (before any await), so every claim below still lands ahead of this
@@ -3703,7 +3796,13 @@ async function poll() {
   // botService.syncFireSessions, so calling it every tick is safe.
   if (PREARM_ENABLED) {
     try {
-      require('./botService').syncFireSessions(prearmWanted)
+      // A tick-pipe fire can promote a driver out of this tick's wanted set
+      // after it was collected (wait → fire in the same tick) — drop them so
+      // sync doesn't re-arm a session the launch just claimed.
+      const stillWanted = prearmWanted.filter(
+        (w) => !watches.get(w.driverId)?.positionFiredToday,
+      );
+      require('./botService').syncFireSessions(stillWanted)
         .catch((err) => console.error('[Arm] sync failed:', err.message));
     } catch (err) {
       console.error('[Arm] botService unavailable:', err.message);
@@ -4701,6 +4800,7 @@ module.exports = {
   _expectedNextPollMs:        expectedNextPollMs,
   _onsetStep:                 onsetStep,
   _onsetCapNow:               onsetCapNow,
+  _runTickPipePass:           runTickPipePass,
   _onsetBacklogBoost:         onsetBacklogBoost,
   _maybeFlagUnderRescue:      maybeFlagUnderRescue,
   _carryoverClearStep:        carryoverClearStep,

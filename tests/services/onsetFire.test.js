@@ -115,6 +115,20 @@ describe('dynamic calm-guard cap (onsetCapNow)', () => {
     expect(_onsetCapNow(st)).toBe(25);
   });
 
+  test('a multi-render ramp of small steps unlocks the full cap (08-16 signature)', () => {
+    // 08-16 live: the ramp arrived as +4,+6,+6 across ~12 s — no single step
+    // ≥ 7, so the legacy 2×max guard held the cap at 12 and the +21 leap one
+    // render later swallowed the whole shallow cohort (+26…+48). Cumulative
+    // evidence (MONITOR_ONSET_CUM, default on) reads the same ramp as Σ16 →
+    // 2×16 = 32 → full cap.
+    let st = _onsetStep(fresh(), { queue: 29, rate: 0.4, nowMs: T0 });
+    st = _onsetStep(st, { queue: 33, rate: 1.5, nowMs: T0 + 4000 });      // +4
+    st = _onsetStep(st, { queue: 39, rate: 2.0, nowMs: T0 + 8000 });      // +6
+    st = _onsetStep(st, { queue: 45, rate: 2.8, nowMs: T0 + 12000 });     // +6 → armed in zone
+    expect(st.active).toBe(true);
+    expect(_onsetCapNow(st)).toBe(25);                                     // Σ16 → 32 → clamped to CAP
+  });
+
   test('stale violence ages out of the cap window', () => {
     let st = _onsetStep(fresh(), { queue: 43, rate: 0.5, nowMs: T0 });
     st = _onsetStep(st, { queue: 56, rate: 3, nowMs: T0 + 5000 });        // +13

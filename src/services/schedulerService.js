@@ -8,8 +8,23 @@ const {
 } = require('./botService');
 const credentialLockout = require('./credentialLockoutService');
 
-// In-memory set prevents the same driver from running twice simultaneously
-const runningJobs = new Set();
+// In-memory map prevents the same driver from running twice simultaneously.
+// Value = acquisition timestamp (ms). A lock older than JOB_LOCK_TTL_MS is
+// treated as stale and reclaimable: a run that leaks its lock (e.g. a DB error
+// before the try/finally that releases it) must not blackhole the driver until
+// the next process restart — that is exactly what stranded cab 354 in Aug 2026.
+const runningJobs = new Map();
+const JOB_LOCK_TTL_MS = parseInt(process.env.JOB_LOCK_TTL_MS ?? '120000', 10);
+
+// True only while the driver's lock is held AND still fresh. A stale lock is
+// reported and treated as free so the caller reclaims it.
+function jobLockActive(jobKey) {
+  const heldSince = runningJobs.get(jobKey);
+  if (heldSince === undefined) return false;
+  if (Date.now() - heldSince < JOB_LOCK_TTL_MS) return true;
+  console.warn(`[Scheduler] ⚠️  Reclaiming stale job lock ${jobKey} — held ${Math.round((Date.now() - heldSince) / 1000)}s (prior run leaked it)`);
+  return false;
+}
 
 const MAX_CONCURRENT = parseInt(process.env.SCHEDULER_CONCURRENCY ?? '5', 10);
 const MAX_RETRIES    = 3;
@@ -106,7 +121,7 @@ async function runBotForDriver(driver, triggerType = 'scheduled', { armedShot = 
   const jobKey = `driver-${driver.id}`;
   const launchCold = coldGate ?? ((fn) => fn());
 
-  if (runningJobs.has(jobKey)) {
+  if (jobLockActive(jobKey)) {
     await disposeClaimedSession(armedShot, 'duplicate run skipped');
     console.log(`[Scheduler] Skipping ${driver.name} (${driver.vehicle_number}) — already running`);
     return;
@@ -132,18 +147,24 @@ async function runBotForDriver(driver, triggerType = 'scheduled', { armedShot = 
     return { success: false, error: msg, message: msg, durationMs: 0 };
   }
 
-  runningJobs.add(jobKey);
+  runningJobs.set(jobKey, Date.now());
 
-  const logId = await Log.create({
-    driver_id:    driver.id,
-    triggered_at: new Date(),
-    trigger_type: triggerType,
-    status:       'pending',
-  });
-
-  console.log(`[Scheduler] Starting bot for ${driver.name} (Vehicle: ${driver.vehicle_number})`);
-
+  // The pending Log.create and everything after it run INSIDE the try so the
+  // finally ALWAYS releases the lock. Aug 2026: this Log.create sat outside the
+  // try/finally, so when it rejected mid-storm (Postgres under load) the lock
+  // leaked and every later run for the driver was skipped as "already running"
+  // until the process restarted (cab 354, dead from Aug 16–20).
+  let logId;
   try {
+    logId = await Log.create({
+      driver_id:    driver.id,
+      triggered_at: new Date(),
+      trigger_type: triggerType,
+      status:       'pending',
+    });
+
+    console.log(`[Scheduler] Starting bot for ${driver.name} (Vehicle: ${driver.vehicle_number})`);
+
     const sanPassword = decrypt(driver.san_password);
     let result;
 
@@ -216,7 +237,8 @@ async function runBotForDriver(driver, triggerType = 'scheduled', { armedShot = 
     // Idempotent — a no-op when fireClaimedSession already consumed the shot.
     await disposeClaimedSession(armedShot, 'bot run threw before firing');
     const friendly = sanitizeError(err.message);
-    await Log.update(logId, { status: 'failed', error_message: friendly });
+    // logId is undefined if the pending Log.create itself threw — nothing to update.
+    if (logId) await Log.update(logId, { status: 'failed', error_message: friendly });
     console.error(`[Scheduler] ✗ ${driver.name} → Unexpected error: ${err.message}`);
     return { success: false, error: friendly };
   } finally {
@@ -311,22 +333,25 @@ function startScheduler() {
 async function runRemoveBotForDriver(driver, triggerType = 'manual_remove') {
   const jobKey = `driver-${driver.id}`;
 
-  if (runningJobs.has(jobKey)) {
+  if (jobLockActive(jobKey)) {
     console.log(`[Scheduler] (remove) Skipping ${driver.name} (${driver.vehicle_number}) — bot already running`);
     return { success: false, error: 'Another bot is already running for this driver' };
   }
-  runningJobs.add(jobKey);
+  runningJobs.set(jobKey, Date.now());
 
-  const logId = await Log.create({
-    driver_id:    driver.id,
-    triggered_at: new Date(),
-    trigger_type: triggerType,
-    status:       'pending',
-  });
-
-  console.log(`[Scheduler] (remove) Starting bot for ${driver.name} (Vehicle: ${driver.vehicle_number})`);
-
+  // Pending Log.create runs inside the try so the finally always releases the
+  // lock even if it rejects (see runBotForDriver for the leak this prevents).
+  let logId;
   try {
+    logId = await Log.create({
+      driver_id:    driver.id,
+      triggered_at: new Date(),
+      trigger_type: triggerType,
+      status:       'pending',
+    });
+
+    console.log(`[Scheduler] (remove) Starting bot for ${driver.name} (Vehicle: ${driver.vehicle_number})`);
+
     const sanPassword = decrypt(driver.san_password);
     const result = await removeFromQueue(driver.san_username, sanPassword, driver.vehicle_number);
 
@@ -349,7 +374,7 @@ async function runRemoveBotForDriver(driver, triggerType = 'manual_remove') {
     return result;
   } catch (err) {
     const friendly = sanitizeError(err.message);
-    await Log.update(logId, { status: 'failed', error_message: friendly });
+    if (logId) await Log.update(logId, { status: 'failed', error_message: friendly });
     console.error(`[Scheduler] (remove) ✗ ${driver.name} → Unexpected error: ${err.message}`);
     return { success: false, error: friendly };
   } finally {

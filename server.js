@@ -31,6 +31,12 @@ app.use(helmet({
     directives: {
       defaultSrc: ["'self'"],
       scriptSrc:  ["'self'", "'unsafe-inline'"],
+      // Inline event-handler attributes (onclick=…). Helmet's defaults set
+      // script-src-attr to 'none', which blocks them EVEN WHEN script-src
+      // allows 'unsafe-inline' — that silently broke the admin's inline
+      // onclick buttons (e.g. Monitor "Stop Watching"). Allow them explicitly,
+      // matching the scriptSrc posture above.
+      scriptSrcAttr: ["'unsafe-inline'"],
       styleSrc:   ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
       fontSrc:    ["'self'", 'https://fonts.gstatic.com'],
       imgSrc:     ["'self'", 'data:'],

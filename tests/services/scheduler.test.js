@@ -253,4 +253,29 @@ describe('duplicate-run guard', () => {
     const logs = await db('logs').where({ driver_id: driver.id });
     expect(logs).toHaveLength(1);
   });
+
+  test('a run whose pending Log.create rejects releases the lock (regression: cab-354 leak, Aug 2026)', async () => {
+    // Aug 2026: runBotForDriver's pending Log.create sat OUTSIDE the try/finally.
+    // A single rejection here (Postgres blip mid-storm) left the driver's
+    // in-memory lock stuck "held" forever, so every later run was skipped as
+    // "already running" until the process restarted — cab 354 was dead for days.
+    const Log = require('../../src/models/Log');
+    const driver = await createDriver();
+
+    // Run 1: the pending Log.create rejects. The error must be CAUGHT (not
+    // thrown out of the function) and the lock released in the finally.
+    const createSpy = jest.spyOn(Log, 'create')
+      .mockRejectedValueOnce(new Error('PG connection lost (simulated storm blip)'));
+    const r1 = await runBotForDriver(driver, 'position_schedule');
+    expect(r1).toBeDefined();
+    expect(r1.success).toBe(false);
+    createSpy.mockRestore();
+
+    // Run 2: because the lock was released, this must actually RUN — not be
+    // skipped as "already running" (which returns undefined).
+    addToQueue.mockResolvedValueOnce({ success: true, alreadyQueued: false, position: 5, durationMs: 10 });
+    const r2 = await runBotForDriver(driver, 'position_schedule');
+    expect(r2).toBeDefined();
+    expect(r2.success).toBe(true);
+  });
 });

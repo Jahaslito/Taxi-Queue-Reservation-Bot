@@ -249,20 +249,58 @@ const PRED_LEAD_HARD_FLOOR = parseInt(process.env.MONITOR_PRED_LEAD_HARD_FLOOR ?
 // Unchanged from the pre-2026-08-11 guarantee (−30) — the band-only loosening
 // must not silently weaken the deep-target contract.
 const PRED_LEAD_OUTER_FLOOR = parseInt(process.env.MONITOR_PRED_LEAD_OUTER_FLOOR ?? '30', 10);
-// Tick-pipe lead (MONITOR_TICK_PIPE_LEAD, default on, '0' kills): every decision
-// in a poll tick reads ONE currentInflight snapshot, taken before any of that
-// tick's own fires clicked — so the inflight-scaled lead never sees the very
-// batch each fire is about to stand behind. 08-16 forensics: all 42 fires of the
-// onset-leap batch read inflight 26 and got the same ~41 lead while the true
-// pipe the k-th joined was 26+k; the whole batch landed a uniform +26…+48
-// (median +35). SAN appends in click-arrival order, so a fire behind k of our
-// own uncommitted adds lands ≥ k past its click queue BY CONSTRUCTION — the
-// same-tick batch is GUARANTEED drift, not a forecast. The tick-pipe pass (see
-// runTickPipePass) re-evaluates the tick's still-waiting drivers with the batch
-// counted into inflight, lowest target first. Undershoot-safe: the added lead is
-// backed 1:1 by already-clicked adds, and the displayed-queue hard floor above
-// still gates every fire, so the −(FLOOR−1) guarantee is untouched.
-const TICK_PIPE_LEAD = String(process.env.MONITOR_TICK_PIPE_LEAD ?? '1') !== '0';
+// Tick-pipe lead (MONITOR_TICK_PIPE_LEAD, default OFF, '1' enables): the pass
+// (see runTickPipePass) re-evaluates the tick's still-waiting drivers with the
+// same-tick fire batch counted into inflight, lowest target first — built to
+// close the one-snapshot-inflight blind spot (08-16: all 42 leap-tick fires
+// read inflight 26 while the k-th actually joined a pipe of 26+k, landing a
+// uniform +26…+48). FALSIFIED LIVE 08-21/08-22, the two worst days recorded
+// (±10 = 5% and 2%): on a queue leap the pass is a positive-feedback loop —
+// each recruited fire grows the pipe, which grows the lead, which unlocks
+// deeper targets in the SAME tick, until the roster is exhausted (104 and 92
+// fires in one second). The recruitment also doubles everyone's commit latency
+// (inflight ~100 vs ~40), so even the fires it does NOT recruit land +35-58.
+// The fixpoint IS the full-roster batch — retuning the cap cannot fix it.
+// Default OFF restores the 08-15 regime (74% ±10 live, leap days ~11-32%).
+const TICK_PIPE_LEAD = String(process.env.MONITOR_TICK_PIPE_LEAD ?? '0') === '1';
+// Pre-onset ladder (MONITOR_LADDER: '1' live [default], 'shadow' log-only,
+// '0' kills): place drivers BEFORE the avalanche instead of firing into it.
+// Why: the storm window physically cannot absorb the roster — SAN commits
+// accurately at ~0.4 adds/s while the display sweeps the 70-199 band in ~25s,
+// so any estimator that waits for the leap fires 70-100 thresholds in one tick
+// (08-21: 104 fires/1s, ±10 = 5%; 08-22: 92 fires/1s, ±10 = 2%). The calm
+// mornings that DID hit 74% (08-15) worked because the pre-dawn crawl walked
+// the queue through our targets one by one — an emergent ladder: each of our
+// own commits raises the queue by 1, unlocking the next target. On 08-21/22
+// the leap arrived at queue 28-29, BELOW the first target (~40), so the chain
+// never ignited. This rule ignites and sustains it deliberately: in the calm
+// pre-onset window, fire any driver whose target is within LADDER_GAP of the
+// effective queue. Undershoot bound BY CONSTRUCTION: landing ≥ effectiveQueue
+// + 1 ≥ target − LADDER_GAP + 1 = target − 10 at the default gap 11 — i.e.
+// every ladder fire lands inside the ±10 band on the undershoot side, and calm
+// commits (~5s, inflight ≤ tick cap) bound the overshoot side at ~−4. Ladder
+// sim on the real 08-22 roster (113 targets, queue start 29): 85-96 drivers
+// placed pre-storm, queue raised to 122-144 by our own adds with only 10-20
+// positions of external trickle; the storm then faces a residue of ~20 instead
+// of the whole roster. Serialized LADDER_TICK_MAX/tick so the chain climbs at
+// SAN's accurate pace and stays below every storm trigger (onset step ≥5,
+// onset rate ≥1.2/s, pred-lead move ≥0.5/s). Gates: burst window AND wall
+// clock ≥ LADDER_AFTER (PT), no active onset, observed velocity < MAX_VEL
+// (a real storm outruns the ladder instantly and the storm machinery owns the
+// tick), and the hard undershoot floor still applies on the DISPLAYED queue,
+// so a probe over-read during a display freeze holds the fire.
+const LADDER_MODE      = String(process.env.MONITOR_LADDER ?? '1');
+const LADDER_LIVE      = LADDER_MODE === '1';
+const LADDER_SHADOW    = LADDER_MODE === 'shadow';
+const LADDER_GAP       = parseInt(process.env.MONITOR_LADDER_GAP ?? '11', 10);
+const LADDER_TICK_MAX  = parseInt(process.env.MONITOR_LADDER_TICK_MAX ?? '2', 10);
+const LADDER_MAX_VEL   = parseFloat(process.env.MONITOR_LADDER_MAX_VEL ?? '0.5');
+// "HH:MM" PT — the ladder never fires before this wall-clock time. Default
+// 03:30 gives ~30-90 min of calm runway before observed storm starts
+// (04:01-05:09 range) while staying inside the 3-8 burst window.
+const LADDER_AFTER_PT  = String(process.env.MONITOR_LADDER_AFTER ?? '03:30');
+const LADDER_AFTER_MIN = (([h, m]) =>
+  (parseInt(h, 10) % 24) * 60 + (parseInt(m, 10) || 0))(LADDER_AFTER_PT.split(':'));
 // Pre-armed fire sessions: park a logged-in page on SAN's "Add To Queue"
 // screen for every driver whose fire is near, so the fire itself is a ~1 s
 // click instead of a ~3.5 s Chromium launch (see botService "Pre-armed fire
@@ -929,6 +967,12 @@ const BIAS_REFRESH_EVERY = 20;    // recalculate bias every N poll ticks
 // (see FLEET_PROBE_ENABLED). Updated only from confirmed tail-joins so it can't
 // be poisoned by re-adds / already-queued / failed rows.
 let lastFleetLanding   = { position: 0, atMs: 0 };
+// Timestamp of the last ladder fire this process dispatched (MONITOR_LADDER).
+// While the chain is actively climbing (a ladder fire within the last 30s) and
+// the queue motion is still chain-sized (< 1.0/s — a real storm is faster),
+// the predictive band lead stays suppressed so our own chain's render steps
+// can't masquerade as storm velocity and fire band drivers 20 deep.
+let ladderLastFireMs   = 0;
 
 // ─── Storm-onset tracker (MONITOR_ONSET_FIRE) ────────────────────────────────
 // One instance per process, advanced once per poll tick with that tick's queue
@@ -2312,6 +2356,7 @@ function evaluatePositionScheduler(state, ctx) {
     onsetMidCap             = ONSET_MID_CAP,
     observedVelocity        = 0,
     currentInflight         = 0,
+    ladderWindowOpen        = false,
   } = ctx;
 
   // Inactive drivers have no business being scheduled. isActive is synced to the
@@ -2466,9 +2511,16 @@ function evaluatePositionScheduler(state, ctx) {
   // property is the one that matters: projectedLanding = effectiveQueue + lead
   // stays a genuine landing estimate, so the fire rail (≥ target) and the
   // past-max rail (> max) both remain correct.
+  // Ladder-chain suppression: our own serialized chain moves the display at
+  // ~0.2-0.4/s, which can graze the 0.5/s move gate over the 8s velocity
+  // window. Velocity ≥ 1.0/s is beyond what the chain can produce (≤ 2 fires
+  // per tick, ~5s commits) — that is a genuine storm and pred-lead resumes.
+  const ladderChainActive = Date.now() - ladderLastFireMs < 30_000
+    && observedVelocity < 1.0;
   const predLeadActive = PREDICTIVE_LEAD && inBurstWindow
     && effectivePosition >= PRED_LEAD_MIN_TARGET
-    && effectivePosition <= PRED_LEAD_MAX_TARGET;
+    && effectivePosition <= PRED_LEAD_MAX_TARGET
+    && !ladderChainActive;
   // Inside the avalanche band, once the queue is genuinely moving, SIZE the lead
   // to the drift we can predict at click time from INFLIGHT:
   //   D = clamp(PRED_DRIFT_INTERCEPT + PRED_DRIFT_SLOPE·inflight, FLOOR, CAP)
@@ -2574,6 +2626,20 @@ function evaluatePositionScheduler(state, ctx) {
   const onsetEligible = (ONSET_FIRE_LIVE || ONSET_FIRE_SHADOW)
     && onsetActive && onsetGap > 0 && onsetGap <= onsetAllow;
 
+  // ─── Pre-onset ladder (MONITOR_LADDER — see the constant block) ────────────
+  // Same gap as the onset rule (target − effectiveQueue) but the OPPOSITE
+  // regime gate: the ladder only runs while the morning is still calm (no
+  // onset, velocity under the storm gates) inside its wall-clock window. The
+  // moment real storm evidence appears, onsetActive/velocity flip and the
+  // storm machinery owns every subsequent fire. Landing bound: ≥ effectiveQueue
+  // + 1 ≥ target − LADDER_GAP + 1 — in-band on the undershoot side by
+  // construction at the default gap.
+  const ladderEligible = (LADDER_LIVE || LADDER_SHADOW)
+    && ladderWindowOpen
+    && !onsetActive
+    && observedVelocity < LADDER_MAX_VEL
+    && onsetGap > 0 && onsetGap <= LADDER_GAP;
+
   // ─── HARD UNDERSHOOT FLOOR (gated targets — the −30 guarantee) ────────────
   // Never let ANY fire path (predictive lead OR onset OR fleet-probe) place a
   // gated driver while the DISPLAYED queue is still more than the floor below
@@ -2599,7 +2665,9 @@ function evaluatePositionScheduler(state, ctx) {
 
   const projectionReached = projectedLanding >= effectivePosition;
   const shouldFire        = !hardFloorHold
-    && (projectionReached || (ONSET_FIRE_LIVE && onsetEligible));
+    && (projectionReached
+        || (ONSET_FIRE_LIVE && onsetEligible)
+        || (LADDER_LIVE && ladderEligible));
 
   // secondsUntilFire drives adaptive polling — how soon do we expect to fire?
   // Negative projection (already past target) → 0; no growth → Infinity.
@@ -2609,16 +2677,24 @@ function evaluatePositionScheduler(state, ctx) {
     : (positionsUntilFire <= 0 ? 0 : Infinity);
 
   if (shouldFire) {
-    const onsetOnly = !projectionReached; // fired by the onset rule alone
+    // Early-fire attribution: onset outranks ladder in the label (both are
+    // gap-rules with the same landing bound; onset implies a storm is live).
+    const onsetOnly  = !projectionReached && ONSET_FIRE_LIVE && onsetEligible;
+    const ladderOnly = !projectionReached && !onsetOnly;
     return {
       action:  'fire',
-      reason:  onsetOnly ? 'onset_early_fire' : 'projection_reached_target',
+      reason:  onsetOnly ? 'onset_early_fire'
+             : ladderOnly ? 'ladder_fire'
+             : 'projection_reached_target',
       effectivePosition,
       maxAcceptable,
-      secondsUntilFire: onsetOnly ? 0 : secondsUntilFire,
+      secondsUntilFire: (onsetOnly || ladderOnly) ? 0 : secondsUntilFire,
       logLine: onsetOnly
         ? `[Pos] ${veh} — ⚡ ONSET early fire: queue ${effectiveQueue}${probeNote}, target ${effectivePosition} ` +
           `(early by ${onsetGap} ≤ cap ${onsetAllow}, rate ${effectiveGrowthRate.toFixed(2)}/s) — firing before the chunk`
+        : ladderOnly
+        ? `[Pos] ${veh} — 🪜 LADDER fire: queue ${effectiveQueue}${probeNote}, target ${effectivePosition} ` +
+          `(gap ${onsetGap} ≤ ${LADDER_GAP}, calm v${observedVelocity.toFixed(2)}/s) — placing ahead of the storm`
         : `[Pos] ${veh} — ✓ queue ${effectiveQueue}${probeNote} + lead ${Number.isInteger(lead) ? lead : lead.toFixed(1)}` +
           `${leadNote ? leadNote : ` (drift ${estimatedDrift}${biasCorrection !== 0 ? ` + bias ${biasCorrection.toFixed(1)}` : ''})`} ` +
           `= ${projectedLanding.toFixed(1)} ≥ target ${effectivePosition} ` +
@@ -2628,7 +2704,7 @@ function evaluatePositionScheduler(state, ctx) {
       fireOpts: {
         growthRate:            effectiveGrowthRate,
         estimatedDrift,
-        predictedLanding:      onsetOnly ? effectiveQueue + 1 : Math.round(projectedLanding),
+        predictedLanding:      (onsetOnly || ladderOnly) ? effectiveQueue + 1 : Math.round(projectedLanding),
         maxAcceptablePosition: maxAcceptable,
       },
     };
@@ -2637,9 +2713,11 @@ function evaluatePositionScheduler(state, ctx) {
   // ─── Wait ─────────────────────────────────────────────────────────────────
   // Shadow mode: the onset rule WOULD have fired here — log it so a shadow
   // morning can be replayed against actual landings before going live.
-  const shadowNote = ONSET_FIRE_SHADOW && onsetEligible
+  const shadowNote = (ONSET_FIRE_SHADOW && onsetEligible
     ? ` [ONSET-SHADOW: would fire early by ${onsetGap} ≤ cap ${onsetAllow}]`
-    : '';
+    : '') + (LADDER_SHADOW && ladderEligible
+    ? ` [LADDER-SHADOW: would fire at gap ${onsetGap} ≤ ${LADDER_GAP}]`
+    : '');
   return {
     action:  'wait',
     reason:  'projected_below_target',
@@ -3455,6 +3533,9 @@ async function poll() {
     // pass their own ctx) never pull in Playwright.
     observedVelocity:        observedVelocity(Date.now()),
     currentInflight:         (() => { try { return require('./botService').currentInflight(); } catch { return 0; } })(),
+    // Pre-onset ladder window (MONITOR_LADDER): burst window AND past the
+    // wall-clock floor. Computed once per tick — same clock as prearm.
+    ladderWindowOpen:        inBurstWindow && currentMinutesPT() >= LADDER_AFTER_MIN,
   };
 
   // Track the soonest fire across all armed drivers — drives adaptive polling.
@@ -3479,6 +3560,12 @@ async function poll() {
   // inequality). No stagger: initiation order alone orders the WS frames, and
   // any deliberate delay would cost real positions during a 20+/s burst.
   const fireBatch = [];
+  // Ladder fires dispatched this tick (MONITOR_LADDER): serialized to
+  // LADDER_TICK_MAX so the chain climbs at SAN's accurate-commit pace and its
+  // display motion stays below every storm trigger. A deferred driver simply
+  // stays 'watching' and re-evaluates next tick with the queue already risen
+  // by this tick's commits.
+  let ladderFiresThisTick = 0;
 
   // Still-waiting drivers collected for the tick-pipe pass (MONITOR_TICK_PIPE_LEAD):
   // after the loop they are re-evaluated with this tick's fire batch counted
@@ -3710,6 +3797,16 @@ async function poll() {
       }
 
       case 'fire':
+        // Ladder serialization (see ladderFiresThisTick above): over-cap ladder
+        // fires defer to the next tick without marking the driver fired.
+        if (decision.reason === 'ladder_fire') {
+          if (ladderFiresThisTick >= LADDER_TICK_MAX) {
+            console.log(`[Pos] #${state.vehicleNumber} — 🪜 ladder deferred to next tick (cap ${LADDER_TICK_MAX}/tick)`);
+            break;
+          }
+          ladderFiresThisTick++;
+          ladderLastFireMs = Date.now();
+        }
         console.log(decision.logLine);
         state.positionFiredToday = true; // mark before enqueuing — prevents double-trigger
         // Collected, not triggered: same-tick fires are launched together after
@@ -4801,6 +4898,7 @@ module.exports = {
   _onsetStep:                 onsetStep,
   _onsetCapNow:               onsetCapNow,
   _runTickPipePass:           runTickPipePass,
+  _setLadderLastFireMs:       (ms) => { ladderLastFireMs = ms; },
   _onsetBacklogBoost:         onsetBacklogBoost,
   _maybeFlagUnderRescue:      maybeFlagUnderRescue,
   _carryoverClearStep:        carryoverClearStep,

@@ -23,6 +23,8 @@ const RE_TS   = /\[(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2}):(\d{2}) PT\]/;
 const RE_FIRE = /\[Pos\] #(\S+) — ✓ queue (\d+) \+ lead [\d.]+.*?≥ target (\d+) \(/;
 // Storm-onset early fires (MONITOR_ONSET_FIRE) — a fire like any other.
 const RE_ONSET = /\[Pos\] #(\S+) — ⚡ ONSET early fire: queue (\d+).*?target (\d+)/;
+// Pre-onset ladder fires (MONITOR_LADDER) — a fire like any other.
+const RE_LADDER = /\[Pos\] #(\S+) — 🪜 LADDER fire: queue (\d+).*?target (\d+)/;
 // Armed path = confirmed armed click OR a verify-recovered timeout (the add
 // was committed by the armed click; SAN was just slow streaming the WAIT
 // screen back — NOT a cold fire). The fast-release form (BOT_FIRE_RELEASE_MS,
@@ -53,7 +55,7 @@ for (const path of process.argv.slice(2)) {
     if (!ts) continue;
     day = ts[1];
     let m;
-    if ((m = RE_FIRE.exec(line)) || (m = RE_ONSET.exec(line))) {
+    if ((m = RE_FIRE.exec(line)) || (m = RE_ONSET.exec(line)) || (m = RE_LADDER.exec(line))) {
       fires.push({ veh: m[1], t: secs(ts), q: +m[2], tgt: +m[3] });
     } else if ((m = RE_LAND.exec(line))) {
       if (!lands.has(m[1])) lands.set(m[1], []);

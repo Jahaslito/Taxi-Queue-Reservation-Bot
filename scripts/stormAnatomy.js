@@ -6,6 +6,7 @@ const fs = require('fs');
 const RE_TS   = /\[(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2}):(\d{2}) PT\]/;
 const RE_FIRE = /\[Pos\] #(\S+) — ✓ queue (\d+) \+ lead ([\d.]+)(.*?)≥ target (\d+) \(/;
 const RE_ONSET= /\[Pos\] #(\S+) — ⚡ ONSET early fire: queue (\d+).*?target (\d+)/;
+const RE_LADR = /\[Pos\] #(\S+) — 🪜 LADDER fire: queue (\d+).*?target (\d+)/;
 const RE_FAST = /\[Arm\] ⚡ #(\S+) fast-released at \d+ ms, add COMMITTED → position (\d+) \(.*?, (\d+) ms total\)/;
 const RE_LAND = /\[PosTracking\] #(\S+) landed at (\d+)/;
 const RE_PRED = /\[pred-lead (\d+) = clamp\([\d.]+\+[\d.]+×(\d+) inflight/;
@@ -26,6 +27,8 @@ for (const path of process.argv.slice(2)) {
                    pred: !!pm, inflight: pm ? +pm[2] : null, clamped: /lead clamped/.test(line) });
     } else if ((m = RE_ONSET.exec(line))) {
       fires.push({ veh: m[1], t: secs(ts), q: +m[2], lead: 0, tgt: +m[3], pred: false, inflight: null, clamped: false, onset: true });
+    } else if ((m = RE_LADR.exec(line))) {
+      fires.push({ veh: m[1], t: secs(ts), q: +m[2], lead: 0, tgt: +m[3], pred: false, inflight: null, clamped: false, ladder: true });
     } else if ((m = RE_FAST.exec(line))) {
       if (!commits.has(m[1])) commits.set(m[1], []);
       commits.get(m[1]).push({ t: secs(ts), pos: +m[2], ms: +m[3] });
@@ -76,7 +79,7 @@ for (const path of process.argv.slice(2)) {
   console.log(`  batch: max fires/2s = ${batchSizes[0]}, top5 = [${batchSizes.slice(0,5)}], fires in first 60s of storm = ${first60}`);
   // error split: pred vs clamped vs rest
   const grp = (rs) => rs.length ? `n=${rs.length} p50=${qtl(rs.map(r=>r.err),.5)} max=${Math.max(...rs.map(r=>r.err))}` : 'n=0';
-  console.log(`  err by path — pred: ${grp(predRows)} | clamped(flat≤10): ${grp(clampedRows)} | other: ${grp(rows.filter(r=>!r.pred&&!r.clamped))}`);
+  console.log(`  err by path — pred: ${grp(predRows)} | clamped(flat≤10): ${grp(clampedRows)} | ladder: ${grp(rows.filter(r=>r.ladder))} | other: ${grp(rows.filter(r=>!r.pred&&!r.clamped&&!r.ladder))}`);
   // shallow vs band targets
   const shallow = rows.filter(r=>r.tgt<70), band = rows.filter(r=>r.tgt>=70&&r.tgt<200), deep = rows.filter(r=>r.tgt>=200);
   const bd = (rs)=> rs.length? `n=${rs.length} ±10=${(100*rs.filter(r=>Math.abs(r.err)<=10).length/rs.length).toFixed(0)}% p50=${qtl(rs.map(r=>r.err),.5)}` : 'n=0';

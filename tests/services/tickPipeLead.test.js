@@ -16,6 +16,7 @@
  * test its own copy.
  */
 
+process.env.MONITOR_TICK_PIPE_LEAD       = '1'; // default is OFF since 08-22 — these tests exercise the mechanism
 process.env.MONITOR_PREDICTIVE_LEAD      = '1';
 process.env.MONITOR_PRED_DRIFT_INTERCEPT = '19';
 process.env.MONITOR_PRED_DRIFT_SLOPE     = '0.86';

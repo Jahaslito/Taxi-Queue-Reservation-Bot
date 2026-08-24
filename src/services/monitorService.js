@@ -301,6 +301,75 @@ const LADDER_MAX_VEL   = parseFloat(process.env.MONITOR_LADDER_MAX_VEL ?? '0.5')
 const LADDER_AFTER_PT  = String(process.env.MONITOR_LADDER_AFTER ?? '03:30');
 const LADDER_AFTER_MIN = (([h, m]) =>
   (parseInt(h, 10) % 24) * 60 + (parseInt(m, 10) || 0))(LADDER_AFTER_PT.split(':'));
+// Ladder SEED tier (08-23): the gap-11 chain assumes a pre-dawn crawl reaches
+// within 11 of the first target. 08-23 falsified that assumption — the queue
+// sat at 0-9 until 05:15 (first target ~50), the chain had nothing to ignite
+// from, and the whole roster was still waiting when the leap hit. The seed
+// tier breaks that stall by spending the operator's declared undershoot
+// budget: when the chain has no in-band rung to fire and nothing in flight,
+// fire the SINGLE lowest-target waiting driver whose gap ≤ LADDER_SEED_GAP —
+// one per tick, so seeds land ascending and each raises the queue toward the
+// next. Landing bound: ≥ effectiveQueue+1 ≥ target − SEED_GAP + 1. On a
+// crawl morning (queue ~25, first target 40) seeds land −14…−2 and tighten as
+// the chain takes over; on an empty morning (08-23: queue 5, targets 50+)
+// they land deep (−40…−64) — bounded, ZERO overshoot, vs the wall's +45…+85.
+// SEED_GAP defaults to the band undershoot floor (MONITOR_PRED_LEAD_HARD_FLOOR)
+// so the operator's single "undershoot budget" knob governs both; 0 disables.
+// SCOPED LIKE THE FLOOR ITSELF: the full budget applies ONLY to targets inside
+// the avalanche band [PRED_LEAD_MIN_TARGET, PRED_LEAD_MAX_TARGET] (70-199).
+// Shallow (<70) and deep (≥200) targets seed at most LADDER_SEED_SHALLOW (29,
+// the onset-cap precedent — worst landing −28, inside the original −30
+// contract), so a target-50 driver can never be seeded to position ~2.
+const LADDER_SEED_GAP = (() => {
+  const v = parseInt(process.env.MONITOR_LADDER_SEED_GAP ?? '', 10);
+  return Number.isFinite(v) ? v : PRED_LEAD_HARD_FLOOR;
+})();
+const LADDER_SEED_SHALLOW = parseInt(process.env.MONITOR_LADDER_SEED_SHALLOW ?? '29', 10);
+// Seed GROWTH gate (2026-08-24, per operator: "if it is calm the undershoot
+// should be minimal — the early shoot must be informed by how the list is
+// growing, not fire just because a target is in range"). The seed tier spends
+// deep undershoot ONLY when the list is genuinely building toward a storm, and
+// scales the depth it may spend with how much it has grown:
+//   • SEED_MIN_RISE (8): net positions the queue must have climbed over the
+//     window before ANY seed fires. Dead calm nets ~0 ⇒ gate shut ⇒ those
+//     drivers wait and land accurate (the gap-11 chain still runs, −4…−10).
+//   • SEED_RISE_WINDOW_S (150): the trailing window sustainedRise() measures
+//     over — long enough that jitter can't fake a sustained climb.
+//   • SEED_GAP_PER_RISE (3): allowed seed depth = rise × this, clamped to the
+//     scoped budget. A gentle ramp (rise 8) unlocks only ~24 positions of
+//     undershoot; a strong build (rise ≥ 22) unlocks the full band budget.
+// So calm ⇒ zero seed undershoot; the depth grows only as fast as the list does.
+const LADDER_SEED_MIN_RISE    = parseInt(process.env.MONITOR_LADDER_SEED_MIN_RISE ?? '8', 10);
+const SEED_RISE_WINDOW_S      = parseInt(process.env.MONITOR_LADDER_SEED_WINDOW ?? '150', 10);
+const LADDER_SEED_GAP_PER_RISE = parseFloat(process.env.MONITOR_LADDER_SEED_GAP_PER_RISE ?? '3');
+const LADDER_SEED_AFTER_PT  = String(process.env.MONITOR_LADDER_SEED_AFTER ?? '03:45');
+const LADDER_SEED_AFTER_MIN = (([h, m]) =>
+  (parseInt(h, 10) % 24) * 60 + (parseInt(m, 10) || 0))(LADDER_SEED_AFTER_PT.split(':'));
+// ─── PROACTIVE seed ("be the onset" — MONITOR_LADDER_PROACTIVE) ───────────────
+// 2026-08-24 replay verdict: the growth-gated seed places almost nobody on a
+// leap-from-quiet storm (08-22/23), because the growth signal only appears
+// ~60s before the leap. The two operator asks — "informed by growth" and "be
+// the onset ourselves" — are in direct conflict: the growth gate can only JOIN
+// a visible build, never START one. This mode resolves it with a STRONGER
+// PRIOR than instantaneous growth: at this airport the avalanche hits inside a
+// known daily window (~04:00-05:30, see storm-dow-profile), so during that
+// window a storm is a near-certainty and pre-placing is justified WITHOUT a
+// growth signal. To keep "minimal undershoot unless justified", the allowed
+// depth RAMPS with the wall clock: shallow (≈ gap 11, near-accurate) at
+// _AFTER, widening linearly to the full scoped budget by _PEAK (the historical
+// storm time) — so a band driver is only placed deep as the leap becomes
+// imminent by the CLOCK. Still scoped (band vs shallow/deep), still serialized
+// (1/tick, inflight-gated), still yields the instant onset arms or velocity
+// spikes. Modes: '0' off (default), 'shadow' log-only (deploy-and-observe),
+// '1' live. The growth-gated seed keeps running underneath in every mode.
+const LADDER_PROACTIVE_MODE   = String(process.env.MONITOR_LADDER_PROACTIVE ?? '0');
+const LADDER_PROACTIVE_LIVE   = LADDER_PROACTIVE_MODE === '1';
+const LADDER_PROACTIVE_SHADOW = LADDER_PROACTIVE_MODE === 'shadow';
+const LADDER_PROACTIVE_AFTER_PT = String(process.env.MONITOR_LADDER_PROACTIVE_AFTER ?? '04:00');
+const LADDER_PROACTIVE_PEAK_PT  = String(process.env.MONITOR_LADDER_PROACTIVE_PEAK  ?? '05:10');
+const toMin = (s) => (([h, m]) => (parseInt(h, 10) % 24) * 60 + (parseInt(m, 10) || 0))(String(s).split(':'));
+const LADDER_PROACTIVE_AFTER_MIN = toMin(LADDER_PROACTIVE_AFTER_PT);
+const LADDER_PROACTIVE_PEAK_MIN  = toMin(LADDER_PROACTIVE_PEAK_PT);
 // Pre-armed fire sessions: park a logged-in page on SAN's "Add To Queue"
 // screen for every driver whose fire is near, so the fire itself is a ~1 s
 // click instead of a ~3.5 s Chromium launch (see botService "Pre-armed fire
@@ -1302,6 +1371,50 @@ function observedVelocity(nowMs) {
   const dt = (newest.t - base.t) / 1000;
   if (dt <= 0) return 0;
   return Math.min(Math.max(0, (newest.q - base.q) / dt), PRED_VEL_CAP);
+}
+
+// ─── Sustained-growth tracker (ladder SEED gate — MONITOR_LADDER_SEED_GAP) ────
+// The short PRED_VEL_WINDOW_S slope is too noisy to tell "the list is building
+// toward a storm" from dead-calm bouncing (08-23: queue jittered 3–10 for 15
+// min, then ramped 15→29 over ~90 s, then leapt). The seed tier must NOT spend
+// undershoot budget on proximity alone during that dead calm — it must be
+// informed by genuine growth. This buffer keeps a longer window (SEED window)
+// so sustainedRise() reports the NET positions the queue has climbed. A dead
+// morning nets ~0; a real ramp nets clearly positive well before the leap.
+// Cumulative count of OUR OWN ladder/seed adds — subtracted from the queue
+// before measuring rise (see below). Monotonic; the DIFFERENCE between two
+// samples is all sustainedRise uses, so it never needs a daily reset.
+let ladderAddsCommitted = 0;
+// Proactive-shadow walk (MONITOR_LADDER_PROACTIVE=shadow): drivers already
+// logged as "would proactively seed" today, so the shadow pass advances one per
+// tick through the roster instead of re-logging the lowest target forever.
+// Keyed by driverId; cleared when the PT date rolls over.
+let ladderShadowSeeded = new Set();
+let ladderShadowDay    = null;
+const seedQueueHistory = []; // [{ t, q, ours }], oldest first
+function recordSeedQueueObservation(count, atMs) {
+  seedQueueHistory.push({ t: atMs, q: count, ours: ladderAddsCommitted });
+  const cutoff = atMs - (SEED_RISE_WINDOW_S + 30) * 1000; // window + a little slack
+  while (seedQueueHistory.length > 2 && seedQueueHistory[0].t < cutoff) {
+    seedQueueHistory.shift();
+  }
+}
+// Net EXTERNAL queue rise (positions) over the last SEED_RISE_WINDOW_S: the raw
+// climb minus OUR OWN ladder/seed adds in the window. This is critical — the
+// displayed queue includes our committed seeds, so a raw rise would let our own
+// seeds re-open and deepen the gate: a slow-motion tick-pipe feedback loop that
+// would empty the band roster on a false-alarm morning. Subtracting our adds
+// makes the gate track genuine competitor/organic demand only. Signed — a flat
+// or our-adds-only climb returns ≤ 0, so the gate stays shut.
+function sustainedRise(nowMs) {
+  if (seedQueueHistory.length < 2) return 0;
+  const newest = seedQueueHistory[seedQueueHistory.length - 1];
+  const target = nowMs - SEED_RISE_WINDOW_S * 1000;
+  let base = seedQueueHistory[0];
+  for (const o of seedQueueHistory) { if (o.t <= target) base = o; else break; }
+  const rawRise  = newest.q - base.q;
+  const ourAdds  = newest.ours - base.ours;
+  return rawRise - ourAdds;
 }
 
 // ─── Adaptive polling (poll faster as drivers approach their fire window) ────
@@ -2357,6 +2470,11 @@ function evaluatePositionScheduler(state, ctx) {
     observedVelocity        = 0,
     currentInflight         = 0,
     ladderWindowOpen        = false,
+    seedWindowOpen          = false,
+    seedPromote             = false, // set only by runLadderSeedPass — widens the ladder gap to LADDER_SEED_GAP
+    seedRise                = 0,     // net queue rise over SEED_RISE_WINDOW_S — the growth signal the seed depth scales with
+    proactiveOpen           = false, // MONITOR_LADDER_PROACTIVE window is open (burst window + past _AFTER)
+    proactiveFrac           = 0,     // 0..1 ramp from _AFTER (shallow) to _PEAK (full budget)
   } = ctx;
 
   // Inactive drivers have no business being scheduled. isActive is synced to the
@@ -2634,11 +2752,54 @@ function evaluatePositionScheduler(state, ctx) {
   // storm machinery owns every subsequent fire. Landing bound: ≥ effectiveQueue
   // + 1 ≥ target − LADDER_GAP + 1 — in-band on the undershoot side by
   // construction at the default gap.
-  const ladderEligible = (LADDER_LIVE || LADDER_SHADOW)
-    && ladderWindowOpen
+  // Seed budget for THIS target (see LADDER_SEED_GAP): full budget only inside
+  // the avalanche band, the −30-contract cap everywhere else — a shallow
+  // target must never be seeded 40-60 under.
+  const seedBudget = (effectivePosition >= PRED_LEAD_MIN_TARGET
+      && effectivePosition <= PRED_LEAD_MAX_TARGET)
+    ? LADDER_SEED_GAP
+    : Math.min(LADDER_SEED_GAP, LADDER_SEED_SHALLOW);
+  // GROWTH-SCALED depth (see the SEED growth-gate block): the seed may spend
+  // undershoot only in proportion to how much the list has actually climbed.
+  // Dead calm ⇒ seedRise < MIN_RISE ⇒ growthAllow 0 ⇒ NO growth seed. As the
+  // ramp builds, the allowed depth grows with it, clamped to the scoped budget.
+  const seedGrowing = seedRise >= LADDER_SEED_MIN_RISE;
+  const growthAllow = seedGrowing
+    ? Math.min(seedBudget, Math.round(seedRise * LADDER_SEED_GAP_PER_RISE))
+    : 0;
+  // PROACTIVE-scaled depth (see the LADDER_PROACTIVE block): inside the daily
+  // storm window the allowed depth ramps with the CLOCK — shallow (gap 11+1) at
+  // _AFTER, full scoped budget by _PEAK — so a driver is placed deep only as the
+  // leap becomes imminent by time, no growth signal required.
+  const proactiveAllow = (proactiveOpen && (LADDER_PROACTIVE_LIVE || LADDER_PROACTIVE_SHADOW))
+    ? Math.min(seedBudget, Math.max(LADDER_GAP + 1,
+        Math.round(LADDER_GAP + (seedBudget - LADDER_GAP) * Math.min(1, Math.max(0, proactiveFrac)))))
+    : 0;
+  // Two allowances: what may actually FIRE (growth always fires; proactive fires
+  // only when LIVE), and the full FUNNEL incl. proactive-shadow (for log-only).
+  const seedFireAllow   = Math.max(growthAllow, LADDER_PROACTIVE_LIVE ? proactiveAllow : 0);
+  const seedFunnelAllow = Math.max(growthAllow, proactiveAllow);
+
+  const ladderGapAllow = seedPromote ? seedFireAllow : LADDER_GAP;
+  const ladderEligible = (LADDER_LIVE || LADDER_SHADOW || LADDER_PROACTIVE_LIVE)
+    && (seedPromote ? (seedWindowOpen && seedFireAllow > 0) : ladderWindowOpen)
     && !onsetActive
     && observedVelocity < LADDER_MAX_VEL
-    && onsetGap > 0 && onsetGap <= LADDER_GAP;
+    && onsetGap > 0 && onsetGap <= ladderGapAllow;
+
+  // Seed candidate (see LADDER_SEED_GAP): a waiting driver the gap-11 chain
+  // cannot reach but the seed budget can — via growth OR the proactive window.
+  // Not fired here — runLadderSeedPass (live) / runLadderSeedShadowPass (shadow)
+  // promotes ONE per tick, lowest target first, so seeds land ascending.
+  const seedModeOn = LADDER_LIVE || LADDER_PROACTIVE_LIVE || LADDER_PROACTIVE_SHADOW;
+  const seedInFunnel = !seedPromote
+    && seedModeOn && LADDER_SEED_GAP > 0
+    && seedWindowOpen
+    && !onsetActive
+    && observedVelocity < LADDER_MAX_VEL
+    && onsetGap > LADDER_GAP && onsetGap <= seedFunnelAllow;
+  const seedCandidate = seedInFunnel;            // in the funnel (may be shadow-only)
+  const seedCanFire   = seedInFunnel && onsetGap <= seedFireAllow; // fire-allowed this tick
 
   // ─── HARD UNDERSHOOT FLOOR (gated targets — the −30 guarantee) ────────────
   // Never let ANY fire path (predictive lead OR onset OR fleet-probe) place a
@@ -2693,8 +2854,8 @@ function evaluatePositionScheduler(state, ctx) {
         ? `[Pos] ${veh} — ⚡ ONSET early fire: queue ${effectiveQueue}${probeNote}, target ${effectivePosition} ` +
           `(early by ${onsetGap} ≤ cap ${onsetAllow}, rate ${effectiveGrowthRate.toFixed(2)}/s) — firing before the chunk`
         : ladderOnly
-        ? `[Pos] ${veh} — 🪜 LADDER fire: queue ${effectiveQueue}${probeNote}, target ${effectivePosition} ` +
-          `(gap ${onsetGap} ≤ ${LADDER_GAP}, calm v${observedVelocity.toFixed(2)}/s) — placing ahead of the storm`
+        ? `[Pos] ${veh} — 🪜 LADDER${seedPromote && proactiveOpen && growthAllow < onsetGap ? ' PROACTIVE' : ''} fire: queue ${effectiveQueue}${probeNote}, target ${effectivePosition} ` +
+          `(${seedPromote ? `seed gap ${onsetGap} ≤ ${ladderGapAllow} (rise +${seedRise}/${SEED_RISE_WINDOW_S}s, clock ${Math.round(Math.min(1,Math.max(0,proactiveFrac))*100)}%)` : `gap ${onsetGap} ≤ ${ladderGapAllow}`}, calm v${observedVelocity.toFixed(2)}/s) — placing ahead of the storm`
         : `[Pos] ${veh} — ✓ queue ${effectiveQueue}${probeNote} + lead ${Number.isInteger(lead) ? lead : lead.toFixed(1)}` +
           `${leadNote ? leadNote : ` (drift ${estimatedDrift}${biasCorrection !== 0 ? ` + bias ${biasCorrection.toFixed(1)}` : ''})`} ` +
           `= ${projectedLanding.toFixed(1)} ≥ target ${effectivePosition} ` +
@@ -2726,6 +2887,10 @@ function evaluatePositionScheduler(state, ctx) {
              `bias: ${biasCorrection.toFixed(1)}, projected: ${projectedLanding.toFixed(1)}${leadNote}, ` +
              `target: ${effectivePosition}, max: ${maxAcceptable}, ` +
              `secsToFire: ${Number.isFinite(secondsUntilFire) ? secondsUntilFire.toFixed(0) : '∞'})${hardFloorNote}${shadowNote}`,
+    seedCandidate,
+    seedCanFire,
+    seedProactiveOnly: seedCandidate && !seedCanFire, // in funnel via proactive-shadow depth only
+    effectiveQueueAtDecision: effectiveQueue,
     metrics: {
       ...baseMetrics,
       queueSize:        waitingCount,
@@ -2737,6 +2902,68 @@ function evaluatePositionScheduler(state, ctx) {
 }
 
 // ─── Core poll tick ──────────────────────────────────────────────────────────
+/**
+ * Ladder seed pass (MONITOR_LADDER_SEED_GAP — see the LADDER_SEED constant
+ * block). Runs after the decision loop on ticks where the gap-11 chain made no
+ * progress and nothing of ours is in flight: promotes exactly ONE still-waiting
+ * seed candidate, lowest target first, by re-evaluating it with seedPromote
+ * (which widens the ladder gap to the seed budget). One per tick + the
+ * inflight gate serialize seeds to SAN's accurate commit pace, and each commit
+ * raises the queue toward the next candidate. Mutates fireBatch and marks the
+ * fired state, mirroring runTickPipePass.
+ */
+function runLadderSeedPass(fireBatch, seedWaiters, decisionCtx, ladderFiresThisTick, evaluate = evaluatePositionScheduler) {
+  if (!(LADDER_LIVE || LADDER_PROACTIVE_LIVE) || LADDER_SEED_GAP <= 0 || seedWaiters.length === 0) return 0;
+  if (ladderFiresThisTick > 0) return 0;                 // the chain is progressing on its own
+  if ((decisionCtx.currentInflight ?? 0) > 0) return 0;  // commits pending — queue about to rise
+  seedWaiters.sort((a, b) => (a.target ?? Infinity) - (b.target ?? Infinity));
+  for (const w of seedWaiters) {
+    if (w.state.positionFiredToday) continue;
+    try {
+      const d2 = evaluate(w.state, { ...decisionCtx, seedPromote: true });
+      if (d2.action !== 'fire') continue;
+      console.log(d2.logLine);
+      w.state.positionFiredToday = true;
+      ladderLastFireMs = Date.now();
+      ladderAddsCommitted++; // our own add — excluded from the growth signal
+      fireBatch.push({ driverId: w.driverId, state: w.state, decision: d2 });
+      return 1;
+    } catch (err) {
+      console.error(`[Pos] ladder seed pass failed for #${w.state?.vehicleNumber}: ${err.message}`);
+    }
+  }
+  return 0;
+}
+
+/**
+ * Proactive-seed SHADOW pass (MONITOR_LADDER_PROACTIVE=shadow). Logs — never
+ * fires — the one lowest-target driver the proactive window WOULD seed this
+ * tick that the live paths did NOT (i.e. justified by the proactive depth but
+ * not by growth). Advances through the roster via ladderShadowSeeded so each
+ * candidate is logged once per day, giving a faithful funnel + timing stream to
+ * review before flipping to live. NOTE: shadow cannot move SAN's real queue, so
+ * the logged landing is the CURRENT-queue lower bound (live would land higher as
+ * our own commits climb) — the quantitative walk is measured by the replay.
+ */
+function runLadderSeedShadowPass(shadowWaiters, nowMs = Date.now()) {
+  if (!LADDER_PROACTIVE_SHADOW || shadowWaiters.length === 0) return 0;
+  const dayKey = new Date(nowMs).toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
+  if (dayKey !== ladderShadowDay) { ladderShadowDay = dayKey; ladderShadowSeeded = new Set(); }
+  shadowWaiters.sort((a, b) => (a.target ?? Infinity) - (b.target ?? Infinity));
+  for (const w of shadowWaiters) {
+    if (ladderShadowSeeded.has(w.driverId)) continue;
+    ladderShadowSeeded.add(w.driverId);
+    const land = (w.effQ ?? 0) + 1;
+    console.log(
+      `[Pos] #${w.state?.vehicleNumber ?? w.driverId} — 🪜 PROACTIVE-SHADOW would seed: ` +
+      `queue ${w.effQ}, target ${w.target} (gap ${w.target - (w.effQ ?? 0)}, ~land ${land}, err ${land - w.target}) ` +
+      `— log-only, would place ahead of the storm`,
+    );
+    return 1;
+  }
+  return 0;
+}
+
 /**
  * Tick-pipe re-evaluation pass (MONITOR_TICK_PIPE_LEAD — see the constant
  * block for the full rationale). Re-runs the tick's still-waiting drivers with
@@ -2941,6 +3168,8 @@ async function poll() {
   if (recentObservations.length > SHORT_WINDOW_POLLS + 1) recentObservations.shift();
   // Time-bounded buffer for the predictive-lead velocity (see observedVelocity).
   recordVelocityObservation(waitingCount, lastObservationAt);
+  // Longer-window buffer for the ladder seed growth gate (see sustainedRise).
+  recordSeedQueueObservation(waitingCount, lastObservationAt);
 
   // Hoisted so the snapshot recording below has access to the raw signals.
   let lastPollRate        = null;
@@ -3532,10 +3761,20 @@ async function poll() {
     // botService require is cached and guarded so decision-only tests (which
     // pass their own ctx) never pull in Playwright.
     observedVelocity:        observedVelocity(Date.now()),
+    seedRise:                sustainedRise(Date.now()),
     currentInflight:         (() => { try { return require('./botService').currentInflight(); } catch { return 0; } })(),
     // Pre-onset ladder window (MONITOR_LADDER): burst window AND past the
     // wall-clock floor. Computed once per tick — same clock as prearm.
     ladderWindowOpen:        inBurstWindow && currentMinutesPT() >= LADDER_AFTER_MIN,
+    seedWindowOpen:          inBurstWindow && currentMinutesPT() >= LADDER_SEED_AFTER_MIN,
+    // Proactive-seed window (MONITOR_LADDER_PROACTIVE): open in the burst window
+    // past _AFTER; frac ramps 0→1 from _AFTER to _PEAK (the historical storm
+    // time), scaling the allowed seed depth by the clock.
+    proactiveOpen:           (LADDER_PROACTIVE_LIVE || LADDER_PROACTIVE_SHADOW)
+                               && inBurstWindow && currentMinutesPT() >= LADDER_PROACTIVE_AFTER_MIN,
+    proactiveFrac:           Math.min(1, Math.max(0,
+                               (currentMinutesPT() - LADDER_PROACTIVE_AFTER_MIN) /
+                               Math.max(1, LADDER_PROACTIVE_PEAK_MIN - LADDER_PROACTIVE_AFTER_MIN))),
   };
 
   // Track the soonest fire across all armed drivers — drives adaptive polling.
@@ -3571,6 +3810,12 @@ async function poll() {
   // after the loop they are re-evaluated with this tick's fire batch counted
   // into inflight — see runTickPipePass.
   const tickPipeWaiters = [];
+  // Ladder seed candidates this tick (MONITOR_LADDER_SEED_GAP) — see
+  // runLadderSeedPass. At most one is promoted per stalled tick.
+  const seedWaiters = [];
+  // Proactive-shadow-only candidates (in the funnel via the proactive depth but
+  // not fire-allowed) — logged by runLadderSeedShadowPass, never fired.
+  const shadowSeedWaiters = [];
 
   // Borrowed-probe candidates: waiting drivers whose target is still far above
   // the tail (safe to lend as probes). Collected here, reconciled after the loop.
@@ -3715,6 +3960,21 @@ async function poll() {
           });
         }
 
+        // Ladder seed candidate (MONITOR_LADDER_SEED_GAP): flagged by the
+        // decision itself; promoted (at most one) by runLadderSeedPass below.
+        // Fire-allowed candidates → seedWaiters (live); proactive-shadow-only
+        // candidates → shadowSeedWaiters (log-only).
+        if (decision.action === 'wait' && decision.seedCandidate) {
+          const entry = {
+            driverId,
+            state,
+            target: decision.metrics?.targetPosition ?? Infinity,
+            effQ: decision.effectiveQueueAtDecision,
+          };
+          if (decision.seedCanFire) seedWaiters.push(entry);
+          else if (decision.seedProactiveOnly) shadowSeedWaiters.push(entry);
+        }
+
         // Borrowed-probe candidate: a genuinely-waiting driver whose real fire is
         // still far enough away — by the rate-aware retire buffer — that we can
         // ALWAYS hand them back and re-arm before it. Never carryovers (already
@@ -3806,6 +4066,7 @@ async function poll() {
           }
           ladderFiresThisTick++;
           ladderLastFireMs = Date.now();
+          ladderAddsCommitted++; // our own add — excluded from the growth signal
         }
         console.log(decision.logLine);
         state.positionFiredToday = true; // mark before enqueuing — prevents double-trigger
@@ -3837,6 +4098,13 @@ async function poll() {
   // it adds join fireBatch before the sort, so the batch still launches in
   // target order with the added fires exactly where their targets place them.
   runTickPipePass(fireBatch, tickPipeWaiters, decisionCtx);
+
+  // ─── Ladder seed pass: break a pre-onset stall the gap-11 chain can't ─────
+  const seededThisTick = runLadderSeedPass(fireBatch, seedWaiters, decisionCtx, ladderFiresThisTick);
+  // Proactive-shadow pass (log-only): only when nothing actually fired/seeded.
+  if (seededThisTick === 0 && ladderFiresThisTick === 0) {
+    runLadderSeedShadowPass(shadowSeedWaiters);
+  }
 
   // ─── Launch this tick's fires, most-overdue target first ──────────────────
   // triggerPositionSchedule claims the armed session in its first synchronous
@@ -4692,12 +4960,57 @@ function syncDriverSchedule(driverId, { scheduledPosition, dayPositions, maxAcce
   const state = watches.get(Number(driverId));
   if (!state) return; // driver not currently watched — no-op
 
+  // Capture the target the scheduler was chasing BEFORE we overwrite the fields,
+  // so we can tell whether this edit actually moved the day's target position.
+  const todayDayStr = new Date().toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/Los_Angeles' });
+  const todayDayKey = { Sun: '0', Mon: '1', Tue: '2', Wed: '3', Thu: '4', Fri: '5', Sat: '6' }[todayDayStr];
+  const oldTarget   = resolveTargetPosition(state, todayDayKey);
+
   state.scheduledPosition     = scheduledPosition     ?? null;
   state.dayPositions          = dayPositions          ?? null;
   state.maxAcceptablePosition = maxAcceptablePosition ?? null;
   if (isActive !== undefined) state.isActive = isActive;
 
   console.log(`[Monitor] Schedule synced for #${state.vehicleNumber} (immediate, no refresh wait)`);
+
+  // ─── Re-arm after a mid-day target edit that followed a "missed" latch ──────
+  // A driver marked missed_impossible sets positionFiredToday=true so the poll
+  // loop stops re-evaluating them (see the case at ~3817). But that latch was
+  // set against the OLD target. If the admin/driver now edits the target to a
+  // DIFFERENT, still-reachable position, the driver must get a fresh shot — the
+  // edit alone doesn't clear the latch, so without this they stay skipped as
+  // "already fired today" for the rest of the day even though they never landed.
+  //
+  // 2026-08-23 #4324: target 490 (unreachable, queue peaked ~430) → edited to
+  // 299 (already past → missed_impossible, latched) → edited to 428 (reachable),
+  // but the 299-miss latch blocked the 428 fire. This releases exactly that.
+  //
+  // Guarded tightly so a genuine placement is never disturbed:
+  //   • target actually changed (a real edit, not a no-op re-save)
+  //   • the driver is still latched from a MISS, not a real fire
+  //     (lastPosDecision === 'missed_impossible' — a fired driver reads 'fired'
+  //      /'waiting'/'completed', and can't have missed after firing since the
+  //      latch would have blocked the fire)
+  //   • never actually landed (landedPositionToday == null)
+  //   • no bot currently in flight (state !== 'requeuing')
+  // If the new target is ALSO already past max, allowRefireToday just lets the
+  // scheduler re-decide next tick — the past-max guard re-marks it missed with
+  // no wasted fire (see evaluatePositionScheduler's waitingCount > max rail).
+  const newTarget = resolveTargetPosition(state, todayDayKey);
+  const targetChanged = newTarget != null && newTarget !== oldTarget;
+  const missLatched   =
+    state.positionFiredToday === true &&
+    state.lastPosDecision === 'missed_impossible' &&
+    state.landedPositionToday == null &&
+    state.state !== 'requeuing';
+
+  if (targetChanged && missLatched) {
+    console.log(
+      `[Monitor] #${state.vehicleNumber} — target changed ${oldTarget} → ${newTarget} after a miss; ` +
+      `clearing the missed latch so the scheduler can re-evaluate the new target`,
+    );
+    allowRefireToday(Number(driverId));
+  }
 }
 
 /**
@@ -4899,6 +5212,11 @@ module.exports = {
   _onsetCapNow:               onsetCapNow,
   _runTickPipePass:           runTickPipePass,
   _setLadderLastFireMs:       (ms) => { ladderLastFireMs = ms; },
+  _runLadderSeedPass:         runLadderSeedPass,
+  _sustainedRise:             sustainedRise,
+  _recordSeedQueueObservation: recordSeedQueueObservation,
+  _bumpLadderAdds:            (n = 1) => { ladderAddsCommitted += n; },
+  _runLadderSeedShadowPass:   runLadderSeedShadowPass,
   _onsetBacklogBoost:         onsetBacklogBoost,
   _maybeFlagUnderRescue:      maybeFlagUnderRescue,
   _carryoverClearStep:        carryoverClearStep,

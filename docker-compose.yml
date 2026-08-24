@@ -266,8 +266,61 @@ services:
       # target first. Undershoot-safe: the added lead is backed 1:1 by our OWN
       # already-clicked adds (SAN appends in arrival order — guaranteed drift,
       # not a forecast), and the displayed-queue hard floor still gates every
-      # fire. Kill switch: MONITOR_TICK_PIPE_LEAD=0.
-      MONITOR_TICK_PIPE_LEAD:  ${MONITOR_TICK_PIPE_LEAD:-1}
+      # fire.
+      # ⚠️ 2026-08-23 — DEFAULT FLIPPED TO 0 (OFF). FALSIFIED LIVE THREE STORMS
+      # IN A ROW (08-21 ±10=5%, 08-22 2%, 08-23 8%): on a queue leap the pass
+      # is a positive-feedback loop — each recruited fire grows the pipe, which
+      # grows the lead, which unlocks deeper targets in the SAME tick until the
+      # roster exhausts (104/92/77 fires in one batch). This compose default
+      # was the line that kept resurrecting it after the code default went off.
+      # Set =1 only to deliberately re-enable for an experiment.
+      MONITOR_TICK_PIPE_LEAD:  ${MONITOR_TICK_PIPE_LEAD:-0}
+
+      # ── Pre-onset ladder (2026-08-23) — place the roster BEFORE the storm ──
+      # The storm window cannot absorb the roster (SAN commits ~0.4 adds/s
+      # accurately; the display sweeps the band in ~25s), so the ladder fires
+      # each driver while the morning is CALM, the moment their target comes
+      # within GAP of the queue — our own commits raise the queue rung by rung
+      # (the emergent chain that made 08-15 a 74% day). Landing bound by
+      # construction: ≥ queue+1 ≥ target−10 at gap 11 — in-band undershoot,
+      # zero overshoot on a calm queue. '0' kills, 'shadow' logs would-fires.
+      MONITOR_LADDER:          ${MONITOR_LADDER:-1}
+      MONITOR_LADDER_GAP:      ${MONITOR_LADDER_GAP:-11}      # chain tier: fires land −10…−4 (in-band)
+      MONITOR_LADDER_TICK_MAX: ${MONITOR_LADDER_TICK_MAX:-2}  # fires/tick — keeps chain below storm triggers
+      MONITOR_LADDER_MAX_VEL:  ${MONITOR_LADDER_MAX_VEL:-0.5} # /s — a moving queue means storm machinery owns the tick
+      MONITOR_LADDER_AFTER:    ${MONITOR_LADDER_AFTER:-03:30} # PT wall clock — no ladder fires before this
+      # Seed tier (08-23, the empty-queue morning: queue 0-9 until 05:15 → the
+      # gap-11 chain had nothing to ignite from). On a stalled tick with nothing
+      # in flight, fire ONE lowest-target waiter whose gap ≤ the seed budget.
+      # Budget is SCOPED like the band floor: full budget (default = HARD_FLOOR,
+      # so 65 here) ONLY for band targets 70-199; shallow <70 and deep ≥200 cap
+      # at SEED_SHALLOW (29 ⇒ worst −28, the original −30 contract) — a
+      # target-50 driver can never be seeded to position ~2. Empty = inherit
+      # HARD_FLOOR; 0 disables the tier.
+      MONITOR_LADDER_SEED_GAP:     ${MONITOR_LADDER_SEED_GAP:-}
+      MONITOR_LADDER_SEED_SHALLOW: ${MONITOR_LADDER_SEED_SHALLOW:-29}
+      MONITOR_LADDER_SEED_AFTER:   ${MONITOR_LADDER_SEED_AFTER:-03:45}
+      # Seed GROWTH gate (2026-08-24): the seed spends undershoot ONLY when the
+      # list is genuinely building, and scales depth with the climb. DEAD CALM
+      # (rise < MIN_RISE over WINDOW) ⇒ no seed ⇒ drivers wait and land accurate;
+      # a target is NEVER seeded deep just for being "in range". MIN_RISE = net
+      # positions the queue must climb; WINDOW = seconds measured over;
+      # GAP_PER_RISE = positions of undershoot unlocked per position of rise.
+      MONITOR_LADDER_SEED_MIN_RISE:     ${MONITOR_LADDER_SEED_MIN_RISE:-8}
+      MONITOR_LADDER_SEED_WINDOW:       ${MONITOR_LADDER_SEED_WINDOW:-150}
+      MONITOR_LADDER_SEED_GAP_PER_RISE: ${MONITOR_LADDER_SEED_GAP_PER_RISE:-3}
+      # PROACTIVE seed — "be the onset" (2026-08-24). Growth-gated seeding can't
+      # beat a leap-from-quiet storm (it only sees the build ~60s before the
+      # leap). This places band drivers on the DAILY-STORM PRIOR instead: inside
+      # the window, seed without waiting for growth, with the allowed depth
+      # ramping by the CLOCK — shallow at _AFTER, full budget by _PEAK (the
+      # historical storm time) — so undershoot deepens only as the leap nears.
+      # DEFAULT 'shadow' (deploy-and-observe: logs 🪜 PROACTIVE-SHADOW would-seed
+      # lines, fires nothing). Flip to '1' to go live, '0' to disable. Scoping,
+      # serialization, and the onset/velocity yield all still apply.
+      MONITOR_LADDER_PROACTIVE:       ${MONITOR_LADDER_PROACTIVE:-shadow}
+      MONITOR_LADDER_PROACTIVE_AFTER: ${MONITOR_LADDER_PROACTIVE_AFTER:-04:00}
+      MONITOR_LADDER_PROACTIVE_PEAK:  ${MONITOR_LADDER_PROACTIVE_PEAK:-05:10}
       MONITOR_PRED_LAT_FLOOR:  ${MONITOR_PRED_LAT_FLOOR:-5}       # s, latency floor (static-queue fallback only)
       MONITOR_PRED_LAT_SLOPE:  ${MONITOR_PRED_LAT_SLOPE:-0.7}     # s of latency per inflight (static-queue fallback only)
       MONITOR_PRED_VEL_CAP:    ${MONITOR_PRED_VEL_CAP:-2.5}       # /s, cap on the velocity used

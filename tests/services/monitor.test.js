@@ -39,9 +39,15 @@ const {
   getState,
   stopMonitor,
   allowRefireToday,
+  syncDriverSchedule,
   armPositionWindowForToday,
   startMonitor,
 } = monitor;
+
+// dayPositions map with the SAME target under every weekday key, so tests that
+// call syncDriverSchedule (which resolves the target against the real current
+// day) are deterministic no matter which day they run on.
+const allDays = (pos) => JSON.stringify({ 0: pos, 1: pos, 2: pos, 3: pos, 4: pos, 5: pos, 6: pos });
 
 // ─── UTC timestamp for a given Pacific Standard Time hour ─────────────────────
 // Uses January 15-16 2026 (PST = UTC-8, no DST ambiguity).
@@ -279,6 +285,92 @@ describe('allowRefireToday()', () => {
     expect(after.positionFiredToday).toBe(false);    // not "fired" anymore
     expect(after.hasBeenSeen).toBe(false);
     expect(after.state).toBe('in_queue');             // still in queue right now
+  });
+});
+
+// ─── syncDriverSchedule() — re-arm after a mid-day target edit past a miss ─────
+// 2026-08-23 #4324 regression. A driver marked missed_impossible latches
+// positionFiredToday=true against the OLD target. If the target is then edited
+// to a DIFFERENT, still-reachable position, the edit must clear that latch so
+// the scheduler re-evaluates — otherwise the driver stays skipped as "already
+// fired today" all day despite never having landed. The latch must NOT be
+// cleared when the driver actually fired/landed, or when a bot is in flight.
+
+describe('syncDriverSchedule() — re-arm after target edit following a miss', () => {
+  beforeEach(async () => {
+    setupMocks();
+    await addWatch(DRIVER_ID, { isAuto: true });
+  });
+
+  // Puts the driver in the exact state #4324 was in at 08:10: latched by a
+  // missed_impossible against target 490, never placed, no bot running.
+  function missLatchedAt(oldTarget) {
+    const s = monitor._getInternalState(DRIVER_ID);
+    s.dayPositions        = allDays(oldTarget);
+    s.scheduledPosition   = null;
+    s.positionFiredToday  = true;
+    s.lastPosDecision     = 'missed_impossible';
+    s.landedPositionToday = null;
+    s.state               = 'watching';
+    s.hasBeenSeen         = false;
+    return s;
+  }
+
+  test('target edited to a NEW position after a miss → latch cleared, scheduler re-armed', () => {
+    missLatchedAt(490);
+
+    // The edit that arrived too late for #4324: 490 → 428 (a reachable target).
+    syncDriverSchedule(DRIVER_ID, { scheduledPosition: null, dayPositions: allDays(428) });
+
+    const after = monitor._getInternalState(DRIVER_ID);
+    expect(after.positionFiredToday).toBe(false); // latch released
+    expect(after.lastPosDecision).toBeNull();      // next decision will write fresh
+    expect(after.state).toBe('watching');          // eligible to fire the new target
+  });
+
+  test('re-save of the SAME target → latch NOT cleared (no spurious re-arm)', () => {
+    missLatchedAt(490);
+
+    // e.g. an unrelated field (maxAcceptable) is edited; the target is unchanged.
+    syncDriverSchedule(DRIVER_ID, { scheduledPosition: null, dayPositions: allDays(490) });
+
+    const after = monitor._getInternalState(DRIVER_ID);
+    expect(after.positionFiredToday).toBe(true);   // still latched — nothing changed
+    expect(after.lastPosDecision).toBe('missed_impossible');
+  });
+
+  test('driver already LANDED → target edit never disturbs the placement', () => {
+    const s = missLatchedAt(490);
+    s.lastPosDecision     = 'completed';
+    s.landedPositionToday = 495; // a real placement exists
+
+    syncDriverSchedule(DRIVER_ID, { scheduledPosition: null, dayPositions: allDays(428) });
+
+    const after = monitor._getInternalState(DRIVER_ID);
+    expect(after.positionFiredToday).toBe(true);   // landing preserved, not re-armed
+  });
+
+  test('bot in flight (requeuing) → target edit does not yank the fire', () => {
+    const s = missLatchedAt(490);
+    s.lastPosDecision = 'missed_impossible';
+    s.state           = 'requeuing'; // a bot is mid-run
+
+    syncDriverSchedule(DRIVER_ID, { scheduledPosition: null, dayPositions: allDays(428) });
+
+    const after = monitor._getInternalState(DRIVER_ID);
+    expect(after.positionFiredToday).toBe(true);   // not re-armed while in flight
+    expect(after.state).toBe('requeuing');
+  });
+
+  test('driver FIRED (awaiting landing), not missed → edit does not re-arm (no double-fire)', () => {
+    const s = missLatchedAt(490);
+    s.lastPosDecision = 'fired'; // a real fire is in the pipeline, just not landed yet
+
+    syncDriverSchedule(DRIVER_ID, { scheduledPosition: null, dayPositions: allDays(428) });
+
+    const after = monitor._getInternalState(DRIVER_ID);
+    expect(after.positionFiredToday).toBe(true);   // fired latch respected
+    expect(after.lastPosDecision).toBe('fired');
   });
 });
 

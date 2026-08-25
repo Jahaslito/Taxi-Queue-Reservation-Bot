@@ -370,6 +370,31 @@ const LADDER_PROACTIVE_PEAK_PT  = String(process.env.MONITOR_LADDER_PROACTIVE_PE
 const toMin = (s) => (([h, m]) => (parseInt(h, 10) % 24) * 60 + (parseInt(m, 10) || 0))(String(s).split(':'));
 const LADDER_PROACTIVE_AFTER_MIN = toMin(LADDER_PROACTIVE_AFTER_PT);
 const LADDER_PROACTIVE_PEAK_MIN  = toMin(LADDER_PROACTIVE_PEAK_PT);
+// Proactive CHAIN extension (2026-08-24, "cannot afford another miss"): the
+// ramp above deepens the seed slowly (full budget only by _PEAK 05:10) and the
+// seed pass places one-per-commit (~0.2/s). Both were sized to keep undershoot
+// minimal — but on a near-empty-queue-then-leap morning (08-24: queue ≤20 until
+// a 16 s leap at 04:16) that is exactly why the 70-200 band was still unplaced
+// when the storm hit (20 misses). Under the operator's revised priority
+// (a MISS is worse than bounded undershoot — a placed driver still earns) these
+// two knobs let the proactive seed run as a FRONT-LOADED chain:
+//   • _FULL=1  → allowed seed depth is the full scoped budget the moment the
+//     window opens (no clock ramp), so the band is seed-eligible from _AFTER.
+//   • SEED_MAX_INFLIGHT (N) → up to N of our own seeds may be in flight at once
+//     (default 1 = the original one-per-commit serialization). N≈4-6 keeps
+//     concurrency at SAN's accurate low-commit knee (measured 08-24: ≤6 in
+//     flight → ~5 s commit, ±2 landing; the 87-in-8s onset burst → 8-13 s, ±40)
+//     while giving ~1/s — enough to seat a ~120 roster in ~2 min of calm.
+// Thorough 08-24 replay (extract.py/funnel.py, model validated to ±2 on the
+// day's real spread seeds): 0 misses, 0 overshoot, ~30-45% ±10, median ≈ −13,
+// worst ≈ −55 on the top targets (chain from a near-empty queue tops out near
+// roster-size). Robust to onset timing: identical result whether the leap hits
+// 04:10 or 04:26, because the chain finishes in the calm. Start EARLY (_AFTER
+// before the earliest plausible onset); a later _AFTER lands tighter but risks
+// a miss if the storm beats it. Off by default — enable with _FULL=1 + N>1.
+const LADDER_PROACTIVE_FULL   = String(process.env.MONITOR_LADDER_PROACTIVE_FULL ?? '0') === '1';
+const LADDER_SEED_MAX_INFLIGHT = Math.max(1,
+  parseInt(process.env.MONITOR_LADDER_SEED_MAX_INFLIGHT ?? '1', 10) || 1);
 // Pre-armed fire sessions: park a logged-in page on SAN's "Add To Queue"
 // screen for every driver whose fire is near, so the fire itself is a ~1 s
 // click instead of a ~3.5 s Chromium launch (see botService "Pre-armed fire
@@ -2914,10 +2939,20 @@ function evaluatePositionScheduler(state, ctx) {
  */
 function runLadderSeedPass(fireBatch, seedWaiters, decisionCtx, ladderFiresThisTick, evaluate = evaluatePositionScheduler) {
   if (!(LADDER_LIVE || LADDER_PROACTIVE_LIVE) || LADDER_SEED_GAP <= 0 || seedWaiters.length === 0) return 0;
-  if (ladderFiresThisTick > 0) return 0;                 // the chain is progressing on its own
-  if ((decisionCtx.currentInflight ?? 0) > 0) return 0;  // commits pending — queue about to rise
+  // Concurrency budget: keep at most LADDER_SEED_MAX_INFLIGHT of our own seeds in
+  // flight (this tick's ladder fires + already-pending commits both count). With
+  // the default N=1 this collapses to the original serialization EXACTLY — fire a
+  // single seed only when the gap-chain made no progress AND nothing is in flight
+  // (budget = 1 − 0 − 0 = 1; any inflight or ladder fire drives budget ≤ 0 → skip).
+  // N>1 (the front-loaded chain) tops the in-flight set back up to N each tick, so
+  // seeds commit at ~N/commit-latency ≈ 1/s while concurrency stays at SAN's
+  // accurate low-commit knee. Lowest target first so the chain lands ascending.
+  const budget = LADDER_SEED_MAX_INFLIGHT - (decisionCtx.currentInflight ?? 0) - ladderFiresThisTick;
+  if (budget <= 0) return 0;
   seedWaiters.sort((a, b) => (a.target ?? Infinity) - (b.target ?? Infinity));
+  let promoted = 0;
   for (const w of seedWaiters) {
+    if (promoted >= budget) break;
     if (w.state.positionFiredToday) continue;
     try {
       const d2 = evaluate(w.state, { ...decisionCtx, seedPromote: true });
@@ -2927,12 +2962,12 @@ function runLadderSeedPass(fireBatch, seedWaiters, decisionCtx, ladderFiresThisT
       ladderLastFireMs = Date.now();
       ladderAddsCommitted++; // our own add — excluded from the growth signal
       fireBatch.push({ driverId: w.driverId, state: w.state, decision: d2 });
-      return 1;
+      promoted++;
     } catch (err) {
       console.error(`[Pos] ladder seed pass failed for #${w.state?.vehicleNumber}: ${err.message}`);
     }
   }
-  return 0;
+  return promoted;
 }
 
 /**
@@ -3772,7 +3807,11 @@ async function poll() {
     // time), scaling the allowed seed depth by the clock.
     proactiveOpen:           (LADDER_PROACTIVE_LIVE || LADDER_PROACTIVE_SHADOW)
                                && inBurstWindow && currentMinutesPT() >= LADDER_PROACTIVE_AFTER_MIN,
-    proactiveFrac:           Math.min(1, Math.max(0,
+    // Depth ramp 0→1 from _AFTER to _PEAK by the clock — UNLESS _FULL, which
+    // opens the full scoped budget the moment the window opens (front-loaded
+    // chain; see LADDER_PROACTIVE_FULL). frac only ever SCALES the seed depth;
+    // it never bypasses the per-target scoped budget or the storm/velocity gate.
+    proactiveFrac:           LADDER_PROACTIVE_FULL ? 1 : Math.min(1, Math.max(0,
                                (currentMinutesPT() - LADDER_PROACTIVE_AFTER_MIN) /
                                Math.max(1, LADDER_PROACTIVE_PEAK_MIN - LADDER_PROACTIVE_AFTER_MIN))),
   };

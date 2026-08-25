@@ -425,6 +425,82 @@ describe('PROACTIVE seed — be the onset during the daily storm window', () => 
   });
 });
 
+describe('front-loaded chain — MONITOR_LADDER_SEED_MAX_INFLIGHT + _FULL (08-24, "cannot afford a miss")', () => {
+  // Three band candidates that all clear the seed budget at queue 70
+  // (gaps 20/25/30 ≤ 65) — the calm pre-onset rungs the chain seats ascending.
+  const bandWaiters = () => [
+    { driverId: 23, state: makeState(100, { vehicleNumber: '0023' }), target: 100 },
+    { driverId: 21, state: makeState(90,  { vehicleNumber: '0021' }), target: 90  },
+    { driverId: 22, state: makeState(95,  { vehicleNumber: '0022' }), target: 95  },
+  ];
+  const seedCtx = (over = {}) => calmCtx({ waitingCount: 70, seedRise: 30, ...over });
+
+  test('DEFAULT (unset ⇒ 1): still promotes exactly ONE per tick — backward compatible', () => {
+    // Top-of-file module: MAX_INFLIGHT unset ⇒ 1 ⇒ budget 1 ⇒ one seed, as before.
+    const added = _runLadderSeedPass([], bandWaiters(), seedCtx(), 0);
+    expect(added).toBe(1);
+  });
+
+  test('N=3 front-loads up to three seeds in one tick, lowest target first', () => {
+    jest.isolateModules(() => {
+      process.env.MONITOR_LADDER_SEED_MAX_INFLIGHT = '3';
+      const m = require('../../src/services/monitorService');
+      const fireBatch = [];
+      const added = m._runLadderSeedPass(fireBatch, bandWaiters(), seedCtx(), 0);
+      expect(added).toBe(3);
+      // ascending target order — the chain lands 90 → 95 → 100
+      expect(fireBatch.map((f) => f.state.vehicleNumber)).toEqual(['0021', '0022', '0023']);
+      delete process.env.MONITOR_LADDER_SEED_MAX_INFLIGHT;
+    });
+  });
+
+  test('N caps concurrency: N=2 promotes only two of three eligible', () => {
+    jest.isolateModules(() => {
+      process.env.MONITOR_LADDER_SEED_MAX_INFLIGHT = '2';
+      const m = require('../../src/services/monitorService');
+      const added = m._runLadderSeedPass([], bandWaiters(), seedCtx(), 0);
+      expect(added).toBe(2);
+      delete process.env.MONITOR_LADDER_SEED_MAX_INFLIGHT;
+    });
+  });
+
+  test('in-flight commits count against the budget (N=5, 3 in flight ⇒ 2 more)', () => {
+    jest.isolateModules(() => {
+      process.env.MONITOR_LADDER_SEED_MAX_INFLIGHT = '5';
+      const m = require('../../src/services/monitorService');
+      const added = m._runLadderSeedPass([], bandWaiters(), seedCtx({ currentInflight: 3 }), 0);
+      expect(added).toBe(2);
+      delete process.env.MONITOR_LADDER_SEED_MAX_INFLIGHT;
+    });
+  });
+
+  test("this tick's gap-chain fires also count (N=3, 2 ladder fires ⇒ 1 seed)", () => {
+    jest.isolateModules(() => {
+      process.env.MONITOR_LADDER_SEED_MAX_INFLIGHT = '3';
+      const m = require('../../src/services/monitorService');
+      const added = m._runLadderSeedPass([], bandWaiters(), seedCtx(), 2);
+      expect(added).toBe(1);
+      delete process.env.MONITOR_LADDER_SEED_MAX_INFLIGHT;
+    });
+  });
+
+  test('_FULL=1 opens full band depth on the prior (loads + fires a deep band driver)', () => {
+    jest.isolateModules(() => {
+      process.env.MONITOR_LADDER_PROACTIVE      = '1';
+      process.env.MONITOR_LADDER_PROACTIVE_FULL = '1';
+      const m = require('../../src/services/monitorService');
+      // Zero growth, but proactive full-depth ⇒ a gap-60 band target still fires.
+      const d = m._evaluatePositionScheduler(
+        makeState(100),
+        calmCtx({ waitingCount: 40, seedRise: 0, proactiveOpen: true, proactiveFrac: 1 }),
+      );
+      expect(d.seedCanFire).toBe(true);
+      delete process.env.MONITOR_LADDER_PROACTIVE_FULL;
+      delete process.env.MONITOR_LADDER_PROACTIVE;
+    });
+  });
+});
+
 describe('kill switch and shadow — MONITOR_LADDER', () => {
   test("'0' disables the ladder entirely", () => {
     jest.isolateModules(() => {

@@ -315,12 +315,56 @@ services:
       # the window, seed without waiting for growth, with the allowed depth
       # ramping by the CLOCK — shallow at _AFTER, full budget by _PEAK (the
       # historical storm time) — so undershoot deepens only as the leap nears.
-      # DEFAULT 'shadow' (deploy-and-observe: logs 🪜 PROACTIVE-SHADOW would-seed
-      # lines, fires nothing). Flip to '1' to go live, '0' to disable. Scoping,
+      # ⚠️ DEFAULT FLIPPED TO '1' (LIVE) on 2026-08-25 after the 08-24 storm cost
+      # 21 drivers their placement. Baked in HERE, not .env, because compose is
+      # the env authority (an unset .env is exactly how the tick-pipe cascade ran
+      # a second storm). KILL SWITCH: set MONITOR_LADDER_PROACTIVE=shadow (log
+      # only) or =0 (off) in prod .env — .env wins over these defaults. Scoping,
       # serialization, and the onset/velocity yield all still apply.
-      MONITOR_LADDER_PROACTIVE:       ${MONITOR_LADDER_PROACTIVE:-shadow}
-      MONITOR_LADDER_PROACTIVE_AFTER: ${MONITOR_LADDER_PROACTIVE_AFTER:-04:00}
+      MONITOR_LADDER_PROACTIVE:       ${MONITOR_LADDER_PROACTIVE:-1}
+      MONITOR_LADDER_PROACTIVE_AFTER: ${MONITOR_LADDER_PROACTIVE_AFTER:-03:45}
       MONITOR_LADDER_PROACTIVE_PEAK:  ${MONITOR_LADDER_PROACTIVE_PEAK:-05:10}
+      # FRONT-LOADED CHAIN (2026-08-24, "cannot afford another miss"). The two
+      # knobs above deepen slowly (full budget only by _PEAK) and place one seed
+      # per commit (~0.2/s) — on an empty-queue-then-leap morning (08-24) that
+      # left the 70-200 band unplaced when the leap hit ⇒ 20 misses. Under the
+      # revised priority (a MISS is worse than bounded undershoot), these two
+      # turn the proactive seed into a front-loaded chain:
+      #   _FULL=1        → full scoped budget the moment the window opens (no clock
+      #                    ramp) ⇒ the whole band is seed-eligible from _AFTER.
+      #   _SEED_MAX_INFLIGHT=N → up to N of our seeds in flight at once (default 1
+      #                    = original one-per-commit). N≈4-6 keeps concurrency at
+      #                    SAN's accurate commit knee (~5s, ±2 landing) at ~1/s.
+      # 08-24 replay (model validated ±2 on the day's real seeds): 0 miss, 0
+      # overshoot, ~30-45% ±10, median ≈ −13, deep undershoot only on the top
+      # targets — vs 20 miss + 51 overshoot (worst +79) actual. Robust to onset
+      # timing when _AFTER is BEFORE the earliest plausible onset.
+      # ── LIVE BY DEFAULT since 2026-08-25 (values baked in below) ──
+      #   PROACTIVE=1  FULL=1  AFTER=03:45  SEED_MAX_INFLIGHT=5
+      # To revert to the pre-08-25 behaviour set MONITOR_LADDER_PROACTIVE=shadow
+      # in .env — verified byte-identical to the old code on an 08-24 replay.
+      # _AFTER=03:45 is the operator's chosen BALANCE (2026-08-25) between
+      # early-storm insurance and calm-morning accuracy:
+      #   • It buys RUNWAY. The chain seats ~1 driver/s, so it needs a few calm
+      #     minutes before the leap. 08-24 replay (leap 04:16): 03:30 / 03:45 /
+      #     04:00 are all IDENTICAL (92/92 seated, med −23). The gate only
+      #     matters when the storm is EARLY: leap 30 min early → 03:45 seats
+      #     48/92 and 04:00 seats ZERO (gate still shut when the avalanche hits).
+      #   • Opening early is SAFE, not aggressive: the −65/−29 HARD FLOOR gates
+      #     seeding on QUEUE LEVEL (target−65 band / target−29 shallow), NOT the
+      #     clock, so an early window cannot dump anyone into an empty queue —
+      #     verified against the real evaluator (at queue 0-4 NOTHING is
+      #     seed-eligible at any clock; on 08-24 the first fire was 04:00:25
+      #     even with the gate open at 03:30).
+      #   • COST, charged every calm morning: an earlier gate starts seeding at
+      #     a lower queue, so landings sit deeper. Scoring ALL 92 band drivers on
+      #     a no-storm crawl day: 03:30 → 17% ±10 / med −20; 04:00 → 58% ±10 /
+      #     med −10. 03:45 sits between them. Bounded by the floor either way.
+      # Move it LATER for accuracy, EARLIER for insurance — via .env, one line.
+      # Defaults below are now the LIVE values (FULL=1, N=5); set them in .env
+      # only to override/kill.
+      MONITOR_LADDER_PROACTIVE_FULL:     ${MONITOR_LADDER_PROACTIVE_FULL:-1}
+      MONITOR_LADDER_SEED_MAX_INFLIGHT:  ${MONITOR_LADDER_SEED_MAX_INFLIGHT:-5}
       MONITOR_PRED_LAT_FLOOR:  ${MONITOR_PRED_LAT_FLOOR:-5}       # s, latency floor (static-queue fallback only)
       MONITOR_PRED_LAT_SLOPE:  ${MONITOR_PRED_LAT_SLOPE:-0.7}     # s of latency per inflight (static-queue fallback only)
       MONITOR_PRED_VEL_CAP:    ${MONITOR_PRED_VEL_CAP:-2.5}       # /s, cap on the velocity used

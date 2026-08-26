@@ -256,6 +256,29 @@ services:
       MONITOR_PRED_LEAD_MOVE_RATE:   ${MONITOR_PRED_LEAD_MOVE_RATE:-0.5}    # /s, queue must be moving to spend the full budget
       MONITOR_PRED_LEAD_HARD_FLOOR:  ${MONITOR_PRED_LEAD_HARD_FLOOR:-65}    # band: never fire >65 below target ⇒ undershoot ≥ −64; 08-14 45→65
       MONITOR_PRED_LEAD_OUTER_FLOOR: ${MONITOR_PRED_LEAD_OUTER_FLOOR:-30}   # target ≥200: unchanged −30 guarantee
+      # PLACE-ANYWAY fallback (2026-08-26). The overshoot rails
+      # (queue_already_past_max, projection_exceeds_max) protect ACCURACY by
+      # declining to fire when the projected landing is past max — but their
+      # failure mode leaves the driver OUT of the queue entirely. On the 08-25
+      # leap #4354/#631/#0360 were armed and single-click-ready when the
+      # projection rail dropped all three (queue read 105 for 4 ticks, then
+      # leapt to 167 past the 40-wide fire window in one poll). For the driver, a
+      # bad position beats no position. When on, an overshoot rail becomes a
+      # best-effort FIRE instead of a miss:
+      #   off  — unchanged (record the miss, leave the driver out)
+      #   warm — fire best-effort ONLY if the armed single-click session is still
+      #          open (the proven <3 s path; the disarm is downstream of the skip
+      #          decision, so the session is alive when we claim it). If not
+      #          armed, fall back to the miss — never cold-fire a guaranteed
+      #          overshoot mid-leap (that lands ~+160 s late and inflates drift).
+      #   cold — fire best-effort ALWAYS (warm if armed, cold otherwise). Nobody
+      #          left out, at the cost of cold-path landings + extra drift.
+      # Enabled WARM 2026-08-26: recovers exactly the armed drivers the rails
+      # were throwing away, zero new cold fires. Best-effort landings overshoot
+      # +50..+70 (> the |err|≤30 bias filter) so they never poison bias learning.
+      # Baked in HERE, not .env — compose is the env authority (an unset .env is
+      # how the tick-pipe cascade kept resurrecting). Kill switch: set =off.
+      MONITOR_PLACE_ANYWAY:    ${MONITOR_PLACE_ANYWAY:-warm}
       # ⚠️ 2026-08-18 — TICK-PIPE LEAD (new, default on). Every decision in a
       # poll tick reads ONE inflight snapshot taken before any of that tick's
       # own fires clicked, so the inflight-scaled lead never counts the very

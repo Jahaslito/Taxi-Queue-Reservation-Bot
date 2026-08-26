@@ -971,6 +971,166 @@ describe('evaluatePositionScheduler — safety rails', () => {
     });
   });
 
+  // Place-anyway fallback (MONITOR_PLACE_ANYWAY): with the flag on, the two
+  // overshoot rails (queue_already_past_max, projection_exceeds_max) return a
+  // best-effort `place_anyway` fire instead of a `missed_impossible` miss, so a
+  // driver is never left OUT of the queue (2026-08-25 leap: #4354/#631/#0360
+  // were armed and single-click-ready when the projection rail dropped them).
+  // Two layers under test:
+  //   (1) the DECISION function flips both overshoot rails to `place_anyway`
+  //       (with the fire fields + a fallbackFrom miss) when the flag is on;
+  //   (2) the CALLER routing (resolvePlaceAnyway) turns that into a warm fire
+  //       or a fall-back-to-miss based on the driver's live armed state.
+  // Loaded in WARM mode via isolateModules; the default `monitor` (flag off)
+  // must still return the plain miss. A separate COLD block covers cold mode.
+  describe('place-anyway fallback (MONITOR_PLACE_ANYWAY=warm)', () => {
+    let evalPA, resolvePA, savedMode;
+    beforeAll(() => {
+      savedMode = process.env.MONITOR_PLACE_ANYWAY;
+      process.env.MONITOR_PLACE_ANYWAY = 'warm';
+      jest.isolateModules(() => {
+        const m = require('../../src/services/monitorService');
+        evalPA    = m._evaluatePositionScheduler;
+        resolvePA = m._resolvePlaceAnyway;
+      });
+    });
+    afterAll(() => {
+      if (savedMode === undefined) delete process.env.MONITOR_PLACE_ANYWAY;
+      else process.env.MONITOR_PLACE_ANYWAY = savedMode;
+    });
+
+    // ── Layer 1: the decision function ──────────────────────────────────────
+    describe('decision function turns the overshoot rails into place_anyway', () => {
+      test('flag OFF (default module) → still records the miss, never place_anyway', () => {
+        // queue past max
+        expect(_evaluatePositionScheduler(
+          makeState(), { ...baseCtx, waitingCount: 130 },
+        ).action).toBe('missed_impossible');
+        // projection past max
+        expect(_evaluatePositionScheduler(
+          makeState({ scheduledPosition: 100, maxAcceptablePosition: 120 }),
+          { ...baseCtx, waitingCount: 115, estimatedDrift: 50, effectiveGrowthRate: 3.0 },
+        ).action).toBe('missed_impossible');
+      });
+
+      test('queue already past max → place_anyway, carries fallbackFrom + fireOpts', () => {
+        const d = evalPA(makeState(), { ...baseCtx, waitingCount: 130 }); // > max 120
+        expect(d.action).toBe('place_anyway');
+        expect(d.reason).toBe('queue_already_past_max');
+        expect(d.effectivePosition).toBe(100);
+        expect(d.maxAcceptable).toBe(120);
+        expect(d.fireOpts.bestEffort).toBe(true);
+        expect(d.fireOpts.predictedLanding).toBe(131); // waitingCount + 1 (SAN appends at tail)
+        expect(d.fallbackFrom.action).toBe('missed_impossible');
+        expect(d.fallbackFrom.reason).toBe('queue_already_past_max');
+      });
+
+      test('projection exceeds max → place_anyway, carries effectivePosition + fireOpts', () => {
+        const d = evalPA(
+          makeState({ scheduledPosition: 100, maxAcceptablePosition: 120 }),
+          { ...baseCtx, waitingCount: 115, estimatedDrift: 50, effectiveGrowthRate: 3.0 }, // 115 + clamped lead > 120
+        );
+        expect(d.action).toBe('place_anyway');
+        expect(d.reason).toBe('projection_exceeds_max');
+        expect(d.effectivePosition).toBe(100);
+        expect(d.maxAcceptable).toBe(120);
+        expect(d.fireOpts.bestEffort).toBe(true);
+        expect(d.fireOpts.maxAcceptablePosition).toBe(120);
+        expect(d.fallbackFrom.action).toBe('missed_impossible');
+        expect(d.fallbackFrom.reason).toBe('projection_exceeds_max');
+      });
+
+      test('band target whose projection is past max → place_anyway (the 08-25 shape)', () => {
+        // A band driver (target 180, max 220) the storm has carried up to queue
+        // 215: projection 215 + clamped lead 10 = 225 > 220. Under the flag this
+        // becomes a best-effort fire instead of the drop the rail would record.
+        const d = evalPA(
+          makeState({ scheduledPosition: 180, maxAcceptablePosition: 220 }),
+          { ...baseCtx, waitingCount: 215, estimatedDrift: 50, effectiveGrowthRate: 3.0 },
+        );
+        expect(d.action).toBe('place_anyway');
+        expect(d.reason).toBe('projection_exceeds_max');
+        expect(d.effectivePosition).toBe(180);
+      });
+
+      test('queue already carried past max (target 180, max 220, queue 230) → place_anyway', () => {
+        // The other rail: displayed queue itself is already past max.
+        const d = evalPA(
+          makeState({ scheduledPosition: 180, maxAcceptablePosition: 220 }),
+          { ...baseCtx, waitingCount: 230, estimatedDrift: 50 },
+        );
+        expect(d.action).toBe('place_anyway');
+        expect(d.reason).toBe('queue_already_past_max');
+      });
+
+      test('does NOT hijack an in-window fire — normal fire path is untouched', () => {
+        const d = evalPA(makeState(), { ...baseCtx, waitingCount: 95, estimatedDrift: 30 }); // 95+clamp(10)=105 ≥ 100, ≤ 120
+        expect(d.action).toBe('fire');
+      });
+
+      test('does NOT hijack a wait — a driver still below target keeps waiting', () => {
+        const d = evalPA(makeState(), { ...baseCtx, waitingCount: 50, estimatedDrift: 5 }); // far below target 100
+        expect(d.action).toBe('wait');
+      });
+
+      test('best-effort overshoot lands outside the |err|≤30 bias filter (no poisoning)', () => {
+        // target 100, queue 130 → floor landing 131 → error +31 > 30 outlier cap.
+        const d = evalPA(makeState(), { ...baseCtx, waitingCount: 130 });
+        expect(d.fireOpts.predictedLanding - d.effectivePosition).toBeGreaterThan(30);
+      });
+    });
+
+    // ── Layer 2: the caller routing (resolvePlaceAnyway) in WARM mode ───────
+    describe('caller routing (resolvePlaceAnyway) — warm mode', () => {
+      const decision = {
+        action: 'place_anyway',
+        fallbackFrom: { action: 'missed_impossible', reason: 'projection_exceeds_max', logLine: 'x', metrics: {} },
+      };
+
+      test('ARMED driver → fires WARM (claims the open single-click session)', () => {
+        const r = resolvePA(decision, true);
+        expect(r.fire).toBe(true);
+        expect(r.warm).toBe(true);
+      });
+
+      test('UNARMED driver → does NOT fire; falls back to the miss (no cold fire in warm mode)', () => {
+        const r = resolvePA(decision, false);
+        expect(r.fire).toBe(false);
+        expect(r.miss).toBe(decision.fallbackFrom);
+      });
+    });
+  });
+
+  // Cold mode: the aggressive "literally nobody left out" setting. Same decision
+  // output as warm; the routing difference is that an UNARMED driver still fires
+  // (cold path) instead of falling back to the miss.
+  describe('place-anyway fallback (MONITOR_PLACE_ANYWAY=cold)', () => {
+    let resolvePA, savedMode;
+    beforeAll(() => {
+      savedMode = process.env.MONITOR_PLACE_ANYWAY;
+      process.env.MONITOR_PLACE_ANYWAY = 'cold';
+      jest.isolateModules(() => {
+        resolvePA = require('../../src/services/monitorService')._resolvePlaceAnyway;
+      });
+    });
+    afterAll(() => {
+      if (savedMode === undefined) delete process.env.MONITOR_PLACE_ANYWAY;
+      else process.env.MONITOR_PLACE_ANYWAY = savedMode;
+    });
+
+    const decision = { action: 'place_anyway', fallbackFrom: { action: 'missed_impossible' } };
+
+    test('ARMED driver → fires WARM', () => {
+      const r = resolvePA(decision, true);
+      expect(r).toEqual({ fire: true, warm: true });
+    });
+
+    test('UNARMED driver → fires COLD (never left out)', () => {
+      const r = resolvePA(decision, false);
+      expect(r).toEqual({ fire: true, warm: false });
+    });
+  });
+
   // Predictive band lead (MONITOR_PREDICTIVE_LEAD) — burst-window lead sized to
   // inflight when the queue is moving: D = clamp(19 + 0.86·inflight, 20, 45),
   // replacing the flat POS_MAX_LEAD clamp. Loaded with the flag ON via

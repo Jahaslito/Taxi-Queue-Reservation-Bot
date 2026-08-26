@@ -529,6 +529,33 @@ function planFirePacing(sortedTargets, inflight, waitingCount, minHold = PACE_MI
 const ONSET_FIRE_MODE   = String(process.env.MONITOR_ONSET_FIRE ?? '0').toLowerCase();
 const ONSET_FIRE_LIVE   = ONSET_FIRE_MODE === '1';
 const ONSET_FIRE_SHADOW = ONSET_FIRE_MODE === 'shadow';
+
+// ─── Place-anyway fallback (MONITOR_PLACE_ANYWAY) ──────────────────────────
+// The overshoot rails (queue_already_past_max, projection_exceeds_max) protect
+// ACCURACY by declining to fire when the projected landing is past max. Their
+// failure mode is that the driver is left OUT of the queue entirely — on the
+// 2026-08-25 leap, #4354/#631/#0360 were armed and single-click-ready, held by
+// the −65 floor while the queue read 105 for four ticks, then the queue leapt
+// to 167 (past the 40-wide fire window in one poll) and the projection rail
+// dropped all three. For the driver, a bad position beats no position.
+//
+// When on, an overshoot rail becomes a best-effort FIRE instead of a miss:
+//   off  (default) — unchanged: record the miss, leave the driver out.
+//   warm           — fire best-effort ONLY if the armed single-click session
+//                    is still open (the proven <3 s path). If not armed, fall
+//                    back to the miss (a cold fire on a guaranteed-overshoot
+//                    driver mid-leap lands ~+160 s later and inflates everyone
+//                    else's drift — see the warm-refire ladder note). This is
+//                    the recommended setting: it recovers exactly the armed
+//                    drivers the rails were throwing away, zero new cold fires.
+//   cold (or 1)    — fire best-effort ALWAYS (warm if armed, cold otherwise).
+//                    Guarantees literally nobody is left out, at the cost of
+//                    cold-path landings and extra self-inflicted drift.
+// Best-effort landings overshoot by +50..+70, which is > the |err|≤30 bias
+// outlier filter, so they never poison the bias/drift learning.
+const PLACE_ANYWAY_MODE    = String(process.env.MONITOR_PLACE_ANYWAY ?? 'off').toLowerCase();
+const PLACE_ANYWAY_ON      = PLACE_ANYWAY_MODE === 'warm' || PLACE_ANYWAY_MODE === 'cold' || PLACE_ANYWAY_MODE === '1';
+const PLACE_ANYWAY_COLD_OK = PLACE_ANYWAY_MODE === 'cold' || PLACE_ANYWAY_MODE === '1';
 // 2026-07-28: zone floor 40→20 — the regime moved (July onsets begin at queue
 // 26–36, 20 of 21 days below the old floor, so detection armed a chunk late by
 // construction). Safe by the calm-guard above: a 9-week replay found pre-storm
@@ -2388,6 +2415,42 @@ function claimArmedFireSession(driverId) {
   }
 }
 
+/**
+ * Non-consuming peek: does this driver have a parked, ready-to-click session
+ * right now? Used by the place-anyway fallback to decide warm (fire the open
+ * click) vs. skip, WITHOUT claiming the session (claimArmedFireSession removes
+ * it from the map). Failure-safe: any error means "not armed".
+ */
+function hasArmedFireSession(driverId) {
+  if (!PREARM_ENABLED) return false;
+  try {
+    return require('./botService').hasArmedFireSession(driverId);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Route a `place_anyway` decision given the driver's live armed state. Pure —
+ * no I/O — so the warm/cold policy is unit-testable without botService.
+ *
+ *   warm mode (PLACE_ANYWAY_COLD_OK=false):
+ *     armed   → fire warm (claim the still-open single-click session)
+ *     unarmed → do NOT fire; fall back to recording the miss. A cold fire on a
+ *               guaranteed-overshoot driver mid-leap lands ~+160 s late and
+ *               inflates everyone else's drift, so warm mode never does it.
+ *   cold mode (PLACE_ANYWAY_COLD_OK=true):
+ *     armed   → fire warm;  unarmed → fire cold (launch() cold-paths it).
+ *
+ * Returns { fire:true, warm } to push to the fire batch, or { fire:false, miss }
+ * to record decision.fallbackFrom (the original miss) unchanged.
+ */
+function resolvePlaceAnyway(decision, armed) {
+  if (armed)              return { fire: true,  warm: true  };
+  if (PLACE_ANYWAY_COLD_OK) return { fire: true,  warm: false };
+  return { fire: false, miss: decision.fallbackFrom };
+}
+
 /** Failure-path disposal for a claimed session (idempotent, never throws). */
 function disposeClaimedFireSession(session, reason) {
   if (!session) return;
@@ -2594,11 +2657,34 @@ function evaluatePositionScheduler(state, ctx) {
   // "target 350, actual 481" which is meaningless data. Mark the row as
   // missed_impossible so the admin UI shows what happened.
   if (waitingCount > maxAcceptable) {
-    return {
+    const missDecision = {
       action:  'missed_impossible',
       reason:  'queue_already_past_max',
       logLine: `[Pos] ${veh} — ✗ queue ${waitingCount} > max ${maxAcceptable} (target ${effectivePosition}) — too late, skipping`,
       metrics: { ...baseMetrics, queueSize: waitingCount },
+    };
+    if (!PLACE_ANYWAY_ON) return missDecision;
+    return {
+      action:            'place_anyway',
+      reason:            'queue_already_past_max',
+      effectivePosition,
+      maxAcceptable,
+      fallbackFrom:      missDecision, // caller records this if it declines to fire (warm-only + unarmed)
+      logLine: `[Pos] ${veh} — ⚠ place-anyway: queue ${waitingCount} > max ${maxAcceptable} (target ${effectivePosition}) — firing best-effort to avoid a miss`,
+      fireOpts: {
+        growthRate:            effectiveGrowthRate,
+        estimatedDrift,
+        predictedLanding:      waitingCount + 1, // floor — SAN appends at the tail
+        maxAcceptablePosition: maxAcceptable,
+        bestEffort:            true,
+      },
+      metrics: {
+        ...baseMetrics,
+        queueSize:        waitingCount,
+        growthRate:       effectiveGrowthRate,
+        estimatedDrift,
+        predictedLanding: waitingCount + 1,
+      },
     };
   }
 
@@ -2733,19 +2819,39 @@ function evaluatePositionScheduler(state, ctx) {
   // where the queue is already past max; this one covers "still below max
   // right now, but the projected landing is past max."
   if (displayedProjection > maxAcceptable) {
-    return {
+    const missMetrics = {
+      ...baseMetrics,
+      queueSize:        waitingCount,
+      growthRate:       effectiveGrowthRate,
+      estimatedDrift,
+      predictedLanding: Math.round(displayedProjection),
+    };
+    const missDecision = {
       action:  'missed_impossible',
       reason:  'projection_exceeds_max',
       logLine: `[Pos] ${veh} — ✗ projection ${displayedProjection.toFixed(1)} > max ${maxAcceptable} ` +
                `(queue ${waitingCount} + lead ${Number.isInteger(lead) ? lead : lead.toFixed(1)}${leadNote}, ` +
                `target ${effectivePosition}) — too late, skipping`,
-      metrics: {
-        ...baseMetrics,
-        queueSize:        waitingCount,
-        growthRate:       effectiveGrowthRate,
+      metrics: missMetrics,
+    };
+    if (!PLACE_ANYWAY_ON) return missDecision;
+    return {
+      action:            'place_anyway',
+      reason:            'projection_exceeds_max',
+      effectivePosition,
+      maxAcceptable,
+      fallbackFrom:      missDecision, // caller records this if it declines to fire (warm-only + unarmed)
+      logLine: `[Pos] ${veh} — ⚠ place-anyway: projection ${displayedProjection.toFixed(1)} > max ${maxAcceptable} ` +
+               `(queue ${waitingCount} + lead ${Number.isInteger(lead) ? lead : lead.toFixed(1)}, ` +
+               `target ${effectivePosition}) — firing best-effort to avoid a miss`,
+      fireOpts: {
+        growthRate:            effectiveGrowthRate,
         estimatedDrift,
-        predictedLanding: Math.round(displayedProjection),
+        predictedLanding:      Math.round(displayedProjection),
+        maxAcceptablePosition: maxAcceptable,
+        bestEffort:            true,
       },
+      metrics: missMetrics,
     };
   }
 
@@ -4114,6 +4220,25 @@ async function poll() {
         fireBatch.push({ driverId, state, decision });
         break;
 
+      case 'place_anyway': {
+        // Overshoot rail with MONITOR_PLACE_ANYWAY on: rather than leave the
+        // driver out of the queue, fire best-effort. resolvePlaceAnyway decides
+        // fire-vs-fall-back from the live armed state (see the helper for the
+        // warm/cold rules and why warm never cold-fires).
+        const routing = resolvePlaceAnyway(decision, hasArmedFireSession(driverId));
+        if (!routing.fire) {
+          const miss = routing.miss;
+          console.log(miss.logLine);
+          recordPositionDecision(state, miss.action, miss.reason, miss.metrics);
+          state.positionFiredToday = true;
+          break;
+        }
+        console.log(`${decision.logLine} [${routing.warm ? 'warm' : 'cold'}]`);
+        state.positionFiredToday = true; // mark before enqueuing — prevents double-trigger
+        fireBatch.push({ driverId, state, decision });
+        break;
+      }
+
       case 'missed_impossible':
         // Queue is already past max — firing now would land far above max.
         // Record the row for visibility and mark fired so the monitor's
@@ -5239,6 +5364,7 @@ module.exports = {
   _planFirePacing:            planFirePacing,
   _isWithinOperatingHours:    isWithinOperatingHours,
   _evaluatePositionScheduler: evaluatePositionScheduler,
+  _resolvePlaceAnyway:        resolvePlaceAnyway,
   // Storm-watch cadence & prearm (pure) — see stormWatchCadence.test.js
   _computeStormReadiness:     computeStormReadiness,
   _computePrearmReady:        computePrearmReady,

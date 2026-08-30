@@ -254,7 +254,7 @@ services:
       MONITOR_PRED_LEAD_MIN_TARGET:  ${MONITOR_PRED_LEAD_MIN_TARGET:-70}    # aggressive lead + band floor only for target ≥ this
       MONITOR_PRED_LEAD_MAX_TARGET:  ${MONITOR_PRED_LEAD_MAX_TARGET:-199}   # …and ≤ this (the avalanche band)
       MONITOR_PRED_LEAD_MOVE_RATE:   ${MONITOR_PRED_LEAD_MOVE_RATE:-0.5}    # /s, queue must be moving to spend the full budget
-      MONITOR_PRED_LEAD_HARD_FLOOR:  ${MONITOR_PRED_LEAD_HARD_FLOOR:-65}    # band: never fire >65 below target ⇒ undershoot ≥ −64; 08-14 45→65
+      MONITOR_PRED_LEAD_HARD_FLOOR:  ${MONITOR_PRED_LEAD_HARD_FLOOR:-35}    # band: never fire >35 below target ⇒ undershoot ≥ −34; 08-29 65→35 (kills the −60 seed landings; ±10 held ~9% in replay). Revert to 65 if overshoot worsens.
       MONITOR_PRED_LEAD_OUTER_FLOOR: ${MONITOR_PRED_LEAD_OUTER_FLOOR:-30}   # target ≥200: unchanged −30 guarantee
       # PLACE-ANYWAY fallback (2026-08-26). The overshoot rails
       # (queue_already_past_max, projection_exceeds_max) protect ACCURACY by
@@ -701,6 +701,14 @@ services:
       # `off` (sim: pacing hurts low-concentration days). The `[Pace]` line says
       # ENGAGED vs "not engaged".
       MONITOR_PACE_MIN_HOLD:       ${MONITOR_PACE_MIN_HOLD:-5}
+      # TARGET SCOPE (2026-08-29). 0 = pace the whole batch. 100 = pace ONLY
+      # targets ≥100 (the crawl zone whose overshoot is SELF-INFLICTED: organic
+      # crawls above 100 at 0.2-0.8/s but our own same-tick dump leaps the queue
+      # past it and sweeps our high-target drivers). The 70-100 flood band fires
+      # immediately (can't win it on commit speed). With MONITOR_FIRE_PACING at
+      # its 'shadow' default this only LOGS what pacing ≥100 would do (the
+      # go/no-go data) — zero behaviour change until FIRE_PACING is set to 'on'.
+      MONITOR_PACE_MIN_TARGET:     ${MONITOR_PACE_MIN_TARGET:-100}
       # Persistent vehicle_not_available = broken SAN account/vehicle data
       # (the #142/#70/#4006 class): after N consecutive not-available arm
       # attempts, suspend re-arming that driver for the suspend window instead

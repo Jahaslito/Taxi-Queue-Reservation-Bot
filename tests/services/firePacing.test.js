@@ -76,4 +76,35 @@ describe('fire-pacing planner', () => {
     expect(r.releases.slice(0, 3).every(Boolean)).toBe(true);
     expect(r.releases.slice(3).some(Boolean)).toBe(false);
   });
+
+  // ── Target scope (MONITOR_PACE_MIN_TARGET, 2026-08-29) ──────────────────────
+  describe('target scope: pace only ≥ minTarget', () => {
+    test('below-scope targets always fire and never count toward the hold gate', () => {
+      // minTarget 100. Batch: 20 low (target 70-89, below scope) + 20 high (≥100).
+      // inflight 0, cap 12, queue 20 (nothing urgent). Only the 20 high are paced:
+      // 12 fire, 8 hold. All 20 low fire unconditionally.
+      const low  = Array.from({ length: 20 }, (_, i) => 70 + i);   // 70..89
+      const high = Array.from({ length: 20 }, (_, i) => 100 + i);  // 100..119
+      const r = plan([...low, ...high], 0, 20, 5, 100);
+      expect(r.engaged).toBe(true);
+      expect(r.fired).toBe(12);            // only in-scope fires are metered
+      expect(r.held).toBe(8);              // 20 high − 12 slots
+      expect(r.releases.slice(0, 20).every(Boolean)).toBe(true); // all low fire
+      // 12 of the 20 high fire, 8 hold
+      expect(r.releases.slice(20).filter(Boolean).length).toBe(12);
+    });
+
+    test('minTarget 0 (default) paces the whole batch — unchanged behaviour', () => {
+      const targets = Array.from({ length: 20 }, (_, i) => 70 + i);
+      const r = plan(targets, 0, 20, 5, 0);
+      expect(r.fired).toBe(12);
+      expect(r.held).toBe(8);
+    });
+
+    test('an all-below-scope batch is a pure no-op (nothing paced)', () => {
+      const r = plan([70, 75, 80, 85, 90], 0, 20, 5, 100);
+      expect(r.held).toBe(0);
+      expect(r.releases.every(Boolean)).toBe(true);
+    });
+  });
 });

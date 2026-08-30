@@ -447,6 +447,15 @@ const PREARM_QUEUE_POS  = parseInt(process.env.MONITOR_PREARM_QUEUE_POS ?? '22',
 //   on     — actually hold over-cap, non-urgent fires to the next tick.
 const FIRE_PACING_MODE     = String(process.env.MONITOR_FIRE_PACING ?? 'off').toLowerCase();
 const PACE_MAX_INFLIGHT    = Math.max(1, parseInt(process.env.MONITOR_PACE_MAX_INFLIGHT ?? '12', 10));
+// TARGET SCOPE (2026-08-29). 0 = pace the whole batch (original behaviour). Set
+// >0 to pace ONLY targets ≥ this — the 08-29 finding is that the 100-199 band
+// overshoot is SELF-INFLICTED: organic crawls above 100 (0.2-0.8/s every day)
+// but our own same-tick dump leaps the queue past it (89→216) and sweeps our
+// own high-target drivers. Scoping the gate to ≥100 meters just those fires so
+// we stop inflating their zone, while the 70-100 flood band (which we can't win
+// on commit speed anyway) still fires immediately. Drivers below the scope are
+// exempt: always released, never counted toward the hold/concentration gate.
+const PACE_MIN_TARGET      = Math.max(0, parseInt(process.env.MONITOR_PACE_MIN_TARGET ?? '0', 10));
 // A driver whose live queue is already within this many positions of its target
 // has no runway to be held (holding → guaranteed overshoot) → always release.
 const PACE_URGENCY_MARGIN  = Math.max(0, parseInt(process.env.MONITOR_PACE_URGENCY_MARGIN ?? '25', 10));
@@ -467,11 +476,15 @@ const paceDriftEst = (inflight) => Math.round(19 + 0.86 * inflight);
 // no runway (queue already within URGENCY_MARGIN of its target) is always
 // released (holding it would only deepen its overshoot). Returns per-item
 // release booleans + counts. Deterministic and side-effect free (unit-tested).
-function planFirePacing(sortedTargets, inflight, waitingCount, minHold = PACE_MIN_HOLD) {
+function planFirePacing(sortedTargets, inflight, waitingCount, minHold = PACE_MIN_HOLD, minTarget = PACE_MIN_TARGET) {
   let slots = Math.max(0, PACE_MAX_INFLIGHT - inflight);
   const releases = [];
   let fired = 0, held = 0, urgent = 0;
   for (const target of sortedTargets) {
+    // Below the pacing scope (e.g. the 70-100 flood band when minTarget=100):
+    // never paced — always release, and don't consume a slot or count toward the
+    // hold/concentration gate. Only in-scope (≥ minTarget) fires are metered.
+    if (target < minTarget) { releases.push(true); continue; }
     const noRunway = waitingCount >= target - PACE_URGENCY_MARGIN;
     const release  = slots > 0 || noRunway;
     if (release) {
@@ -4311,7 +4324,10 @@ async function poll() {
 
       const pacedPeak   = Math.min(PACE_MAX_INFLIGHT, inflight + fired) + urgent;
       const unpacedPeak = inflight + fireBatch.length;
-      console.log(`[Pace] ${FIRE_PACING_MODE.toUpperCase()} — batch ${fireBatch.length}, inflight ${inflight} (cap ${PACE_MAX_INFLIGHT}): `
+      const scopeNote = PACE_MIN_TARGET > 0
+        ? ` [scope: pacing target ≥${PACE_MIN_TARGET}, ${targets.filter((t) => t >= PACE_MIN_TARGET).length}/${fireBatch.length} in scope]`
+        : '';
+      console.log(`[Pace] ${FIRE_PACING_MODE.toUpperCase()}${scopeNote} — batch ${fireBatch.length}, inflight ${inflight} (cap ${PACE_MAX_INFLIGHT}): `
         + `${engaged ? `ENGAGED fire ${fired} / hold ${held}${urgent ? ` (urgent-release ${urgent})` : ''}` : `not engaged (would hold <${PACE_MIN_HOLD}) — all ${fireBatch.length} fire`}; `
         + `est peak inflight paced ~${pacedPeak} vs unpaced ~${unpacedPeak} → est drift ~${paceDriftEst(pacedPeak)} vs ~${paceDriftEst(unpacedPeak)}`);
     }

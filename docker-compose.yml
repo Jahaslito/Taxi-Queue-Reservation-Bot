@@ -254,7 +254,7 @@ services:
       MONITOR_PRED_LEAD_MIN_TARGET:  ${MONITOR_PRED_LEAD_MIN_TARGET:-70}    # aggressive lead + band floor only for target ≥ this
       MONITOR_PRED_LEAD_MAX_TARGET:  ${MONITOR_PRED_LEAD_MAX_TARGET:-199}   # …and ≤ this (the avalanche band)
       MONITOR_PRED_LEAD_MOVE_RATE:   ${MONITOR_PRED_LEAD_MOVE_RATE:-0.5}    # /s, queue must be moving to spend the full budget
-      MONITOR_PRED_LEAD_HARD_FLOOR:  ${MONITOR_PRED_LEAD_HARD_FLOOR:-35}    # band: never fire >35 below target ⇒ undershoot ≥ −34; 08-29 65→35 (kills the −60 seed landings; ±10 held ~9% in replay). Revert to 65 if overshoot worsens.
+      MONITOR_PRED_LEAD_HARD_FLOOR:  ${MONITOR_PRED_LEAD_HARD_FLOOR:-65}    # band: never fire >65 below target. REVERTED 35→65 on 08-31: the 08-30 storm showed 35 HELD high-target fires past their max-rail window (#0911 tgt150 could fire at q98/proj151<max190 but was held to q115, missed at q135) → 66 max-rail hits (59 place-anyway +67, 7 miss) vs 0-11 normally, SAME storm violence. The −60 undershoot is capped separately by MONITOR_LADDER_SEED_GAP below (seed-only, no window narrowing).
       MONITOR_PRED_LEAD_OUTER_FLOOR: ${MONITOR_PRED_LEAD_OUTER_FLOOR:-30}   # target ≥200: unchanged −30 guarantee
       # PLACE-ANYWAY fallback (2026-08-26). The overshoot rails
       # (queue_already_past_max, projection_exceeds_max) protect ACCURACY by
@@ -320,7 +320,7 @@ services:
       # at SEED_SHALLOW (29 ⇒ worst −28, the original −30 contract) — a
       # target-50 driver can never be seeded to position ~2. Empty = inherit
       # HARD_FLOOR; 0 disables the tier.
-      MONITOR_LADDER_SEED_GAP:     ${MONITOR_LADDER_SEED_GAP:-}
+      MONITOR_LADDER_SEED_GAP:     ${MONITOR_LADDER_SEED_GAP:-35}   # 08-31: cap ONLY the pre-onset seed at −35 (was inheriting HARD_FLOOR). Kills the target-70-at-queue-5 → position-14 landings WITHOUT narrowing the normal-fire window (that stays at the −65 hard floor). Decouples "no deep seed" from "fire high targets early enough to be placed".
       MONITOR_LADDER_SEED_SHALLOW: ${MONITOR_LADDER_SEED_SHALLOW:-29}
       MONITOR_LADDER_SEED_AFTER:   ${MONITOR_LADDER_SEED_AFTER:-03:45}
       # Seed GROWTH gate (2026-08-24): the seed spends undershoot ONLY when the

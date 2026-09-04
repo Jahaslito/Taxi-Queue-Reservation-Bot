@@ -325,6 +325,29 @@ const LADDER_SEED_GAP = (() => {
   return Number.isFinite(v) ? v : PRED_LEAD_HARD_FLOOR;
 })();
 const LADDER_SEED_SHALLOW = parseInt(process.env.MONITOR_LADDER_SEED_SHALLOW ?? '29', 10);
+// 2026-09-03 — DEEP cap split from SHALLOW. The chain must be able to IGNITE
+// from an EMPTY queue by the clock (every one of the last 8 storms hit while
+// our chain was still waiting for the queue to reach target−cap; 09-03: one
+// seed fired, then 137 drivers met the flood reactively → 4% ±10, 14 misses,
+// worst +171). Ignition needs SHALLOW ≥ the lowest target (so the first rung
+// is reachable at queue 0) — but that same number must NOT let a ≥200 target
+// be seeded 70 under once our own chain lifts the queue to ~130. DEEP caps the
+// ≥200 seeds on their own (default = SHALLOW, i.e. unchanged behaviour).
+const LADDER_SEED_DEEP = (() => {
+  const v = parseInt(process.env.MONITOR_LADDER_SEED_DEEP ?? '', 10);
+  return Number.isFinite(v) ? v : LADDER_SEED_SHALLOW;
+})();
+// 2026-09-03 (operator) — QUEUE FLOOR for the deep seed. The up-to-70 seed lead
+// may not fire into a queue shallower than this: hold every seed candidate until
+// the effective queue has reached SEED_MIN_QUEUE, THEN release ascending by
+// target (the seed pass already sorts lowest-target-first). This lifts the whole
+// chain's landing floor by ~this many positions — a target-46 driver is placed
+// at ~queue 21 (−25), never at position 1 (−45) — at the cost of a later
+// ignition (the queue must reach the floor organically before the chain starts;
+// on a morning that stays flat until the leap the seed holds and the onset/
+// predictive paths take over). Set 0 to ignite from an empty queue.
+const LADDER_SEED_MIN_QUEUE = Math.max(0,
+  parseInt(process.env.MONITOR_LADDER_SEED_MIN_QUEUE ?? '10', 10) || 0);
 // Seed GROWTH gate (2026-08-24, per operator: "if it is calm the undershoot
 // should be minimal — the early shoot must be informed by how the list is
 // growing, not fire just because a target is in range"). The seed tier spends
@@ -1128,9 +1151,15 @@ let onsetState = freshOnsetState();
 // cap ladder, not one line per tick.
 let lastLoggedOnsetCap = 0;
 
-function onsetStep(st, { queue, rate, nowMs = Date.now() }) {
+// `ours` (optional) = cumulative count of OUR OWN ladder/seed adds. The render
+// step is measured net of the adds we committed between the two polls, so our
+// chain (up to SEED_MAX_INFLIGHT landings in one 5 s render) cannot satisfy
+// ONSET_STEP on its own and flip the tick to the onset-dump machinery. Omitted
+// (legacy callers/tests) → raw step, unchanged behaviour.
+function onsetStep(st, { queue, rate, nowMs = Date.now(), ours }) {
   const changed = st.prevQueue !== null && queue !== st.prevQueue;
-  const step    = changed ? Math.max(0, queue - st.prevQueue) : 0;
+  const ownStep = (ours != null && st.prevOurs != null) ? Math.max(0, ours - st.prevOurs) : 0;
+  const step    = changed ? Math.max(0, queue - st.prevQueue - ownStep) : 0;
 
   const recentSteps = st.recentSteps
     .filter((s) => nowMs - s.t <= ONSET_EVIDENCE_WINDOW_MS)
@@ -1146,7 +1175,7 @@ function onsetStep(st, { queue, rate, nowMs = Date.now() }) {
     active = false;
   }
 
-  return { active, prevQueue: queue, lastEvidenceMs, recentSteps, stepSeen: step };
+  return { active, prevQueue: queue, prevOurs: ours ?? null, lastEvidenceMs, recentSteps, stepSeen: step };
 }
 
 /** Calm-morning guard: the early-fire allowance actually in force. Scales with
@@ -1416,9 +1445,9 @@ const recentObservations = [];
 // Time-bounded observation buffer for the predictive-lead velocity (independent
 // of poll cadence — recentObservations is capped by COUNT and won't reliably
 // span PRED_VEL_WINDOW_S once adaptive polling tightens). Holds ~2× the window.
-const velocityObservations = []; // [{ t: ms, q: count }], oldest first
+const velocityObservations = []; // [{ t: ms, q: count, ours }], oldest first
 function recordVelocityObservation(count, atMs) {
-  velocityObservations.push({ t: atMs, q: count });
+  velocityObservations.push({ t: atMs, q: count, ours: ladderAddsCommitted });
   const cutoff = atMs - PRED_VEL_WINDOW_S * 2 * 1000;
   while (velocityObservations.length > 2 && velocityObservations[0].t < cutoff) {
     velocityObservations.shift();
@@ -1426,6 +1455,14 @@ function recordVelocityObservation(count, atMs) {
 }
 // Trailing slope (positions/sec) over the last PRED_VEL_WINDOW_S, floored at 0
 // and capped at PRED_VEL_CAP so a single-tick surge can't inflate the lead.
+// 2026-09-03: EXTERNAL velocity — our own ladder/seed adds are subtracted (the
+// same correction sustainedRise already applies). Before this the chain's own
+// motion tripped LADDER_MAX_VEL (0.5/s) and the ladderChainActive release at
+// 1.0/s, so a 4-5/tick chain throttled itself and could hand the tick back to
+// the predictive-lead dump (08-24 replay: 42 pred fires in 9 s off chain
+// motion). A real flood (5-15/s) still shows through; the chain (~0.8/s) does
+// not. Our adds are counted at FIRE and land ~5 s later, so the correction can
+// briefly over-subtract (floored at 0) — conservative in the safe direction.
 function observedVelocity(nowMs) {
   if (velocityObservations.length < 2) return 0;
   const newest = velocityObservations[velocityObservations.length - 1];
@@ -1435,7 +1472,21 @@ function observedVelocity(nowMs) {
   for (const o of velocityObservations) { if (o.t <= target) base = o; else break; }
   const dt = (newest.t - base.t) / 1000;
   if (dt <= 0) return 0;
-  return Math.min(Math.max(0, (newest.q - base.q) / dt), PRED_VEL_CAP);
+  const ours = Math.max(0, (newest.ours ?? 0) - (base.ours ?? 0));
+  return Math.min(Math.max(0, (newest.q - base.q - ours) / dt), PRED_VEL_CAP);
+}
+/** Our own ladder/seed add rate (positions/s) over the velocity window — the
+ *  part of the displayed growth that is us, fed to the onset detector so the
+ *  chain cannot declare a storm on itself. */
+function ownAddRate(nowMs) {
+  if (velocityObservations.length < 2) return 0;
+  const newest = velocityObservations[velocityObservations.length - 1];
+  const target = nowMs - PRED_VEL_WINDOW_S * 1000;
+  let base = velocityObservations[0];
+  for (const o of velocityObservations) { if (o.t <= target) base = o; else break; }
+  const dt = (newest.t - base.t) / 1000;
+  if (dt <= 0) return 0;
+  return Math.max(0, ((newest.ours ?? 0) - (base.ours ?? 0)) / dt);
 }
 
 // ─── Sustained-growth tracker (ladder SEED gate — MONITOR_LADDER_SEED_GAP) ────
@@ -1446,9 +1497,10 @@ function observedVelocity(nowMs) {
 // informed by genuine growth. This buffer keeps a longer window (SEED window)
 // so sustainedRise() reports the NET positions the queue has climbed. A dead
 // morning nets ~0; a real ramp nets clearly positive well before the leap.
-// Cumulative count of OUR OWN ladder/seed adds — subtracted from the queue
-// before measuring rise (see below). Monotonic; the DIFFERENCE between two
-// samples is all sustainedRise uses, so it never needs a daily reset.
+// Cumulative count of OUR OWN adds (ladder/seed at promotion, every other fire
+// at launch — 2026-09-03) — subtracted from the queue before measuring rise /
+// velocity / onset step. Monotonic; only DIFFERENCES between samples are used,
+// so it never needs a daily reset.
 let ladderAddsCommitted = 0;
 // Proactive-shadow walk (MONITOR_LADDER_PROACTIVE=shadow): drivers already
 // logged as "would proactively seed" today, so the shadow pass advances one per
@@ -2899,10 +2951,11 @@ function evaluatePositionScheduler(state, ctx) {
   // Seed budget for THIS target (see LADDER_SEED_GAP): full budget only inside
   // the avalanche band, the −30-contract cap everywhere else — a shallow
   // target must never be seeded 40-60 under.
-  const seedBudget = (effectivePosition >= PRED_LEAD_MIN_TARGET
-      && effectivePosition <= PRED_LEAD_MAX_TARGET)
-    ? LADDER_SEED_GAP
-    : Math.min(LADDER_SEED_GAP, LADDER_SEED_SHALLOW);
+  const seedBudget = effectivePosition > PRED_LEAD_MAX_TARGET
+    ? Math.min(LADDER_SEED_GAP, LADDER_SEED_DEEP)      // ≥200: never chained deep
+    : (effectivePosition >= PRED_LEAD_MIN_TARGET
+      ? LADDER_SEED_GAP                                 // band 70-199
+      : Math.min(LADDER_SEED_GAP, LADDER_SEED_SHALLOW)); // <70: the ignition rungs
   // GROWTH-SCALED depth (see the SEED growth-gate block): the seed may spend
   // undershoot only in proportion to how much the list has actually climbed.
   // Dead calm ⇒ seedRise < MIN_RISE ⇒ growthAllow 0 ⇒ NO growth seed. As the
@@ -2939,6 +2992,7 @@ function evaluatePositionScheduler(state, ctx) {
   const seedInFunnel = !seedPromote
     && seedModeOn && LADDER_SEED_GAP > 0
     && seedWindowOpen
+    && effectiveQueue >= LADDER_SEED_MIN_QUEUE  // deep seed holds until queue ≥ floor (operator, 09-03)
     && !onsetActive
     && observedVelocity < LADDER_MAX_VEL
     && onsetGap > LADDER_GAP && onsetGap <= seedFunnelAllow;
@@ -3872,7 +3926,14 @@ async function poll() {
   let onsetBoost = 0;
   if (ONSET_FIRE_LIVE || ONSET_FIRE_SHADOW) {
     const wasActive = onsetState.active;
-    onsetState = onsetStep(onsetState, { queue: waitingCount, rate: effectiveGrowthRate });
+    // External evidence only: our own chain adds are removed from both the
+    // render step (ours) and the rate, so the pre-onset chain can never
+    // self-trigger the onset dump (see onsetStep / ownAddRate, 2026-09-03).
+    onsetState = onsetStep(onsetState, {
+      queue: waitingCount,
+      rate:  Math.max(0, effectiveGrowthRate - ownAddRate(Date.now())),
+      ours:  ladderAddsCommitted,
+    });
     if (onsetState.active !== wasActive) {
       console.log(onsetState.active
         ? `[Pos] ⚡ storm ONSET detected (queue ${waitingCount}, rate ${effectiveGrowthRate.toFixed(2)}/s, ` +
@@ -4292,9 +4353,16 @@ async function poll() {
     fireBatch.sort((a, b) =>
       (a.decision.effectivePosition ?? Infinity) - (b.decision.effectivePosition ?? Infinity));
 
-    const launch = ({ driverId, state, decision }) =>
-      triggerPositionSchedule(driverId, state, decision.effectivePosition, decision.fireOpts)
+    const launch = ({ driverId, state, decision }) => {
+      // Every add we launch is OURS for the external-growth signals (velocity,
+      // onset step/rate, sustainedRise) — not just the ladder-tagged ones. The
+      // calm chain is ~40% projection fires (gap ≤ 10 rungs), and those were
+      // invisible to the correction until 2026-09-03. Ladder/seed fires were
+      // already counted at promotion; count the rest here, at launch.
+      if (decision.reason !== 'ladder_fire') ladderAddsCommitted++;
+      return triggerPositionSchedule(driverId, state, decision.effectivePosition, decision.fireOpts)
         .catch(console.error);
+    };
 
     if (FIRE_PACING_MODE === 'off') {
       for (const item of fireBatch) launch(item);
@@ -5397,6 +5465,9 @@ module.exports = {
   _sustainedRise:             sustainedRise,
   _recordSeedQueueObservation: recordSeedQueueObservation,
   _bumpLadderAdds:            (n = 1) => { ladderAddsCommitted += n; },
+  _recordVelocityObservation: recordVelocityObservation,
+  _observedVelocity:          observedVelocity,
+  _ownAddRate:                ownAddRate,
   _runLadderSeedShadowPass:   runLadderSeedShadowPass,
   _onsetBacklogBoost:         onsetBacklogBoost,
   _maybeFlagUnderRescue:      maybeFlagUnderRescue,

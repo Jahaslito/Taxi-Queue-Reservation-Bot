@@ -278,7 +278,13 @@ services:
       # +50..+70 (> the |err|≤30 bias filter) so they never poison bias learning.
       # Baked in HERE, not .env — compose is the env authority (an unset .env is
       # how the tick-pipe cascade kept resurrecting). Kill switch: set =off.
-      MONITOR_PLACE_ANYWAY:    ${MONITOR_PLACE_ANYWAY:-warm}
+      # 2026-09-03: warm→cold. 14 drivers ended 09-03 with NO position: the
+      # projection rail skipped them ("too late"), warm found no parked session
+      # (roster 137 > armed pool 100; sessions released mid-leap), and the miss
+      # latched them as "already fired today". Operator rule: a driver must
+      # ALWAYS get a position — a late one beats none. With the chain seating
+      # the roster pre-storm this path is the rare residue, not the main event.
+      MONITOR_PLACE_ANYWAY:    ${MONITOR_PLACE_ANYWAY:-cold}
       # ⚠️ 2026-08-18 — TICK-PIPE LEAD (new, default on). Every decision in a
       # poll tick reads ONE inflight snapshot taken before any of that tick's
       # own fires clicked, so the inflight-scaled lead never counts the very
@@ -320,9 +326,48 @@ services:
       # at SEED_SHALLOW (29 ⇒ worst −28, the original −30 contract) — a
       # target-50 driver can never be seeded to position ~2. Empty = inherit
       # HARD_FLOOR; 0 disables the tier.
-      MONITOR_LADDER_SEED_GAP:     ${MONITOR_LADDER_SEED_GAP:-35}   # 08-31: cap ONLY the pre-onset seed at −35 (was inheriting HARD_FLOOR). Kills the target-70-at-queue-5 → position-14 landings WITHOUT narrowing the normal-fire window (that stays at the −65 hard floor). Decouples "no deep seed" from "fire high targets early enough to be placed".
-      MONITOR_LADDER_SEED_SHALLOW: ${MONITOR_LADDER_SEED_SHALLOW:-29}
-      MONITOR_LADDER_SEED_AFTER:   ${MONITOR_LADDER_SEED_AFTER:-03:45}
+      # ⚠️ 2026-09-03 — BE THE ONSET FOR REAL: uniform cap 70, ignite by the clock.
+      # 08-31's SEED_GAP 35 (and SHALLOW 29) meant a seed could only fire once the
+      # queue was within 35 of a target — i.e. the chain could not ignite from an
+      # empty queue; it waited for the queue to reach ~15-20, which on all 8 of
+      # the last 8 mornings was the competitor's own warm-up, 30-60 s before its
+      # flood. Replay 08-27..09-03: cap 35 seated 0-1 drivers pre-storm; on 09-03
+      # the whole roster (137) then met the flood reactively — 56 fires in one
+      # tick at q43, inflight 56, ±10 4%, 14 drivers left with NO position,
+      # worst +171. A UNIFORM cap (SHALLOW = GAP = 70) does two things at once:
+      #   1. IGNITION — the lowest target (40-50) is reachable at queue 0, so the
+      #      chain starts at _AFTER by the clock, not on the competitor's cue.
+      #   2. STRICT TARGET ORDER — with one cap for every target the eligible set
+      #      is always {target ≤ queue + 70}, so the lowest target is always the
+      #      first rung: no more band drivers (70+) jumping ahead of shallower
+      #      targets (the 08-24/08-27 "target-70 at position 6-20" cliff).
+      # Replay (same 8 mornings, chain at ~0.4/s from 03:40): 996/1000 targets
+      # <200 seated BEFORE the flood every day, zero misses, max +7, ±10 24-41%,
+      # median −16…−34. The price is the SHALLOW cohort (<70): −25…−49 (they take
+      # positions 1-45 at 03:40 instead of 46-69) and 150-199: −25…−60 (sparse
+      # targets). That undershoot is arithmetic (N drivers from an empty queue
+      # occupy 1…N; 58 drivers want 50-74), not tuning — the only way past it is
+      # spreading the targets drivers book. Roll back: GAP 35 / SHALLOW 29.
+      MONITOR_LADDER_SEED_GAP:     ${MONITOR_LADDER_SEED_GAP:-70}
+      MONITOR_LADDER_SEED_SHALLOW: ${MONITOR_LADDER_SEED_SHALLOW:-70}
+      # ≥200 targets keep the old −29 cap: with the chain lifting the queue to
+      # ~130 they would otherwise be seeded ~70 under. Default = SHALLOW.
+      MONITOR_LADDER_SEED_DEEP:    ${MONITOR_LADDER_SEED_DEEP:-29}
+      # QUEUE FLOOR for the deep seed — OPERATOR BUSINESS RULE (2026-09-04): no
+      # driver may be added to the queue while it is below this. Holds every seed
+      # until the displayed queue reaches the floor, then releases ascending by
+      # target. Set to 10 by the operator: our drivers must never take positions
+      # 1-9. ACCEPTED COST, confirmed after the analysis below: the queue can only
+      # reach the floor ORGANICALLY (our own seeds are blocked beneath it, so they
+      # cannot lift it there). On near-empty mornings (08-27/28/29 in the sim: queue
+      # 0-5 until the flood) the floor clears only as the storm hits, so the chain
+      # cannot seat the roster early and those drivers overshoot (sim: 1-14% ±10).
+      # On mornings the queue crawls to the floor first (e.g. 09-03) the rule costs
+      # nothing and the chain works (sim: ~35% ±10, no >+40, no misses). To seat a
+      # roster ahead of an empty-queue flood you must occupy positions 1-9, which
+      # the operator has ruled out; 0 would lift that but is against the rule.
+      MONITOR_LADDER_SEED_MIN_QUEUE: ${MONITOR_LADDER_SEED_MIN_QUEUE:-10}
+      MONITOR_LADDER_SEED_AFTER:   ${MONITOR_LADDER_SEED_AFTER:-03:40}   # 09-03: 03:45→03:40 — earliest flood seen 03:48 (08-31); chain needs ~5 min
       # Seed GROWTH gate (2026-08-24): the seed spends undershoot ONLY when the
       # list is genuinely building, and scales depth with the climb. DEAD CALM
       # (rise < MIN_RISE over WINDOW) ⇒ no seed ⇒ drivers wait and land accurate;
@@ -345,7 +390,7 @@ services:
       # only) or =0 (off) in prod .env — .env wins over these defaults. Scoping,
       # serialization, and the onset/velocity yield all still apply.
       MONITOR_LADDER_PROACTIVE:       ${MONITOR_LADDER_PROACTIVE:-1}
-      MONITOR_LADDER_PROACTIVE_AFTER: ${MONITOR_LADDER_PROACTIVE_AFTER:-03:45}
+      MONITOR_LADDER_PROACTIVE_AFTER: ${MONITOR_LADDER_PROACTIVE_AFTER:-03:40}   # 09-03: 03:45→03:40 (see SEED_AFTER)
       MONITOR_LADDER_PROACTIVE_PEAK:  ${MONITOR_LADDER_PROACTIVE_PEAK:-05:10}
       # FRONT-LOADED CHAIN (2026-08-24, "cannot afford another miss"). The two
       # knobs above deepen slowly (full budget only by _PEAK) and place one seed
@@ -387,7 +432,7 @@ services:
       # Defaults below are now the LIVE values (FULL=1, N=5); set them in .env
       # only to override/kill.
       MONITOR_LADDER_PROACTIVE_FULL:     ${MONITOR_LADDER_PROACTIVE_FULL:-1}
-      MONITOR_LADDER_SEED_MAX_INFLIGHT:  ${MONITOR_LADDER_SEED_MAX_INFLIGHT:-5}
+      MONITOR_LADDER_SEED_MAX_INFLIGHT:  ${MONITOR_LADDER_SEED_MAX_INFLIGHT:-4}   # 09-03: 5→4 — stays under ONSET_STEP 5 even before the own-add correction
       MONITOR_PRED_LAT_FLOOR:  ${MONITOR_PRED_LAT_FLOOR:-5}       # s, latency floor (static-queue fallback only)
       MONITOR_PRED_LAT_SLOPE:  ${MONITOR_PRED_LAT_SLOPE:-0.7}     # s of latency per inflight (static-queue fallback only)
       MONITOR_PRED_VEL_CAP:    ${MONITOR_PRED_VEL_CAP:-2.5}       # /s, cap on the velocity used
@@ -693,8 +738,14 @@ services:
       # re-fire warm (never disarm). Two holes to fix first: (1) urgency-margin
       # escape lets the whole onset burst through (spikes inflight), (2) hold →
       # disarm → cold re-fire. Kill switch stays `shadow`.
-      MONITOR_FIRE_PACING:         ${MONITOR_FIRE_PACING:-shadow}
-      MONITOR_PACE_MAX_INFLIGHT:   ${MONITOR_PACE_MAX_INFLIGHT:-12}
+      # 2026-09-03: shadow→on, cap 12→6, scope ALL targets. Shadow line on the
+      # 09-03 leap: 56-fire batch, est drift paced ~29 vs unpaced ~67 (actual
+      # landed +40…+74). Held drivers keep their parked session (no disarm — the
+      # 08-14 trap) and re-evaluate next 1 s poll. With the chain seating the
+      # roster pre-storm, this meters only the reactive residue (≥200 targets,
+      # late adds, a day the flood beats 03:40).
+      MONITOR_FIRE_PACING:         ${MONITOR_FIRE_PACING:-on}
+      MONITOR_PACE_MAX_INFLIGHT:   ${MONITOR_PACE_MAX_INFLIGHT:-6}
       MONITOR_PACE_URGENCY_MARGIN: ${MONITOR_PACE_URGENCY_MARGIN:-25}
       # Concentration gate: only ENGAGE pacing when it would hold ≥ this many
       # fires (a real pile-up). Below it, release all — calm mornings behave like
@@ -708,7 +759,7 @@ services:
       # immediately (can't win it on commit speed). With MONITOR_FIRE_PACING at
       # its 'shadow' default this only LOGS what pacing ≥100 would do (the
       # go/no-go data) — zero behaviour change until FIRE_PACING is set to 'on'.
-      MONITOR_PACE_MIN_TARGET:     ${MONITOR_PACE_MIN_TARGET:-100}
+      MONITOR_PACE_MIN_TARGET:     ${MONITOR_PACE_MIN_TARGET:-0}   # 09-03: 100→0 — the q43 dump that hurt was targets 51-75
       # Persistent vehicle_not_available = broken SAN account/vehicle data
       # (the #142/#70/#4006 class): after N consecutive not-available arm
       # attempts, suspend re-arming that driver for the suspend window instead

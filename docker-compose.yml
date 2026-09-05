@@ -744,7 +744,12 @@ services:
       # 08-14 trap) and re-evaluate next 1 s poll. With the chain seating the
       # roster pre-storm, this meters only the reactive residue (≥200 targets,
       # late adds, a day the flood beats 03:40).
-      MONITOR_FIRE_PACING:         ${MONITOR_FIRE_PACING:-on}
+      # 2026-09-04 — TURNED OFF by operator. Set to 'on' this session; it caused
+      # the +200 landings on 09-04 by holding band drivers during the flood,
+      # which DISARMED them (pre-arm reconcile drops a held driver) so they
+      # re-fired cold 60-86s late into the plateau — the documented 08-14
+      # backfire. 'off' = launch the batch as-is, no holding, no disarm.
+      MONITOR_FIRE_PACING:         ${MONITOR_FIRE_PACING:-off}
       MONITOR_PACE_MAX_INFLIGHT:   ${MONITOR_PACE_MAX_INFLIGHT:-6}
       MONITOR_PACE_URGENCY_MARGIN: ${MONITOR_PACE_URGENCY_MARGIN:-25}
       # Concentration gate: only ENGAGE pacing when it would hold ≥ this many

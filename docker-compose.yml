@@ -432,11 +432,26 @@ services:
       # Defaults below are now the LIVE values (FULL=1, N=5); set them in .env
       # only to override/kill.
       MONITOR_LADDER_PROACTIVE_FULL:     ${MONITOR_LADDER_PROACTIVE_FULL:-1}
-      MONITOR_LADDER_SEED_MAX_INFLIGHT:  ${MONITOR_LADDER_SEED_MAX_INFLIGHT:-4}   # 09-03: 5→4 — stays under ONSET_STEP 5 even before the own-add correction
+      # 2026-09-09 (operator request) — release up to 6 seeds concurrently in the calm
+      # window (was 4). 6 = SAN's commit knee (≤6 → ~5s/±2 landing; >6 → ~10s/±40,
+      # 08-24) and the safe edge of the self-trigger model (6 stays idle; ~10+ can re-arm
+      # the false onset). Max safe calm throughput without leaning hard on the ours-fixes.
+      # Revert to 4 if the 🕶/onset logs ever show the ladder self-arming onset in calm.
+      MONITOR_LADDER_SEED_MAX_INFLIGHT:  ${MONITOR_LADDER_SEED_MAX_INFLIGHT:-6}
+      # No concurrency cap once the storm is active. NOTE: inert unless the ladder's
+      # !onsetActive gate is also lifted; the onset early-fire dump is already uncapped.
+      MONITOR_LADDER_SEED_STORM_UNCAP:   ${MONITOR_LADDER_SEED_STORM_UNCAP:-1}
       MONITOR_PRED_LAT_FLOOR:  ${MONITOR_PRED_LAT_FLOOR:-5}       # s, latency floor (static-queue fallback only)
       MONITOR_PRED_LAT_SLOPE:  ${MONITOR_PRED_LAT_SLOPE:-0.7}     # s of latency per inflight (static-queue fallback only)
       MONITOR_PRED_VEL_CAP:    ${MONITOR_PRED_VEL_CAP:-2.5}       # /s, cap on the velocity used
       MONITOR_PRED_VEL_WINDOW: ${MONITOR_PRED_VEL_WINDOW:-8}      # s, trailing velocity window
+      # 2026-09-08 — count OUR OWN adds at COMMIT (when they land in the queue),
+      # not at FIRE. Fire-timing mis-aligned the self-subtraction by ~5s (the commit
+      # latency), so ~8s after any seed burst our own commits read as external growth
+      # and tripped LADDER_MAX_VEL — the ladder self-throttled (09-07: 11 seeds then
+      # shut off for the rest of the calm window). Commit-timing cancels our adds
+      # exactly. Set to 0 to revert to the old fire-time accounting.
+      MONITOR_OURS_AT_COMMIT:  ${MONITOR_OURS_AT_COMMIT:-1}
       # SAN commit-latency awareness (2026-07-28). The drift horizon measures the
       # BOT's run time (decision → click) but was blind to SAN's own commit
       # latency (click → slot stamped). On the 07-27 storm that gap stalled to
@@ -552,6 +567,20 @@ services:
       MONITOR_ONSET_CAP:         ${MONITOR_ONSET_CAP:-29}
       MONITOR_ONSET_CUM:         ${MONITOR_ONSET_CUM:-1}
       MONITOR_ONSET_QUIET_MS:    ${MONITOR_ONSET_QUIET_MS:-25000}
+      # 2026-09-09 — remove OUR OWN single-poll commit spike from the onset RATE gate
+      # (the 8s-windowed ownAddRate can't cancel a one-poll seed-burst spike). Without
+      # it a seed burst self-declares a FALSE onset (09-08: q22 "5.00/s" 41s early) that
+      # shuts the ladder off for the whole storm. onsetStep also subtracts ownStep÷dt.
+      # 0 = revert to windowed-only subtraction. Pairs with MONITOR_OURS_AT_COMMIT.
+      MONITOR_ONSET_OWN_RATE_FIX: ${MONITOR_ONSET_OWN_RATE_FIX:-1}
+      # 2026-09-09 — judge the onset RATE on the 8s-windowed EXTERNAL rate
+      # (observedVelocity) instead of the instantaneous single-poll rate, so SAN's
+      # chunked render steps (a calm 0.4/s shown as +2/+4 jumps) stop arming onset on
+      # jitter and latching the ladder off through the pre-storm calm. The STEP path
+      # still arms instantly on a real avalanche chunk. shadow = log-only A/B (default,
+      # SAFE — live unchanged); 1 = live; 0 = off. Shadow-first: onset guards the
+      # 08-21/22 tick-pipe dump — watch the 🕶 ONSET-SHADOW lines before flipping to 1.
+      MONITOR_ONSET_RATE_WINDOWED: ${MONITOR_ONSET_RATE_WINDOWED:-shadow}
       # Backlog-aware onset cap + target-horizon guard (07-19 five-morning
       # forensics; see monitorService ONSET_CAP_MAX block). The onset cap may
       # deepen past the dynamic base up to CAP_MAX, but ONLY while a real SAN

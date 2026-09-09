@@ -721,20 +721,52 @@ describe('dropAndArmLeftover() — 3 AM forced drop + re-arm', () => {
     await monitor._dropAndArmLeftover(DRIVER_ID, '9999');
     expect(runRemoveBotForDriver).not.toHaveBeenCalled();
   });
+
+  test('fromLiveQueue → drops + arms even when the carryover flag was FALSE-CLEARED', async () => {
+    runRemoveBotForDriver.mockResolvedValue({ success: true, removed: true });
+    _setWatch(DRIVER_ID, {
+      driverId: DRIVER_ID, vehicleNumber: '9999',
+      inQueueFromCarryover: false, state: 'watching',   // flag says "gone" (3-poll false-clear)
+      hasBeenSeen: true, positionFiredToday: true,
+    });
+
+    await monitor._dropAndArmLeftover(DRIVER_ID, '9999', { fromLiveQueue: true });
+    const s = monitor._getInternalState(DRIVER_ID);
+
+    expect(runRemoveBotForDriver).toHaveBeenCalled(); // acted despite the flag (live queue is truth)
+    expect(s.state).toBe('watching');
+    expect(s.positionFiredToday).toBe(false);         // armed to fire fresh at target
+    expect(s.hasBeenSeen).toBe(false);
+  });
+
+  test('fromLiveQueue → still never touches a dispatched (mid-trip) driver', async () => {
+    _setWatch(DRIVER_ID, { driverId: DRIVER_ID, vehicleNumber: '9999', state: 'dispatched' });
+
+    await monitor._dropAndArmLeftover(DRIVER_ID, '9999', { fromLiveQueue: true });
+    expect(runRemoveBotForDriver).not.toHaveBeenCalled();
+  });
 });
 
-describe('dropAndArmCarryoverLeftovers() — selects only stuck leftovers', () => {
+describe('dropAndArmCarryoverLeftovers() — LIVE queue is the source of truth', () => {
   beforeEach(() => setupMocks());
 
-  test('enqueues a drop for each in_queue carryover driver WITH a target, skips the rest', () => {
-    _setWatch(1, { driverId: 1, vehicleNumber: 'A', inQueueFromCarryover: true,  state: 'in_queue',  scheduledPosition: 118 });
-    _setWatch(2, { driverId: 2, vehicleNumber: 'B', inQueueFromCarryover: true,  state: 'in_queue',  dayPositions: '{"mon":130}' });
-    _setWatch(3, { driverId: 3, vehicleNumber: 'C', inQueueFromCarryover: false, state: 'watching',  scheduledPosition: 100 }); // not a leftover
-    _setWatch(4, { driverId: 4, vehicleNumber: 'D', inQueueFromCarryover: true,  state: 'requeuing', scheduledPosition: 100 }); // in-flight bot
-    _setWatch(5, { driverId: 5, vehicleNumber: 'E', inQueueFromCarryover: true,  state: 'in_queue' }); // manual driver, no target
+  test('drops each scheduled driver the LIVE queue shows — ignores the (false-clearable) carryover flag', () => {
+    // Selection keys off vehicleNorm ∈ the live WAITING map, NOT inQueueFromCarryover.
+    _setWatch(1, { driverId: 1, vehicleNumber: 'A', vehicleNorm: 'A', inQueueFromCarryover: true,  state: 'watching',  scheduledPosition: 118 });
+    _setWatch(2, { driverId: 2, vehicleNumber: 'B', vehicleNorm: 'B', inQueueFromCarryover: false, state: 'watching',  scheduledPosition: 130 }); // flag FALSE-CLEARED but live queue shows it → must still drop
+    _setWatch(3, { driverId: 3, vehicleNumber: 'C', vehicleNorm: 'C', inQueueFromCarryover: true,  state: 'watching',  scheduledPosition: 100 }); // flag says carryover but NOT in live queue → skip
+    _setWatch(4, { driverId: 4, vehicleNumber: 'D', vehicleNorm: 'D', inQueueFromCarryover: true,  state: 'requeuing', scheduledPosition: 100 }); // bot in-flight → skip
+    _setWatch(5, { driverId: 5, vehicleNumber: 'E', vehicleNorm: 'E', inQueueFromCarryover: true,  state: 'watching' }); // in live queue but NO target → skip (can't re-arm)
 
-    const count = monitor._dropAndArmCarryoverLeftovers('2026-06-30');
-    expect(count).toBe(2); // only 1 and 2 (in_queue carryover + has a target)
+    // Live V Holding WAITING list (source of truth): A, B, D, E present; C absent.
+    const liveWaiting = new Map([['A', 5], ['B', 8], ['D', 12], ['E', 20]]);
+    const count = monitor._dropAndArmCarryoverLeftovers('2026-06-30', liveWaiting);
+    expect(count).toBe(2); // A (1) + B (2, false-cleared). C absent, D in-flight, E no target.
+  });
+
+  test('no liveWaiting map → no-op (never falls back to the unreliable flag)', () => {
+    _setWatch(1, { driverId: 1, vehicleNumber: 'A', vehicleNorm: 'A', inQueueFromCarryover: true, state: 'in_queue', scheduledPosition: 118 });
+    expect(monitor._dropAndArmCarryoverLeftovers('2026-06-30')).toBe(0);
   });
 });
 

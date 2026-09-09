@@ -418,6 +418,12 @@ const LADDER_PROACTIVE_PEAK_MIN  = toMin(LADDER_PROACTIVE_PEAK_PT);
 const LADDER_PROACTIVE_FULL   = String(process.env.MONITOR_LADDER_PROACTIVE_FULL ?? '0') === '1';
 const LADDER_SEED_MAX_INFLIGHT = Math.max(1,
   parseInt(process.env.MONITOR_LADDER_SEED_MAX_INFLIGHT ?? '1', 10) || 1);
+// 2026-09-09 (operator request) — release seeds with NO concurrency cap once the storm
+// is active (onset). ⚠️ Mechanically inert on its own: the seed pass is gated
+// `!onsetActive` upstream, so during a storm seedWaiters is empty and this cap never
+// applies; the storm's firing goes through the (already-uncapped) onset early-fire
+// dump. Made explicit as a knob so the intent is in config; default off in code.
+const LADDER_SEED_STORM_UNCAP = String(process.env.MONITOR_LADDER_SEED_STORM_UNCAP ?? '0') === '1';
 // Pre-armed fire sessions: park a logged-in page on SAN's "Add To Queue"
 // screen for every driver whose fire is near, so the fire itself is a ~1 s
 // click instead of a ~3.5 s Chromium launch (see botService "Pre-armed fire
@@ -612,6 +618,30 @@ const ONSET_ZONE_MIN    = parseInt(process.env.MONITOR_ONSET_ZONE_MIN ?? '20', 1
 const ONSET_ZONE_MAX    = parseInt(process.env.MONITOR_ONSET_ZONE_MAX ?? '90', 10);
 const ONSET_RATE        = parseFloat(process.env.MONITOR_ONSET_RATE   ?? '1.2');
 const ONSET_STEP        = parseInt(process.env.MONITOR_ONSET_STEP     ?? '5', 10);
+// 2026-09-09 — "Alarm 2" fix. The onset RATE evidence already removes OUR OWN adds
+// so the chain can't self-trigger, but the subtraction is the 8 s-WINDOWED ownAddRate
+// (~1/s) while effectiveGrowthRate spikes INSTANTANEOUSLY (lastPollRate) to ~5/s on the
+// single poll where a seed BURST commits. A windowed rate cannot cancel a one-poll
+// spike, so the 09-08 false onset fired at q22 "5.00/s" purely on our own 4 commits and
+// shut the ladder off for the whole storm (see [[ladder-self-throttle-ours-at-commit-0908]]).
+// onsetStep now ALSO subtracts the instantaneous own rate (ownStep ÷ dt), matched to
+// lastPollRate's timescale, so a commit burst cancels exactly and only true external
+// growth trips the gate. '0' reverts to the windowed-only subtraction.
+const ONSET_OWN_RATE_FIX = String(process.env.MONITOR_ONSET_OWN_RATE_FIX ?? '1') !== '0';
+// 2026-09-09 — SHADOW prototype (issue #3, distinct from the ours-fixes above). The
+// onset RATE evidence uses the INSTANTANEOUS effectiveGrowthRate (single-poll
+// lastPollRate), so SAN's chunked display — a calm ~0.4/s EXTERNAL drift shown as
+// periodic +2/+4 render JUMPS — reads as 2-4/s and arms onset on jitter, then the 25s
+// quiet-latch holds it through the pre-storm calm and blocks the ladder (09-08: onset
+// re-armed at q24 on a "+2" 36 s before the real leap). Fix: judge the RATE on
+// observedVelocity (8 s-windowed EXTERNAL rate, already ours-subtracted) — jitter nets
+// to ~0.4/s (idle) while a real avalanche caps it at 2.5/s AND its first chunk trips
+// the instantaneous STEP path anyway, so genuine storms still arm immediately. 'shadow'
+// (default) = log-only A/B, live unchanged; '1' = live; '0' = off. Shadow-first because
+// onset guards the 08-21/22 tick-pipe dump.
+const ONSET_RATE_WINDOWED_MODE   = String(process.env.MONITOR_ONSET_RATE_WINDOWED ?? 'shadow').toLowerCase();
+const ONSET_RATE_WINDOWED_LIVE   = ONSET_RATE_WINDOWED_MODE === '1';
+const ONSET_RATE_WINDOWED_SHADOW = ONSET_RATE_WINDOWED_MODE === 'shadow';
 const ONSET_CAP         = parseInt(process.env.MONITOR_ONSET_CAP      ?? '25', 10);
 const ONSET_QUIET_MS    = parseInt(process.env.MONITOR_ONSET_QUIET_MS ?? '25000', 10);
 // Render steps older than this no longer describe the storm's current violence
@@ -1072,6 +1102,11 @@ let todayPT = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_An
  * day, regardless of how many polls fire during the window.
  */
 let positionWindowArmedForDate = null;
+// Once-per-day marker for the live-queue overnight-leftover drop. Separate from
+// positionWindowArmedForDate because the drop runs AFTER the queue is parsed (so it
+// can read the live WAITING list); keeping its own marker means a failed fetch on
+// the arm tick simply retries the drop next tick. Auto-resets when the PT day rolls.
+let carryoverDroppedForDate = null;
 
 /** Stats from the most recent successful poll */
 let lastPollStats = {
@@ -1147,16 +1182,37 @@ const freshOnsetState = () => ({
   active: false, prevQueue: null, lastEvidenceMs: 0, recentSteps: [], stepSeen: 0,
 });
 let onsetState = freshOnsetState();
+// Parallel onset state for the windowed-rate A/B (MONITOR_ONSET_RATE_WINDOWED=shadow):
+// advanced each tick with observedVelocity as the rate so the log can show what a
+// render-jitter-immune onset WOULD decide, without touching live firing.
+let onsetStateShadow = freshOnsetState();
+// Per-morning A/B tally for the shadow onset, emitted as ONE summary line when the
+// storm window relaxes to normal cadence (reset daily). armedTicks = ticks with onset
+// active on either side; liveOnly = live armed while shadow idle (= ticks the ladder
+// would have kept running under the windowed rule); shadowOnly = shadow armed while
+// live idle (windowed arming EARLIER — watch this stays ~0).
+const freshOnsetShadowStats = () => ({
+  armedTicks: 0, disagree: 0, liveOnly: 0, shadowOnly: 0,
+  firstLiveArm: null, firstShadowArm: null, summaryLogged: false,
+});
+let onsetShadowStats = freshOnsetShadowStats();
 // Last effective cap logged (backlog boost) — change-gated so the log shows the
 // cap ladder, not one line per tick.
 let lastLoggedOnsetCap = 0;
 
-// `ours` (optional) = cumulative count of OUR OWN ladder/seed adds. The render
-// step is measured net of the adds we committed between the two polls, so our
-// chain (up to SEED_MAX_INFLIGHT landings in one 5 s render) cannot satisfy
-// ONSET_STEP on its own and flip the tick to the onset-dump machinery. Omitted
-// (legacy callers/tests) → raw step, unchanged behaviour.
-function onsetStep(st, { queue, rate, nowMs = Date.now(), ours }) {
+// `ours` (optional) = cumulative count of OUR OWN ladder/seed adds. Both evidence
+// signals are measured net of the adds we committed between the two polls, so our
+// chain cannot satisfy either on its own and flip the tick to the onset-dump
+// machinery:
+//   • STEP: the render step subtracts the instantaneous ownStep (ours − prevOurs).
+//   • RATE: the growth rate subtracts OUR OWN contribution on whichever timescale is
+//     larger — the 8 s-windowed `ownWindowRate` (adds spread across the window) OR the
+//     instantaneous ownStep ÷ dt (a single-poll commit BURST the windowed rate is too
+//     slow to cancel; the 09-08 false onset). Gated by ONSET_OWN_RATE_FIX.
+// `rate` is the RAW growth rate (effectiveGrowthRate); onsetStep does the subtraction.
+// `ownWindowRate`/`dt` omitted (legacy callers/tests) → rate used as passed, so the
+// step-only correction and all prior behaviour are unchanged.
+function onsetStep(st, { queue, rate, nowMs = Date.now(), ours, ownWindowRate = 0, dt = 0 }) {
   const changed = st.prevQueue !== null && queue !== st.prevQueue;
   const ownStep = (ours != null && st.prevOurs != null) ? Math.max(0, ours - st.prevOurs) : 0;
   const step    = changed ? Math.max(0, queue - st.prevQueue - ownStep) : 0;
@@ -1165,7 +1221,11 @@ function onsetStep(st, { queue, rate, nowMs = Date.now(), ours }) {
     .filter((s) => nowMs - s.t <= ONSET_EVIDENCE_WINDOW_MS)
     .concat(step > 0 ? [{ t: nowMs, step }] : []);
 
-  const evidence = step >= ONSET_STEP || rate >= ONSET_RATE;
+  const ownRate  = ONSET_OWN_RATE_FIX
+    ? Math.max(ownWindowRate || 0, dt > 0 ? ownStep / dt : 0)
+    : (ownWindowRate || 0);
+  const netRate  = Math.max(0, rate - ownRate);
+  const evidence = step >= ONSET_STEP || netRate >= ONSET_RATE;
   let { active, lastEvidenceMs } = st;
 
   if (evidence && (active || (queue >= ONSET_ZONE_MIN && queue <= ONSET_ZONE_MAX))) {
@@ -1175,7 +1235,7 @@ function onsetStep(st, { queue, rate, nowMs = Date.now(), ours }) {
     active = false;
   }
 
-  return { active, prevQueue: queue, prevOurs: ours ?? null, lastEvidenceMs, recentSteps, stepSeen: step };
+  return { active, prevQueue: queue, prevOurs: ours ?? null, lastEvidenceMs, recentSteps, stepSeen: step, netRate };
 }
 
 /** Calm-morning guard: the early-fire allowance actually in force. Scales with
@@ -1461,8 +1521,12 @@ function recordVelocityObservation(count, atMs) {
 // 1.0/s, so a 4-5/tick chain throttled itself and could hand the tick back to
 // the predictive-lead dump (08-24 replay: 42 pred fires in 9 s off chain
 // motion). A real flood (5-15/s) still shows through; the chain (~0.8/s) does
-// not. Our adds are counted at FIRE and land ~5 s later, so the correction can
-// briefly over-subtract (floored at 0) — conservative in the safe direction.
+// not. 2026-09-08: our adds are now counted at COMMIT (MONITOR_OURS_AT_COMMIT),
+// aligned with the queue rise they cause. The old fire-time count was ~5 s early,
+// so once the fire step slid out of this window while the commit-rise stayed in,
+// our own chain read as external growth and self-throttled ~8 s after each burst
+// (09-07: 11 seeds then shutoff). Commit-timing cancels our adds exactly; only a
+// true external flood (5-15/s) trips the gate now. See ladderAddsCommitted.
 function observedVelocity(nowMs) {
   if (velocityObservations.length < 2) return 0;
   const newest = velocityObservations[velocityObservations.length - 1];
@@ -1497,10 +1561,22 @@ function ownAddRate(nowMs) {
 // informed by genuine growth. This buffer keeps a longer window (SEED window)
 // so sustainedRise() reports the NET positions the queue has climbed. A dead
 // morning nets ~0; a real ramp nets clearly positive well before the leap.
-// Cumulative count of OUR OWN adds (ladder/seed at promotion, every other fire
-// at launch — 2026-09-03) — subtracted from the queue before measuring rise /
-// velocity / onset step. Monotonic; only DIFFERENCES between samples are used,
-// so it never needs a daily reset.
+// Cumulative count of OUR OWN adds — subtracted from the queue before measuring
+// rise / velocity / onset step so the chain never declares a storm on itself.
+// Monotonic; only DIFFERENCES between samples are used, so it never needs a reset.
+//
+// 2026-09-08 — COMMIT-timed accounting (MONITOR_OURS_AT_COMMIT, default on).
+// Counting at FIRE (the pre-09-08 default) mis-aligns the subtraction: `ours`
+// steps up at click, but the displayed queue only rises ~5 s later at COMMIT.
+// Once the fire-time step slides out of the 8 s velocity window while the
+// commit-rise is still inside it, our own seeds read as EXTERNAL growth and trip
+// LADDER_MAX_VEL — the ladder self-throttles ~8 s after any burst (09-07 live:
+// 11 seeds fired 04:00:34–39, committed by 04:00:44, velocity spiked to 1.04/s at
+// 04:00:49 = exactly one window later, and seeding shut off for the rest of the
+// 30 s calm window). Counting at COMMIT (in the genuine-landing handler) steps
+// `ours` in lockstep with the queue rise it causes, so our adds cancel exactly and
+// only TRUE external growth trips the gate. '0' reverts to the old fire-time count.
+const OURS_AT_COMMIT = String(process.env.MONITOR_OURS_AT_COMMIT ?? '1') !== '0';
 let ladderAddsCommitted = 0;
 // Proactive-shadow walk (MONITOR_LADDER_PROACTIVE=shadow): drivers already
 // logged as "would proactively seed" today, so the shadow pass advances one per
@@ -2053,6 +2129,12 @@ async function _runBot(driverId, state, triggerType = 'monitor_requeue', botOpts
     // landings have it unset and are skipped. Cleared so a later landing on this
     // same state can't reuse a stale fire time.
     if (state._posFiredAtMs) {
+      // Our add is now VISIBLE in the queue (this is the genuine landing). Count
+      // it here so `ours` steps in lockstep with the queue rise it causes — the
+      // COMMIT-timed accounting that stops the ladder self-throttling on itself
+      // (see MONITOR_OURS_AT_COMMIT). Gated on _posFiredAtMs so auto-requeue /
+      // carryover landings (not our fires) never count.
+      if (OURS_AT_COMMIT) ladderAddsCommitted++;
       const commitMs = Date.now() - state._posFiredAtMs;
       // Decompose the latency into OUR side (decision → click dispatched: claim
       // + browser event-loop serialization) vs SAN/observe (dispatched → slot
@@ -2298,10 +2380,20 @@ async function autoRemoveNotAuthorized(driverId, vehicleNumber) {
 //     of mislabelling them "already in queue". It's cleared naturally on the fire.
 //   • Not confirmed / dispatched / error → touch NOTHING. The passive machinery
 //     (debounced clear + re-protect) keeps protecting the driver as it does today.
-async function dropAndArmLeftover(driverId, vehicleNumber) {
+async function dropAndArmLeftover(driverId, vehicleNumber, { fromLiveQueue = false } = {}) {
   const pre = watches.get(driverId);
-  // Only act on a driver we still believe is a leftover sitting in V Holding.
-  if (!pre || !pre.inQueueFromCarryover || pre.state !== 'in_queue') return;
+  if (!pre) return;
+  // fromLiveQueue (the 2 AM sweep): the LIVE V Holding page is the source of truth,
+  // so act on any driver SAN still shows in the queue — bypassing our in-memory
+  // carryover flag, which a 3-poll false-clear can wrongly turn off (the blindness
+  // that let #0193/#4339 sit unremoved on 09-06/07). Legacy path: trust the flag.
+  // NEITHER path touches a driver on a trip (dispatched) or with a bot in flight
+  // (requeuing).
+  if (fromLiveQueue) {
+    if (pre.state === 'requeuing' || pre.state === 'dispatched') return;
+  } else if (!pre.inQueueFromCarryover || pre.state !== 'in_queue') {
+    return;
+  }
 
   try {
     const driver = await Driver.findByIdWithCredentials(driverId);
@@ -2337,19 +2429,30 @@ async function dropAndArmLeftover(driverId, vehicleNumber) {
 // has just been (re)computed for every watched driver. Fire-and-forget via the
 // concurrency-capped jobQueue so it never blocks the poll loop. Returns how many
 // drops were enqueued. No-op (and no bot runs) when CARRYOVER_DROP_ENABLED=false.
-function dropAndArmCarryoverLeftovers(dayKey = todayPT) {
+function dropAndArmCarryoverLeftovers(dayKey = todayPT, liveWaiting = null) {
   if (!CARRYOVER_DROP_ENABLED) return 0;
-  // Only drop leftovers we can actually RE-ARM — i.e. drivers with a position
-  // target to fire at. A pure manual driver (no schedule) has no target, so a
-  // drop would just evict them with no re-add; leaving them in the draining
-  // overnight queue is better for them. They're handled by the passive machinery.
+  // 2026-09-08 — the LIVE V Holding WAITING list is the source of truth. Match it
+  // against our roster, NOT our in-memory carryover flag: a 3-poll false-clear can
+  // wrongly turn that flag off while the driver is still physically in the queue,
+  // which is exactly how #0193/#4339 were missed on 09-06/07. Requires the parsed
+  // `waiting` map; without it we can't see the live queue, so no-op (never fall
+  // back to the unreliable flag).
+  if (!liveWaiting) return 0;
+  // Weekday key for today's per-day target override (see resolveTargetPosition).
+  const dowStr = new Date().toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/Los_Angeles' });
+  const dow = { Sun: '0', Mon: '1', Tue: '2', Wed: '3', Thu: '4', Fri: '5', Sat: '6' }[dowStr];
+  // Only drop leftovers we can actually RE-ARM — drivers with a position target
+  // today. A pure manual driver (no target) would just be evicted with no re-add,
+  // so leave them. Never touch a driver mid-trip (dispatched) or bot-in-flight.
   const leftovers = [...watches.values()].filter(
-    (s) => s.inQueueFromCarryover && s.state === 'in_queue' && (s.scheduledPosition || s.dayPositions),
+    (s) => liveWaiting.has(s.vehicleNorm)
+      && s.state !== 'requeuing' && s.state !== 'dispatched'
+      && resolveTargetPosition(s, dow) != null,
   );
   if (!leftovers.length) return 0;
-  console.log(`[Monitor] Position window — forcing drop of ${leftovers.length} stuck overnight leftover(s) SAN didn't purge (day ${dayKey})`);
+  console.log(`[Monitor] Position window — live queue shows ${leftovers.length} of our scheduled driver(s) still in V Holding; dropping + arming fresh at target (day ${dayKey})`);
   for (const s of leftovers) {
-    jobQueue.enqueue(() => dropAndArmLeftover(s.driverId, s.vehicleNumber)).catch(() => {});
+    jobQueue.enqueue(() => dropAndArmLeftover(s.driverId, s.vehicleNumber, { fromLiveQueue: true })).catch(() => {});
   }
   return leftovers.length;
 }
@@ -3120,7 +3223,13 @@ function runLadderSeedPass(fireBatch, seedWaiters, decisionCtx, ladderFiresThisT
   // N>1 (the front-loaded chain) tops the in-flight set back up to N each tick, so
   // seeds commit at ~N/commit-latency ≈ 1/s while concurrency stays at SAN's
   // accurate low-commit knee. Lowest target first so the chain lands ascending.
-  const budget = LADDER_SEED_MAX_INFLIGHT - (decisionCtx.currentInflight ?? 0) - ladderFiresThisTick;
+  // Calm: release up to LADDER_SEED_MAX_INFLIGHT of our seeds concurrently. Storm
+  // (onset active) + LADDER_SEED_STORM_UNCAP: no concurrency cap (see the flag note —
+  // inert while the ladder stays gated `!onsetActive`).
+  const capN   = (decisionCtx.onsetActive && LADDER_SEED_STORM_UNCAP)
+    ? Infinity
+    : LADDER_SEED_MAX_INFLIGHT;
+  const budget = capN - (decisionCtx.currentInflight ?? 0) - ladderFiresThisTick;
   if (budget <= 0) return 0;
   seedWaiters.sort((a, b) => (a.target ?? Infinity) - (b.target ?? Infinity));
   let promoted = 0;
@@ -3133,7 +3242,7 @@ function runLadderSeedPass(fireBatch, seedWaiters, decisionCtx, ladderFiresThisT
       console.log(d2.logLine);
       w.state.positionFiredToday = true;
       ladderLastFireMs = Date.now();
-      ladderAddsCommitted++; // our own add — excluded from the growth signal
+      if (!OURS_AT_COMMIT) ladderAddsCommitted++; // legacy fire-time count; default now counts at commit
       fireBatch.push({ driverId: w.driverId, state: w.state, decision: d2 });
       promoted++;
     } catch (err) {
@@ -3263,6 +3372,8 @@ async function poll() {
     }
     // New day → fresh storm tracking (yesterday's onset must not leak forward).
     onsetState = freshOnsetState();
+    onsetStateShadow = freshOnsetState();
+    onsetShadowStats = freshOnsetShadowStats();
     borrowPinnedSecondId = null; // new day → re-pin the single second borrow account
     console.log('[Monitor] Daily reset — counters and visibility state cleared');
     broadcast('daily_reset', { date: currentDayPT });
@@ -3315,11 +3426,9 @@ async function poll() {
   if (isWithinPositionHours() && positionWindowArmedForDate !== currentDayPT) {
     positionWindowArmedForDate = currentDayPT;
     armPositionWindowForToday(currentDayPT);
-    // Proactively pull any leftover SAN didn't purge overnight (still in V Holding
-    // at the window open) and arm it to fire fresh at target — instead of waiting
-    // hours for SAN's drop, by which point the tail has grown past max. Confirmed
-    // removals only; a failed/unconfirmed drop leaves carryover protection intact.
-    dropAndArmCarryoverLeftovers(currentDayPT);
+    // Overnight-leftover drop moved BELOW, to after the queue is parsed, so it can
+    // match the LIVE waiting list (source of truth) instead of our carryover flag.
+    // See the dropAndArmCarryoverLeftovers call right after parseQueue.
   }
 
   const t0 = Date.now();
@@ -3339,6 +3448,17 @@ async function poll() {
   prevObservationAt = lastObservationAt;
   lastObservationAt = Date.now(); // record when this snapshot was taken
   const { dispatched, dispatchedDest, waiting, notAuthorized } = parseQueue(html);
+
+  // Overnight-leftover cleanup (MONITOR_CARRYOVER_DROP_ENABLED) — once per day, on
+  // the first poll in position hours with a freshly-parsed queue. Drop every one of
+  // OUR scheduled drivers SAN still shows in the live WAITING list (they didn't
+  // purge overnight) and arm them to fire fresh at target. The LIVE queue is the
+  // source of truth, so this catches drivers our carryover flag falsely cleared. A
+  // driver appearing LATER (e.g. 4 AM) is a deliberate manual add and is left alone.
+  if (isWithinPositionHours() && carryoverDroppedForDate !== currentDayPT) {
+    carryoverDroppedForDate = currentDayPT;
+    dropAndArmCarryoverLeftovers(currentDayPT, waiting);
+  }
 
   lastPollStats = {
     pollAt:       new Date(),
@@ -3926,21 +4046,65 @@ async function poll() {
   let onsetBoost = 0;
   if (ONSET_FIRE_LIVE || ONSET_FIRE_SHADOW) {
     const wasActive = onsetState.active;
-    // External evidence only: our own chain adds are removed from both the
-    // render step (ours) and the rate, so the pre-onset chain can never
-    // self-trigger the onset dump (see onsetStep / ownAddRate, 2026-09-03).
+    // External evidence only: our own chain adds are removed from BOTH signals —
+    // the render step (instantaneous ownStep) and the rate (windowed ownAddRate OR
+    // the instantaneous ownStep/dt, whichever is larger — see ONSET_OWN_RATE_FIX) — so
+    // the pre-onset chain can never self-trigger the onset dump on its own commit burst.
+    const onsetNowMs = Date.now();
+    const onsetDtS   = prevObservationAt !== null
+      ? Math.max(1, (lastObservationAt - prevObservationAt) / 1000)
+      : 0;
+    // 8 s-windowed EXTERNAL rate (already ours-subtracted, capped 2.5) — immune to
+    // SAN's render-step quantization. Drives the RATE evidence in windowed-LIVE mode
+    // and the shadow A/B always (see ONSET_RATE_WINDOWED_MODE).
+    const windowedExtRate = observedVelocity(onsetNowMs);
     onsetState = onsetStep(onsetState, {
       queue: waitingCount,
-      rate:  Math.max(0, effectiveGrowthRate - ownAddRate(Date.now())),
+      // Windowed-LIVE: judge the rate on the jitter-immune windowed external rate.
+      // Else: the raw instantaneous rate, with onsetStep de-spiking our own adds.
+      rate:  ONSET_RATE_WINDOWED_LIVE ? windowedExtRate : effectiveGrowthRate,
+      nowMs: onsetNowMs,
       ours:  ladderAddsCommitted,
+      ownWindowRate: ONSET_RATE_WINDOWED_LIVE ? 0 : ownAddRate(onsetNowMs),
+      dt:    ONSET_RATE_WINDOWED_LIVE ? 0 : onsetDtS,
     });
     if (onsetState.active !== wasActive) {
       console.log(onsetState.active
-        ? `[Pos] ⚡ storm ONSET detected (queue ${waitingCount}, rate ${effectiveGrowthRate.toFixed(2)}/s, ` +
+        ? `[Pos] ⚡ storm ONSET detected (queue ${waitingCount}, rate ${effectiveGrowthRate.toFixed(2)}/s ext ${onsetState.netRate.toFixed(2)}/s, ` +
           `step +${onsetState.stepSeen}) — early fire ${ONSET_FIRE_LIVE ? 'ACTIVE' : 'SHADOW (log-only)'}, ` +
           `cap ${onsetCapNow(onsetState)} of ${ONSET_CAP} (scales with observed step size)`
-        : `[Pos] storm onset cleared (queue ${waitingCount}, rate ${effectiveGrowthRate.toFixed(2)}/s) — early fire disarmed`);
+        : `[Pos] storm onset cleared (queue ${waitingCount}, rate ${effectiveGrowthRate.toFixed(2)}/s ext ${onsetState.netRate.toFixed(2)}/s) — early fire disarmed`);
       if (!onsetState.active) lastLoggedOnsetCap = 0;
+    }
+    // Windowed-rate A/B (log-only): what a render-jitter-immune onset WOULD decide,
+    // using observedVelocity for the RATE while keeping the same instantaneous STEP
+    // trigger. Logged only on a shadow transition or when shadow disagrees with live,
+    // so a quiet morning stays quiet. Live firing is untouched in shadow mode.
+    if (ONSET_RATE_WINDOWED_SHADOW) {
+      const shadowWas = onsetStateShadow.active;
+      onsetStateShadow = onsetStep(onsetStateShadow, {
+        queue: waitingCount,
+        rate:  windowedExtRate,     // 8 s windowed external rate; already ours-subtracted
+        nowMs: onsetNowMs,
+        ours:  ladderAddsCommitted,
+        ownWindowRate: 0,
+        dt:    0,
+      });
+      // Per-morning A/B tally (summarised at the morning-complete cadence flip).
+      const s = onsetShadowStats;
+      if (onsetState.active || onsetStateShadow.active) s.armedTicks++;
+      const ptNow = () => new Date(onsetNowMs)
+        .toLocaleTimeString('en-CA', { timeZone: 'America/Los_Angeles', hour12: false });
+      if (onsetState.active       && s.firstLiveArm   === null) s.firstLiveArm   = ptNow();
+      if (onsetStateShadow.active && s.firstShadowArm === null) s.firstShadowArm = ptNow();
+      if (onsetStateShadow.active !== onsetState.active) {
+        s.disagree++;
+        if (onsetState.active) s.liveOnly++; else s.shadowOnly++;
+      }
+      if (onsetStateShadow.active !== shadowWas || onsetStateShadow.active !== onsetState.active) {
+        console.log(`[Pos] 🕶 ONSET-SHADOW (windowed rate): shadow ${onsetStateShadow.active ? 'ACTIVE' : 'idle'} | live ${onsetState.active ? 'ACTIVE' : 'idle'} ` +
+          `(queue ${waitingCount}, windowed ${windowedExtRate.toFixed(2)}/s vs raw ${effectiveGrowthRate.toFixed(2)}/s, step +${onsetStateShadow.stepSeen})`);
+      }
     }
     // Backlog boost — deepens the cap (≤ ONSET_CAP_MAX) only while unprocessed
     // fires prove SAN's pipe is deep. Logged when the effective cap moves ≥5.
@@ -4285,7 +4449,7 @@ async function poll() {
           }
           ladderFiresThisTick++;
           ladderLastFireMs = Date.now();
-          ladderAddsCommitted++; // our own add — excluded from the growth signal
+          if (!OURS_AT_COMMIT) ladderAddsCommitted++; // legacy fire-time count; default now counts at commit
         }
         console.log(decision.logLine);
         state.positionFiredToday = true; // mark before enqueuing — prevents double-trigger
@@ -4359,7 +4523,9 @@ async function poll() {
       // calm chain is ~40% projection fires (gap ≤ 10 rungs), and those were
       // invisible to the correction until 2026-09-03. Ladder/seed fires were
       // already counted at promotion; count the rest here, at launch.
-      if (decision.reason !== 'ladder_fire') ladderAddsCommitted++;
+      // NOTE: this is the LEGACY fire-time path. The default (MONITOR_OURS_AT_COMMIT)
+      // counts every add at COMMIT instead, in the genuine-landing handler.
+      if (!OURS_AT_COMMIT && decision.reason !== 'ladder_fire') ladderAddsCommitted++;
       return triggerPositionSchedule(driverId, state, decision.effectivePosition, decision.fireOpts)
         .catch(console.error);
     };
@@ -4527,6 +4693,16 @@ async function poll() {
           : `nearest fire in ${Number.isFinite(minSecondsUntilFire) ? minSecondsUntilFire.toFixed(0) + 's' : '∞'}`;
     console.log(`[Monitor] Poll cadence ${currentPollDelayMs/1000}s → ${newDelayMs/1000}s (${reason})`);
     currentPollDelayMs = newDelayMs;
+    // One-line onset A/B summary for the morning, emitted once as the storm window
+    // relaxes to normal cadence. Skipped on a calm morning (neither side ever armed).
+    const oss = onsetShadowStats;
+    if (ONSET_RATE_WINDOWED_SHADOW && inWatchWindow && !positionFirePending
+        && !oss.summaryLogged && (oss.firstLiveArm || oss.firstShadowArm)) {
+      console.log(`[Pos] 🕶 ONSET-SHADOW SUMMARY — ${oss.disagree} tick(s) where shadow≠live of ${oss.armedTicks} armed ` +
+        `(live-only ${oss.liveOnly} = ladder would keep running under the windowed rate; shadow-only ${oss.shadowOnly} = windowed armed EARLIER — watch this stays low); ` +
+        `live first armed ${oss.firstLiveArm ?? 'never'}, shadow first armed ${oss.firstShadowArm ?? 'never'}`);
+      oss.summaryLogged = true;
+    }
   }
   } else {
     if (currentPollDelayMs !== POLL_INTERVAL_MS) {
@@ -5162,6 +5338,8 @@ function stopMonitor() {
   nudgePending = false;
   pollInFlight = false;
   onsetState   = freshOnsetState();
+  onsetStateShadow = freshOnsetState();
+  onsetShadowStats = freshOnsetShadowStats();
   lastLoggedOnsetCap = 0;
   try { require('./botService').setFireVisibilityListener(null); } catch { /* not loaded */ }
   // Retire any borrowed probes so no real driver is left mid-cycle in the live

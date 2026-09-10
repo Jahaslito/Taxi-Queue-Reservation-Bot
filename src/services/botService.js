@@ -1683,6 +1683,10 @@ const WARM_REFIRE_ENABLED   = WARM_REFIRE_MODE === '1';
 const WARM_REFIRE_SHADOW    = WARM_REFIRE_MODE === 'shadow';
 const WARM_REFIRE_ATTEMPTS  = Math.max(1, parseInt(process.env.BOT_WARM_REFIRE_ATTEMPTS ?? '3', 10));
 const WARM_REFIRE_BUDGET_MS = parseInt(process.env.BOT_WARM_REFIRE_MS ?? '2500', 10);
+// Running count of shadow warm-refire hits (cold-refire misses the ladder WOULD
+// have recovered). Shown in each ♻ SHADOW line so a storm's total is visible from
+// the last line; process-lifetime (resets on restart, per-storm delta reads off it).
+let warmRefireShadowCount = 0;
 // In-context recovery (tier 2 of the ladder, on unless BOT_WARM_REFIRE_RECOVER=0).
 // When the re-dispatch finds NO add button — the armed page fell off the add
 // screen (08-13 #258: handler/hiddenId/visible all false) — re-drive the SAME
@@ -2500,7 +2504,7 @@ async function fireClaimedSession(session) {
       // click never dispatched and the driver is absent). Log it and fall
       // through to the unchanged cold fallback so the storm shows how often the
       // ladder would fire — no re-dispatch is taken.
-      console.warn(`[Arm] ♻ #${vehicleNumber} SHADOW — would warm re-fire here (click never dispatched, driver absent); falling through to cold instead`);
+      console.warn(`[Arm] ♻ #${vehicleNumber} SHADOW #${++warmRefireShadowCount} — would warm re-fire here (click never dispatched, driver absent); falling through to cold instead — this is a +74…+165 cold-refire the ladder would have caught`);
     } else if (WARM_REFIRE_ENABLED && dispatchedAtMs === null) {
       let clicked = false;
       // One in-page dispatch attempt; stamps the fire state on success.

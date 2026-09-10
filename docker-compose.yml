@@ -348,8 +348,22 @@ services:
       # targets). That undershoot is arithmetic (N drivers from an empty queue
       # occupy 1…N; 58 drivers want 50-74), not tuning — the only way past it is
       # spreading the targets drivers book. Roll back: GAP 35 / SHALLOW 29.
-      MONITOR_LADDER_SEED_GAP:     ${MONITOR_LADDER_SEED_GAP:-70}
-      MONITOR_LADDER_SEED_SHALLOW: ${MONITOR_LADDER_SEED_SHALLOW:-70}
+      # ⚠️ 2026-09-10 (operator request) — WIDENED 70→999: dump the WHOLE non-200+
+      # roster the instant the queue clears the floor, in strict target order, instead
+      # of releasing it in queue-driven waves. gap ≫ max band target ⇒ the eligible set
+      # is {every target <200} at ANY queue ⇒ all ~131 fire at once; strict TARGET ORDER
+      # is preserved by the ascending sort in runLadderSeedPass AND the fireBatch
+      # launch-sort (monitorService ~L4530, by effectivePosition). ⚠️ GAP and SHALLOW
+      # MUST STAY EQUAL — the uniform cap is what guarantees the order; a split cap lets
+      # band targets jump ahead of shallower ones (the 09-03 note above). Undershoot is
+      # bounded by roster size (131 drivers → nobody lands past ~131; target-150 → ~122
+      # / −28, worst ~−68). 200+ stay on the normal path via SEED_DEEP=29 below.
+      # NOTE: MIN_QUEUE floor intentionally KEPT — the dump still starts at queue 10
+      # (~10s before onset), so warm coverage is armed-pool-bound; expect a cold TAIL on
+      # drivers whose login can't finish in that window (see BOT_ARMED_MAX). Roll back:
+      # GAP 70 / SHALLOW 70.
+      MONITOR_LADDER_SEED_GAP:     ${MONITOR_LADDER_SEED_GAP:-999}
+      MONITOR_LADDER_SEED_SHALLOW: ${MONITOR_LADDER_SEED_SHALLOW:-999}
       # ≥200 targets keep the old −29 cap: with the chain lifting the queue to
       # ~130 they would otherwise be seeded ~70 under. Default = SHALLOW.
       MONITOR_LADDER_SEED_DEEP:    ${MONITOR_LADDER_SEED_DEEP:-29}
@@ -432,12 +446,19 @@ services:
       # Defaults below are now the LIVE values (FULL=1, N=5); set them in .env
       # only to override/kill.
       MONITOR_LADDER_PROACTIVE_FULL:     ${MONITOR_LADDER_PROACTIVE_FULL:-1}
-      # 2026-09-09 (operator request) — release up to 6 seeds concurrently in the calm
-      # window (was 4). 6 = SAN's commit knee (≤6 → ~5s/±2 landing; >6 → ~10s/±40,
-      # 08-24) and the safe edge of the self-trigger model (6 stays idle; ~10+ can re-arm
-      # the false onset). Max safe calm throughput without leaning hard on the ours-fixes.
-      # Revert to 4 if the 🕶/onset logs ever show the ladder self-arming onset in calm.
-      MONITOR_LADDER_SEED_MAX_INFLIGHT:  ${MONITOR_LADDER_SEED_MAX_INFLIGHT:-6}
+      # 2026-09-10 (operator request) — UNCAPPED calm dump (was 6): release ALL eligible
+      # seeds at once, ascending by target ("be the storm" — take the front wholesale
+      # before the competitor floods). 999 = effectively no cap for the roster.
+      # ⚠️ This OVERRIDES the prior calibration, so know what you're trading:
+      #   • 6 was SAN's commit knee: ≤6 → ~5s/±2 landing; >6 → ~10s/±40 (08-24). Expect a
+      #     deeper, ±40 tail whenever the dump fires INTO a climbing queue instead of
+      #     ahead of it (the MIN_QUEUE floor still gates WHEN it starts — this uncaps the
+      #     dump but does not move it earlier).
+      #   • ~10+ concurrent can re-arm the FALSE onset the ours-fixes suppress
+      #     ([[ladder-self-throttle-ours-at-commit-0908]]). WATCH the onset logs after
+      #     deploy — if the ladder self-arms onset in calm, this is why.
+      # Revert: set to 6.
+      MONITOR_LADDER_SEED_MAX_INFLIGHT:  ${MONITOR_LADDER_SEED_MAX_INFLIGHT:-999}
       # No concurrency cap once the storm is active. NOTE: inert unless the ladder's
       # !onsetActive gate is also lifted; the onset early-fire dump is already uncapped.
       MONITOR_LADDER_SEED_STORM_UNCAP:   ${MONITOR_LADDER_SEED_STORM_UNCAP:-1}
@@ -616,7 +637,11 @@ services:
       # fires are in flight (the backlog signal + early landings above).
       BOT_FIRE_VIS_POLL_MS:          ${BOT_FIRE_VIS_POLL_MS:-1250}
       BOT_FIRE_VIS_START_MS:         ${BOT_FIRE_VIS_START_MS:-2000}
-      BOT_FIRE_VIS_TIMEOUT_MS:       ${BOT_FIRE_VIS_TIMEOUT_MS:-60000}
+      # ⚠️ 2026-09-10 — 60000→120000: the 32/128 uncap dump saturates SAN worse
+      # (commit latency hit 84s at 25/100; higher inflight pushes it further), so a
+      # 60s visibility window would concede slow-but-committed adds to cold → "already
+      # in queue". 120s covers the worst-case commit.
+      BOT_FIRE_VIS_TIMEOUT_MS:       ${BOT_FIRE_VIS_TIMEOUT_MS:-120000}
       # Fast page release (2026-07-21 pipeline-declog). The old fire path held
       # each browser page in waitForFunction until SAN streamed the WAIT screen
       # back (10-25 s under storm load); with ~25 drivers now firing per queue
@@ -644,9 +669,13 @@ services:
       # at *_MAX. The fixed ~18 s window was shorter than the 08-05/08-06 storm
       # latency (18–89 s), so slow-but-committed adds false-failed → cold re-fire →
       # "already in queue" and wasted browser launches mid-storm. Floor keeps calm
-      # mornings unchanged; MAX bounds the worst case (~45 s at 30 × 1.5 s polls).
+      # mornings unchanged; MAX bounds the worst case.
+      # ⚠️ 2026-09-10 — MAX 30→80 (~45s → ~120s at 1.5s polls) for the 32/128 uncap
+      # dump: firing 128 at once saturates SAN past the old 45s cap (84s seen at
+      # 25/100), so committed-but-slow adds were being false-failed → cold re-fire →
+      # "already in queue". Adaptive floor (12) unchanged, so calm mornings are the same.
       BOT_FIRE_RELEASE_VERIFY_ATTEMPTS:     ${BOT_FIRE_RELEASE_VERIFY_ATTEMPTS:-12}
-      BOT_FIRE_RELEASE_VERIFY_ATTEMPTS_MAX: ${BOT_FIRE_RELEASE_VERIFY_ATTEMPTS_MAX:-30}
+      BOT_FIRE_RELEASE_VERIFY_ATTEMPTS_MAX: ${BOT_FIRE_RELEASE_VERIFY_ATTEMPTS_MAX:-80}
       # ⚠️ 2026-07-28 — 40→48 to match the widened pool's slot capacity (12
       # browsers × 4 sessions below); at 40 the cap bound BELOW capacity, and on
       # 07-27 it starved 9 of 78 drivers (targets 111–165, the crush band) to the
@@ -654,8 +683,11 @@ services:
       # BOT_ARMED_BROWSERS_MAX × BOT_ARMED_SESSIONS_PER_BROWSER when resizing.
       # ⚠️ 2026-08-07 — 48→100 on the 16 GB droplet: arm the whole storm roster
       # (~77 today, headroom to 100) so no driver falls to the cold path. Equals
-      # BOT_ARMED_BROWSERS_MAX (25) × BOT_ARMED_SESSIONS_PER_BROWSER (4) below.
-      BOT_ARMED_MAX:             ${BOT_ARMED_MAX:-100}
+      # BOT_ARMED_BROWSERS_MAX × BOT_ARMED_SESSIONS_PER_BROWSER below.
+      # ⚠️ 2026-09-10 (operator request) — 100→128: roster grew to ~131, so cover it
+      # and the uncapped ascending dump fires warm instead of a ~30-driver cold tail.
+      # = 32 browsers × 4 sessions. Worst-case RSS ~10.6 GB (see BROWSERS_MAX below).
+      BOT_ARMED_MAX:             ${BOT_ARMED_MAX:-128}
       # Roster-scaled armed pool: BOT_ARMED_BROWSERS is the FLOOR; one extra
       # browser opens per BOT_ARMED_SESSIONS_PER_BROWSER armed sessions, up to
       # BOT_ARMED_BROWSERS_MAX (07-06: 12 same-tick claims on 3 browsers = 4
@@ -676,27 +708,35 @@ services:
       # restart (11264M) with a ~1 GB graceful gap below the Docker app cap
       # (12288M). Postgres stays capped at 1 GB (see the db service; idles ~107
       # MiB). Box budget: 12 GB app + 1 GB db + ~1 GB OS/nginx ≈ 14 GB of ~15.5.
+      # ⚠️ 2026-09-10 — 25→32 (+7) to arm 128. Worst-case RSS ≈ 32×180 + 128×35 + base
+      # ≈ 10.6 GB — still under the pm2 restart (11264M), BUT the buffer is now only
+      # ~0.6 GB (was 2.9 GB): a browser leak has far less room before pm2 restarts the
+      # app mid-storm. pm2/container caps NOT raised (10.6 < 11.26 < 12.3). ⛔ Do NOT
+      # push browsers past ~33 without a bigger box — worst-case would cross 11264M.
       # NOTE: 25 Chromiums only fire in PARALLEL if the droplet has the vCPUs to
       # run them — same-tick armed clicks serialise per browser, so with too few
       # cores the batching win moves to the CPU layer. Verify with `docker stats`
       # at ~15 browsers during a live storm; if CPU-bound, trim MAX and raise
       # BOT_ARMED_SESSIONS_PER_BROWSER to keep ARMED_MAX at 100.
       BOT_ARMED_BROWSERS:             ${BOT_ARMED_BROWSERS:-4}
-      BOT_ARMED_BROWSERS_MAX:         ${BOT_ARMED_BROWSERS_MAX:-25}
+      BOT_ARMED_BROWSERS_MAX:         ${BOT_ARMED_BROWSERS_MAX:-32}   # 2026-09-10: 25→32 (+7) to arm the ~131 roster (32×4=128). CPU: 32 Chromiums on 8 vCPU is near the contention edge — verify `docker stats` at ~25 live before pushing further.
       BOT_ARMED_SESSIONS_PER_BROWSER: ${BOT_ARMED_SESSIONS_PER_BROWSER:-4}
       # ⚠️ 2026-08-07 — 4→8 with the 100-armed pool (16 GB / 8 vCPU). Arm AND
       # refresh share this semaphore; a full keep-alive sweep = ARMED_MAX ÷ this ×
       # ~4 s must stay under BOT_ARM_REFRESH_MS (90 s) or sessions go stale. At 100
       # armed, 4-wide = ~100 s (behind); 8-wide = ~50 s. Arms are SAN-I/O-bound, so
       # 8-wide is fine on 8 vCPU. Keep this ≈ ARMED_MAX ÷ 12 when resizing the pool.
-      BOT_ARM_OPS_CONCURRENCY:   ${BOT_ARM_OPS_CONCURRENCY:-8}
+      BOT_ARM_OPS_CONCURRENCY:   ${BOT_ARM_OPS_CONCURRENCY:-11}   # 2026-09-10: 8→11 (≈ ARMED_MAX 128 ÷ 12) so the keep-alive sweep = 128÷11×~4s ≈ 47s stays under BOT_ARM_REFRESH_MS (90s) at 128 armed
       # Adaptive fire-confirmation timeout: floor .. max, driven by 2 × rolling
       # p95 of armed-fire durations. A timeout is verified against V Holding
       # before falling back cold — the Blazor add commits when SAN processes
       # the click, so a slow confirmation is almost never a failed add
       # (07-06: 17 committed adds misread as failures → "already in queue" wall).
       BOT_ARM_FIRE_TIMEOUT_MS:     ${BOT_ARM_FIRE_TIMEOUT_MS:-12000}
-      BOT_ARM_FIRE_TIMEOUT_MAX_MS: ${BOT_ARM_FIRE_TIMEOUT_MAX_MS:-45000}
+      # ⚠️ 2026-09-10 — MAX 45000→120000 for the 32/128 uncap dump (same reason as the
+      # verify window above: 84s commit latency > the old 45s cap → false-fail cold
+      # re-fires). Floor (12000) unchanged; adaptive, so calm mornings are unaffected.
+      BOT_ARM_FIRE_TIMEOUT_MAX_MS: ${BOT_ARM_FIRE_TIMEOUT_MAX_MS:-120000}
       # Warm re-fire ladder (default OFF). The big storm overshoots are the COLD
       # fallback, not lead/drift error: when an armed click never dispatches (the
       # CPU-starved renderer can't ready the visible Add button under a same-tick
@@ -778,7 +818,12 @@ services:
       # which DISARMED them (pre-arm reconcile drops a held driver) so they
       # re-fired cold 60-86s late into the plateau — the documented 08-14
       # backfire. 'off' = launch the batch as-is, no holding, no disarm.
-      MONITOR_FIRE_PACING:         ${MONITOR_FIRE_PACING:-off}
+      # 2026-09-09 — set to 'shadow' to prototype the ASCENDING-PACED placement the
+      # oracle's fleet line models (lowest-target-first, ≤PACE_MAX_INFLIGHT concurrent).
+      # SHADOW = log-only, launches everything unchanged; emits per-tick `[Pace]` lines
+      # + a per-storm `🅿 PACED-SHADOW SUMMARY`. Do NOT set 'on' until held fires are
+      # warm-refire-backed (BOT_WARM_REFIRE) or it reruns the 08-14 cold-refire backfire.
+      MONITOR_FIRE_PACING:         ${MONITOR_FIRE_PACING:-shadow}
       MONITOR_PACE_MAX_INFLIGHT:   ${MONITOR_PACE_MAX_INFLIGHT:-6}
       MONITOR_PACE_URGENCY_MARGIN: ${MONITOR_PACE_URGENCY_MARGIN:-25}
       # Concentration gate: only ENGAGE pacing when it would hold ≥ this many
@@ -896,7 +941,10 @@ services:
 
     # Shared memory for Chromium (prevents crashes on small droplets)
     # 2026-08-07 — 256mb → 512mb for the 25-browser pool on the 16 GB droplet.
-    shm_size: '512mb'
+    # 2026-09-10 — 512mb → 640mb for the 32-browser pool (~20 MB/browser; Chromium
+    # crashes if /dev/shm is starved). Counts toward container memory — folded into
+    # the ~10.6 GB worst-case below.
+    shm_size: '640mb'
 
     networks:
       - internal
@@ -915,6 +963,10 @@ services:
     # 100-armed pool. Worst-case app RSS ≈ 8.4 GB; pm2 restarts at 11264M (~1 GB
     # gap under this cap). Postgres stays capped at 1 GB (see the db service):
     # box budget 12 GB app + 1 GB db + ~1 GB OS/nginx ≈ 14 GB of ~15.5.
+    # ⚠️ 2026-09-10 — pool raised to 32 browsers / 128 armed. Worst-case app RSS now
+    # ≈ 10.6 GB — the 12288M cap and 11264M pm2 restart are UNCHANGED (10.6 still fits,
+    # buffer ~0.6 GB). Going further needs a bigger droplet, not a cap bump: the box is
+    # ~15.5 GB and 13 GB app + 1 db + 1 OS is already the physical edge.
     deploy:
       resources:
         limits:

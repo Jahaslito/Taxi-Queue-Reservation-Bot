@@ -1196,6 +1196,18 @@ const freshOnsetShadowStats = () => ({
   firstLiveArm: null, firstShadowArm: null, summaryLogged: false,
 });
 let onsetShadowStats = freshOnsetShadowStats();
+// Per-morning tally for the ASCENDING-PACED placement shadow (MONITOR_FIRE_PACING=
+// shadow): what a lowest-target-first, ≤PACE_MAX_INFLIGHT-concurrent release WOULD do
+// vs the actual all-at-once dump. `held` = fires a paced release would have deferred
+// to a later tick (the coordination win); `urgent` = fires with no runway left
+// (queue already ≥ target−margin) that even pacing must release — the un-paceable
+// remainder that says how much of the storm is too late to coordinate reactively.
+// maxHeld = biggest single-tick pile-up deferred (the disarm-risk / warm-refire gauge).
+const freshPaceShadowStats = () => ({
+  engagedTicks: 0, batchTotal: 0, fired: 0, held: 0, urgent: 0, maxHeld: 0,
+  peakPaced: 0, peakUnpaced: 0, summaryLogged: false,
+});
+let paceShadowStats = freshPaceShadowStats();
 // Last effective cap logged (backlog boost) — change-gated so the log shows the
 // cap ladder, not one line per tick.
 let lastLoggedOnsetCap = 0;
@@ -3374,6 +3386,7 @@ async function poll() {
     onsetState = freshOnsetState();
     onsetStateShadow = freshOnsetState();
     onsetShadowStats = freshOnsetShadowStats();
+    paceShadowStats = freshPaceShadowStats();
     borrowPinnedSecondId = null; // new day → re-pin the single second borrow account
     console.log('[Monitor] Daily reset — counters and visibility state cleared');
     broadcast('daily_reset', { date: currentDayPT });
@@ -4564,6 +4577,16 @@ async function poll() {
       console.log(`[Pace] ${FIRE_PACING_MODE.toUpperCase()}${scopeNote} — batch ${fireBatch.length}, inflight ${inflight} (cap ${PACE_MAX_INFLIGHT}): `
         + `${engaged ? `ENGAGED fire ${fired} / hold ${held}${urgent ? ` (urgent-release ${urgent})` : ''}` : `not engaged (would hold <${PACE_MIN_HOLD}) — all ${fireBatch.length} fire`}; `
         + `est peak inflight paced ~${pacedPeak} vs unpaced ~${unpacedPeak} → est drift ~${paceDriftEst(pacedPeak)} vs ~${paceDriftEst(unpacedPeak)}`);
+
+      // Per-morning ascending-paced tally (shadow), summarised at the cadence flip.
+      if (FIRE_PACING_MODE === 'shadow' && engaged) {
+        const ps = paceShadowStats;
+        ps.engagedTicks++; ps.batchTotal += fireBatch.length;
+        ps.fired += fired; ps.held += held; ps.urgent += urgent;
+        ps.maxHeld    = Math.max(ps.maxHeld, held);
+        ps.peakPaced  = Math.max(ps.peakPaced, pacedPeak);
+        ps.peakUnpaced = Math.max(ps.peakUnpaced, unpacedPeak);
+      }
     }
   }
 
@@ -4702,6 +4725,16 @@ async function poll() {
         `(live-only ${oss.liveOnly} = ladder would keep running under the windowed rate; shadow-only ${oss.shadowOnly} = windowed armed EARLIER — watch this stays low); ` +
         `live first armed ${oss.firstLiveArm ?? 'never'}, shadow first armed ${oss.firstShadowArm ?? 'never'}`);
       oss.summaryLogged = true;
+    }
+    // Ascending-paced placement A/B summary (shadow) — what a lowest-target-first,
+    // cap-limited release would have deferred vs the actual all-at-once dump.
+    const ps = paceShadowStats;
+    if (FIRE_PACING_MODE === 'shadow' && inWatchWindow && !positionFirePending
+        && !ps.summaryLogged && ps.engagedTicks > 0) {
+      console.log(`[Pace] 🅿 PACED-SHADOW SUMMARY — over ${ps.engagedTicks} engaged tick(s) of ${ps.batchTotal} batched fires: ascending-paced (cap ${PACE_MAX_INFLIGHT}) `
+        + `would DEFER ${ps.held} to later ticks (max ${ps.maxHeld} at once) and urgent-release ${ps.urgent} with NO runway (queue already ≥ target−${PACE_URGENCY_MARGIN}); `
+        + `peak inflight paced ~${ps.peakPaced} vs dump ~${ps.peakUnpaced}. Deferred fires need warm-refire or they cold-refire (08-14); high urgent = too late to pace reactively → needs PROACTIVE pre-placement.`);
+      ps.summaryLogged = true;
     }
   }
   } else {
@@ -5340,6 +5373,7 @@ function stopMonitor() {
   onsetState   = freshOnsetState();
   onsetStateShadow = freshOnsetState();
   onsetShadowStats = freshOnsetShadowStats();
+  paceShadowStats = freshPaceShadowStats();
   lastLoggedOnsetCap = 0;
   try { require('./botService').setFireVisibilityListener(null); } catch { /* not loaded */ }
   // Retire any borrowed probes so no real driver is left mid-cycle in the live

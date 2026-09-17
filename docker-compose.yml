@@ -254,7 +254,7 @@ services:
       MONITOR_PRED_LEAD_MIN_TARGET:  ${MONITOR_PRED_LEAD_MIN_TARGET:-70}    # aggressive lead + band floor only for target ≥ this
       MONITOR_PRED_LEAD_MAX_TARGET:  ${MONITOR_PRED_LEAD_MAX_TARGET:-199}   # …and ≤ this (the avalanche band)
       MONITOR_PRED_LEAD_MOVE_RATE:   ${MONITOR_PRED_LEAD_MOVE_RATE:-0.5}    # /s, queue must be moving to spend the full budget
-      MONITOR_PRED_LEAD_HARD_FLOOR:  ${MONITOR_PRED_LEAD_HARD_FLOOR:-65}    # band: never fire >65 below target. REVERTED 35→65 on 08-31: the 08-30 storm showed 35 HELD high-target fires past their max-rail window (#0911 tgt150 could fire at q98/proj151<max190 but was held to q115, missed at q135) → 66 max-rail hits (59 place-anyway +67, 7 miss) vs 0-11 normally, SAME storm violence. The −60 undershoot is capped separately by MONITOR_LADDER_SEED_GAP below (seed-only, no window narrowing).
+      MONITOR_PRED_LEAD_HARD_FLOOR:  ${MONITOR_PRED_LEAD_HARD_FLOOR:-999}   # 2026-09-16 (operator): HOLD REMOVED for the 70-199 band (was 65). Rule is "hold until displayed queue ≥ target − FLOOR"; 999 ⇒ target−999 < 0 ≤ queue always ⇒ never holds ⇒ the whole <200 band releases into the queue-8 ascending dump instead of waiting for the queue to climb (09-16: queue stuck at 8-9, the 65-floor held all 113 band drivers → reactive/cold → +100 overshoots). LOOSENING not tightening: fires EARLIER, so it CANNOT cause the 08-30 max-rail miss (that was the opposite — floor 35 fired too LATE). Undershoot is now bounded by ROSTER RANK in the ascending dump (~28-49 worst), not the raw target−queue delta. Targets ≥200 are UNAFFECTED — they use MONITOR_PRED_LEAD_OUTER_FLOOR (−30) below. RESIDUAL RISK: a lone band fire on a probe over-read during a display freeze can now undershoot deeply (the floor was the catch); acceptable in the coordinated dump. Revert: set back to 65.
       MONITOR_PRED_LEAD_OUTER_FLOOR: ${MONITOR_PRED_LEAD_OUTER_FLOOR:-30}   # target ≥200: unchanged −30 guarantee
       # PLACE-ANYWAY fallback (2026-08-26). The overshoot rails
       # (queue_already_past_max, projection_exceeds_max) protect ACCURACY by
@@ -380,7 +380,7 @@ services:
       # nothing and the chain works (sim: ~35% ±10, no >+40, no misses). To seat a
       # roster ahead of an empty-queue flood you must occupy positions 1-9, which
       # the operator has ruled out; 0 would lift that but is against the rule.
-      MONITOR_LADDER_SEED_MIN_QUEUE: ${MONITOR_LADDER_SEED_MIN_QUEUE:-10}
+      MONITOR_LADDER_SEED_MIN_QUEUE: ${MONITOR_LADDER_SEED_MIN_QUEUE:-8}    # 2026-09-16 (operator): 10→8. Release the ascending dump as soon as the queue reaches 8 (was 10). 09-16 the queue sat at 8-9 until ~4s before onset and never crossed 10, so the dump never fired and the whole band went reactive/cold. At 8 the shallowest landing is ~position 9 (queue 8 + the first ascending seed); positions 1-7 stay clear. Floor still holds the dump until the queue reaches 8 organically, then releases ascending by target.
       MONITOR_LADDER_SEED_AFTER:   ${MONITOR_LADDER_SEED_AFTER:-03:40}   # 09-03: 03:45→03:40 — earliest flood seen 03:48 (08-31); chain needs ~5 min
       # Seed GROWTH gate (2026-08-24): the seed spends undershoot ONLY when the
       # list is genuinely building, and scales depth with the climb. DEAD CALM

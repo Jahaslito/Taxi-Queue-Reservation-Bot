@@ -23,6 +23,105 @@ function sanitizeError(msg = '') {
   return 'Something went wrong — please try again or contact support';
 }
 
+// ─── Browser pid capture (for reliable process-group reaping) ─────────────────
+// Playwright's client `Browser` does NOT expose its OS process — `browser.process()`
+// is a Puppeteer API and is `undefined` here — so we cannot read the pid off the
+// browser to kill its process group. We capture it at spawn time instead:
+// Playwright launches every browser through child_process.spawn, so we wrap spawn
+// with a transparent pass-through that records the pid of the process spawned
+// INSIDE a launchReapableBrowser() call. An AsyncLocalStorage store ties that
+// spawn back to the exact launch — it propagates across launch()'s own internal
+// awaits — so attribution stays correct even when many browsers launch at once
+// (verified: 3 concurrent launches each captured their own distinct leader pid,
+// and kill(-pid) then reaped only the intended group). The wrapper only ever
+// reads/records; it never alters spawn behaviour, so every other spawn in the
+// app is unaffected. Chromium is launched detached (Playwright sets
+// detached:true on non-Windows), so the captured pid is a group leader and
+// kill(-pid) hits only that browser's own group.
+const { AsyncLocalStorage } = require('async_hooks');
+const child_process   = require('child_process');
+const browserLaunchPid = new WeakMap();            // browser → its OS pid (group leader)
+const _launchPidStore  = new AsyncLocalStorage();
+const _origSpawn       = child_process.spawn;
+child_process.spawn = function spawn(...args) {
+  const child = _origSpawn.apply(this, args);
+  try {
+    const store = _launchPidStore.getStore();
+    if (store && !store.pid && child && typeof child.pid === 'number') store.pid = child.pid;
+  } catch { /* capture must never disturb a spawn */ }
+  return child;
+};
+
+// Launch a browser AND remember its pid so hardCloseBrowser / the disconnect
+// handler can reap the whole process group. Use this everywhere in place of a
+// bare chromium.launch(): a browser launched directly would have no captured pid
+// and its stranded children could not be reaped.
+async function launchReapableBrowser(launchOptions) {
+  const store = {};
+  const browser = await _launchPidStore.run(store, () => chromium.launch(launchOptions));
+  if (store.pid) browserLaunchPid.set(browser, store.pid);
+  return browser;
+}
+
+// ─── Browser teardown (force-reap) ────────────────────────────────────────────
+// A bare browser.close() is NOT enough. When a Chromium is wedged or already
+// crashed, close() either hangs or silently no-ops — Playwright logs
+// "skipped force kill … processClosed=true" and moves on — and the browser's
+// renderer/gpu/zygote children get re-parented to PID 1 and keep running. Those
+// orphans burn process/thread slots until the box can no longer fork:
+//   browserType.launch: … spawn …/chrome-headless-shell EAGAIN
+// That is the confirmed root cause of the 2026-09-16 outage (0 EAGAIN across 6
+// days of uptime, then 1448 once the orphan pile crossed the box's fork ceiling
+// — the afternoon that broke ran LESS launch load than the clean day before).
+//
+// hardCloseBrowser() gives close() a hard deadline, then SIGKILLs the browser's
+// whole process GROUP (negative pid) so no child is stranded. It never throws —
+// teardown must not manufacture failures. Safety: Playwright launches the
+// browser detached, so its group id == browser.pid; kill(-pid) therefore targets
+// only the browser's own group. If it somehow were not a group leader, no group
+// with that id exists and kill(-pid) simply ESRCHes — it can NEVER hit Node's
+// group, whose id is Node's pid, never the browser's.
+const BROWSER_CLOSE_TIMEOUT_MS = parseInt(process.env.BOT_BROWSER_CLOSE_TIMEOUT_MS ?? '5000', 10);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function hardCloseBrowser(browser, label = '') {
+  if (!browser) return;
+  // pid captured at launch time (see launchReapableBrowser). null for a browser
+  // launched some other way, or a mock in tests — then we just close(), no reap.
+  const pid = browserLaunchPid.get(browser) ?? null;
+
+  // 1) Graceful close, but never wait forever on a wedged Chromium.
+  let closedInTime = false;
+  try {
+    await Promise.race([
+      (async () => { try { await browser.close(); } catch { /* ignore */ } finally { closedInTime = true; } })(),
+      sleep(BROWSER_CLOSE_TIMEOUT_MS),
+    ]);
+  } catch { /* never throw from teardown */ }
+
+  // 2) Reap the process GROUP as a backstop, regardless of what close() reported:
+  //    Playwright "skips force kill" when it believes the main process exited,
+  //    which strands live children. In the healthy case the group is already
+  //    gone (ESRCH) and this is a quiet no-op; when children were stranded it
+  //    reaps them. See the header note for why this can only ever hit the
+  //    browser's own group, never Node's.
+  if (pid && pid > 1) {
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch (err) {
+      if (err && err.code !== 'ESRCH') {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* nothing more we can do */ }
+      }
+    }
+  }
+
+  // Only shout about the genuinely bad case: close() blew its deadline (the
+  // wedged-browser path that used to hang teardown and leak the tree).
+  if (!closedInTime) {
+    console.warn(`[Bot:reap] ${label ? label + ' ' : ''}browser close() exceeded ${BROWSER_CLOSE_TIMEOUT_MS}ms — force-killed pgid ${pid ?? '?'}`);
+  }
+}
+
 // ─── Proxy rotation ───────────────────────────────────────────────────────────
 // Returns a Playwright-compatible proxy config with a fresh session ID, or null
 // when proxy use is disabled (env kill switch, PROXY_SERVER unset, or the
@@ -139,6 +238,11 @@ const OIDC_HOST   = 'san.gtcvms.com/GsiIdentityServer';
 const APP_HOST    = 'san.gtcvms.com/gsidispatch.edispatch';
 const TIMEOUT     = 60000;   // 60s — OIDC handshake + SPA hydration can be slow
 const NAV_TIMEOUT = 60000;   // Extra time for full page-navigation round-trips
+// Confirm window for the leading-zero search fallback (STEP 6.5). SAN renders a
+// search result in ~1s, so this only needs to cover SPA hydration; kept well
+// under TIMEOUT so a genuine double-miss fails fast instead of stalling a storm
+// retry for the full 60s.
+const SEARCH_RETRY_TIMEOUT = parseInt(process.env.BOT_SEARCH_RETRY_TIMEOUT_MS ?? '15000', 10);
 
 // ─── SAN response text constants ─────────────────────────────────────────────
 // Every literal string we look for in SAN's HTML lives here so updates (when
@@ -451,7 +555,7 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
   let page    = null;
 
   try {
-    browser = await chromium.launch({
+    browser = await launchReapableBrowser({
       headless: true,
       args: [
         '--no-sandbox',
@@ -619,36 +723,70 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
 
     // ─── STEP 6: Search by vehicle number ────────────────────────────────────
     // The field placeholder says "Vehicle Dispatch Name" but the actual value
-    // entered is the numeric vehicle number (e.g. "4000")
-    console.log(`[Bot] ${vehicleNumber} → Searching for vehicle ${vehicleNumber}…`);
-    await page.fill('input[placeholder="Vehicle Dispatch Name"]', String(vehicleNumber));
-    await page.click('button:has-text("Search")');
+    // entered is the numeric vehicle number (e.g. "4000"). SAN matches the name
+    // EXACTLY. Factored into a helper so STEP 6.5 can re-run the search with a
+    // fallback term (see the leading-zero note below) without duplicating the
+    // fill/click/wait logic.
+    const searchForVehicle = async (term) => {
+      console.log(`[Bot] ${vehicleNumber} → Searching for vehicle ${term}…`);
+      await page.fill('input[placeholder="Vehicle Dispatch Name"]', String(term));
+      await page.click('button:has-text("Search")');
+      // Wait for any of the known search-result strings (see SEARCH_RESULT_STRINGS
+      // at the top of this file). Adding a new SAN response state means adding
+      // one entry there — no change to this call.
+      await page.waitForFunction(
+        (needles) => needles.some((s) => document.body.innerText.includes(s)),
+        SEARCH_RESULT_STRINGS,
+        { timeout: TIMEOUT },
+      );
+      return page.textContent('body').catch(() => '');
+    };
 
-    // Wait for any of the known search-result strings (see SEARCH_RESULT_STRINGS
-    // at the top of this file). Adding a new SAN response state means adding
-    // one entry there — no change to this call.
-    await page.waitForFunction(
-      (needles) => needles.some((s) => document.body.innerText.includes(s)),
-      SEARCH_RESULT_STRINGS,
-      { timeout: TIMEOUT },
-    );
+    const bodyText = await searchForVehicle(String(vehicleNumber));
 
     // ─── STEP 6.5: Detect SAN business-rule rejections ────────────────────────
     // Read the body once and dispatch on what SAN said. Cheaper than three
     // separate isVisible calls and surfaces a clear driver-facing error
     // instead of a misleading "vehicle not found" or "SAN took too long".
-    const bodyText = await page.textContent('body').catch(() => '');
-
+    //
+    // Leading-zero fallback: some cabs are stored with a leading zero SAN does
+    // NOT use ("0219" while SAN knows the vehicle as "219"), and SAN answers an
+    // exact-name miss with VEHICLE_NOT_AVAILABLE. Our queue matcher already
+    // strips leading zeros via norm(); mirror that here as a one-shot retry so a
+    // mis-stored zero self-heals instead of blocking the driver every day. We
+    // only retry when stripping actually changes the term, and confirm success
+    // by waiting for the Add-To-Queue button — a positive signal, since the
+    // previous rejection banner can linger in the DOM through SAN's re-render,
+    // so re-reading body text alone would race. Cabs whose stored name is
+    // already correct (e.g. "0226", which SAN really does keep) succeed on the
+    // first search and never reach this path.
     if (bodyText.includes(SAN_TEXT.VEHICLE_NOT_AVAILABLE)) {
-      console.log(`[Bot] ${vehicleNumber} → ${SAN_TEXT.VEHICLE_NOT_AVAILABLE} (SAN business-rule rejection)`);
-      await captureNotEligible(page, vehicleNumber, DRIVER_ERROR_COPY.VEHICLE_NOT_AVAILABLE);
-      return {
-        success:               false,
-        vehicleNotAvailable:   true, // signal for callers — short cooldown, not a creds problem
-        durationMs:            Date.now() - startTime,
-        error:                 DRIVER_ERROR_COPY.VEHICLE_NOT_AVAILABLE,
-        message:               DRIVER_ERROR_COPY.VEHICLE_NOT_AVAILABLE,
-      };
+      let recovered = false;
+      const { _norm } = require('./monitorService');
+      const stripped = _norm(vehicleNumber);
+      if (stripped && stripped !== String(vehicleNumber)) {
+        console.log(`[Bot] ${vehicleNumber} → not available as "${vehicleNumber}" — retrying as "${stripped}"…`);
+        await searchForVehicle(stripped);
+        recovered = await page
+          .waitForSelector(`button:has-text("${SAN_TEXT.ADD_TO_QUEUE_BUTTON}")`, { timeout: SEARCH_RETRY_TIMEOUT })
+          .then(() => true)
+          .catch(() => false);
+        if (recovered) console.log(`[Bot] ${vehicleNumber} → found as "${stripped}" — proceeding to add.`);
+      }
+
+      if (!recovered) {
+        console.log(`[Bot] ${vehicleNumber} → ${SAN_TEXT.VEHICLE_NOT_AVAILABLE} (SAN business-rule rejection)`);
+        await captureNotEligible(page, vehicleNumber, DRIVER_ERROR_COPY.VEHICLE_NOT_AVAILABLE);
+        return {
+          success:               false,
+          vehicleNotAvailable:   true, // signal for callers — short cooldown, not a creds problem
+          durationMs:            Date.now() - startTime,
+          error:                 DRIVER_ERROR_COPY.VEHICLE_NOT_AVAILABLE,
+          message:               DRIVER_ERROR_COPY.VEHICLE_NOT_AVAILABLE,
+        };
+      }
+      // recovered: fall through to STEP 7+ — the vehicle is now on screen under
+      // its stripped name with the Add-To-Queue button visible.
     }
 
     // ─── STEP 7: Already queued after search? ────────────────────────────────
@@ -745,7 +883,7 @@ async function addToQueue(sanUsername, sanPassword, vehicleNumber) {
       sanErrorText: sanErrorText,   // raw page-visible text; null if none found
     };
   } finally {
-    if (browser) await browser.close();
+    if (browser) await hardCloseBrowser(browser, `#${vehicleNumber}`);
   }
 }
 
@@ -1036,7 +1174,7 @@ async function removeFromQueue(sanUsername, sanPassword, vehicleNumber) {
   let page    = null;
 
   try {
-    browser = await chromium.launch({
+    browser = await launchReapableBrowser({
       headless: true,
       args: [
         '--no-sandbox',
@@ -1260,7 +1398,7 @@ async function removeFromQueue(sanUsername, sanPassword, vehicleNumber) {
       sanErrorText: sanErrorText,
     };
   } finally {
-    if (browser) await browser.close();
+    if (browser) await hardCloseBrowser(browser, `#${vehicleNumber}`);
   }
 }
 
@@ -1286,7 +1424,7 @@ async function warmSession({ sanUsername, sanPassword, vehicleNumber }) {
   let page    = null; // lifted from try-block so the catch can debugCapture
 
   try {
-    browser = await chromium.launch({
+    browser = await launchReapableBrowser({
       headless: true,
       args: [
         '--no-sandbox',
@@ -1395,7 +1533,7 @@ async function warmSession({ sanUsername, sanPassword, vehicleNumber }) {
       sanErrorText: sanErrorText,
     };
   } finally {
-    if (browser) await browser.close();
+    if (browser) await hardCloseBrowser(browser, `#${vehicleNumber}`);
   }
 }
 
@@ -1792,7 +1930,7 @@ async function ensureArmedBrowser(slot) {
   if (armedBrowsers[slot]?.isConnected()) return armedBrowsers[slot];
   if (armedBrowserLaunching[slot]) return armedBrowserLaunching[slot];
 
-  armedBrowserLaunching[slot] = chromium.launch({
+  armedBrowserLaunching[slot] = launchReapableBrowser({
     headless: true,
     args: [
       '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
@@ -1806,6 +1944,13 @@ async function ensureArmedBrowser(slot) {
     ],
   }).then((browser) => {
     browser.on('disconnected', () => {
+      // A disconnect (crash or pipe-break) can strand the renderer/gpu/zygote
+      // tree on PID 1 — reap the group so it can't accrue toward the fork
+      // ceiling. Safe no-op (ESRCH) when the tree is already gone.
+      try {
+        const dpid = browserLaunchPid.get(browser);
+        if (dpid && dpid > 1) process.kill(-dpid, 'SIGKILL');
+      } catch { /* already reaped */ }
       if (armedBrowsers[slot] !== browser) return;
       armedBrowsers[slot] = null;
       const lost = [...armedSessions.values()].filter((s) => s.browserSlot === slot);
@@ -1861,7 +2006,7 @@ async function closeArmedBrowserIfIdle() {
     const b = armedBrowsers[slot];
     if (!b) continue;
     armedBrowsers[slot] = null;
-    closing.push(b.close().catch(() => {}));
+    closing.push(hardCloseBrowser(b, `pool[${slot}]`));
   }
   if (closing.length > 0) {
     await Promise.all(closing);
@@ -2676,6 +2821,8 @@ module.exports = {
   warmSession,
   verifyCredentials,
   sanitizeError,
+  hardCloseBrowser,
+  launchReapableBrowser,
   sessionStore,
   // Exposed for the warmer service and tests.
   saveSession,

@@ -16,6 +16,14 @@ function formatRelTime(iso) {
   return `${m}m ago`;
 }
 
+// ─── Absolute short date (used by the "Created" column) ──────────────────────
+function formatDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
 // ─── Pagination state ────────────────────────────────────────────────────────
 let driversPage   = 1;
 const DRIVERS_PER = 25;
@@ -43,17 +51,23 @@ async function loadDrivers(page) {
   const offset = (driversPage - 1) * DRIVERS_PER;
   const search = document.getElementById('driver-search').value;
   const status = document.getElementById('driver-status-filter')?.value || '';
+  // Sort filter → sort/dir query params. '' = default (schedule/name);
+  // 'created_desc' = newest first; 'created_asc' = oldest first.
+  const sortSel = document.getElementById('driver-sort-filter')?.value || '';
+  const sortParams = sortSel === 'created_desc' ? '&sort=created_at&dir=desc'
+                   : sortSel === 'created_asc'  ? '&sort=created_at&dir=asc'
+                   : '';
   const tbody  = document.getElementById('drivers-table-body');
 
-  tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted2);padding:24px;"><span class="spinner"></span></td></tr>';
+  tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted2);padding:24px;"><span class="spinner"></span></td></tr>';
   document.getElementById('drivers-pagination').style.display = 'none';
 
   try {
-    const data = await api(`/api/admin/drivers?limit=${DRIVERS_PER}&offset=${offset}&search=${encodeURIComponent(search)}&status=${encodeURIComponent(status)}`);
+    const data = await api(`/api/admin/drivers?limit=${DRIVERS_PER}&offset=${offset}&search=${encodeURIComponent(search)}&status=${encodeURIComponent(status)}${sortParams}`);
     if (!data) return; // 401 already handled by api()
 
     if (!data.drivers.length) {
-      tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted2);padding:32px;">No drivers found</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted2);padding:32px;">No drivers found</td></tr>';
       setDriversPagination(0);
       return;
     }
@@ -115,6 +129,7 @@ async function loadDrivers(page) {
             <div style="font-size:11px;color:var(--muted2);margin-top:3px;">${d.last_run ? formatRelTime(d.last_run) : ''}</div>
           </td>
           <td>${activeBadge}${payBadge}</td>
+          <td style="font-size:12px;color:var(--muted2);white-space:nowrap;" title="${esc(d.created_at || '')}">${d.created_at ? esc(formatDate(d.created_at)) : '—'}</td>
           <td>
             <div style="display:flex;gap:6px;flex-wrap:wrap;">
               <button class="btn btn-trigger btn-sm" data-action="trigger"    data-id="${Number(d.id)}" data-name="${esc(d.name)}">▶ Run</button>
@@ -132,7 +147,7 @@ async function loadDrivers(page) {
 
     setDriversPagination(data.total);
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="8" style="color:var(--red);text-align:center;padding:24px;">${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" style="color:var(--red);text-align:center;padding:24px;">${err.message}</td></tr>`;
   }
 }
 
@@ -631,6 +646,9 @@ document.getElementById('driver-search').addEventListener('input', () => {
 
 // Status filter (server-side, cross-page) — reload from page 1 on change
 document.getElementById('driver-status-filter')?.addEventListener('change', () => loadDrivers(1));
+
+// Sort filter (server-side, cross-page) — reload from page 1 on change
+document.getElementById('driver-sort-filter')?.addEventListener('change', () => loadDrivers(1));
 
 // Static buttons
 document.getElementById('btn-add-driver').addEventListener('click', openAddDriverModal);

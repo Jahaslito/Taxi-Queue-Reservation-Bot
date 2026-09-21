@@ -204,7 +204,7 @@ async function loginAdmin(req, res, next) {
 
     const token = generateToken(admin.id, 'admin', '7d');
     res.cookie('token', token, { ...COOKIE_OPTS, maxAge: 7 * 24 * 60 * 60 * 1000 });
-    res.json({ admin: { id: admin.id, username: admin.username } });
+    res.json({ admin: { id: admin.id, username: admin.username, role: admin.role || 'super_admin' } });
   } catch (err) {
     next(err);
   }

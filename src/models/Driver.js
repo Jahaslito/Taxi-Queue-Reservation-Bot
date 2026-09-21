@@ -34,6 +34,35 @@ const PUBLIC_FIELDS = [
   'sms_opt_in',
 ];
 
+// Shared WHERE-clause for the admin driver search and its matching count, so the
+// two can never drift (a mismatch would corrupt pagination totals). Matches
+// name, email, vehicle, SAN username and phone. Phone additionally matches on a
+// digits-only basis, so a search for "8582013255" finds a driver whose number is
+// stored formatted as "(858) 201-3255" and vice-versa. Assumes the `drivers as d`
+// alias used by both queries below.
+function applyDriverSearchFilters(q, { search, activeOnly = false, status } = {}) {
+  if (search) {
+    const digits = String(search).replace(/\D/g, '');
+    q.where((builder) => {
+      builder
+        .whereILike('d.name',           `%${search}%`)
+        .orWhereILike('d.email',          `%${search}%`)
+        .orWhereILike('d.vehicle_number', `%${search}%`)
+        .orWhereILike('d.san_username',   `%${search}%`)
+        .orWhereILike('d.phone',          `%${search}%`);
+      if (digits) {
+        builder.orWhereRaw(
+          "regexp_replace(COALESCE(d.phone, ''), '[^0-9]', '', 'g') LIKE ?",
+          [`%${digits}%`],
+        );
+      }
+    });
+  }
+  // status: 'active' | 'inactive' filters on is_active; activeOnly kept for back-compat.
+  if (status === 'active' || activeOnly) q.where('d.is_active', true);
+  else if (status === 'inactive')        q.where('d.is_active', false);
+}
+
 class Driver {
   /** Single driver by ID — public fields only */
   static findById(id) {
@@ -123,7 +152,7 @@ class Driver {
    * Full-text search across drivers with their latest log status joined.
    * Used by the admin drivers list endpoint.
    */
-  static search({ search, activeOnly = false, status, limit = 25, offset = 0 } = {}) {
+  static search({ search, activeOnly = false, status, sort, dir, limit = 25, offset = 0 } = {}) {
     const latestLogSubquery = db('logs')
       .select('id')
       .whereRaw('driver_id = d.id')
@@ -133,7 +162,7 @@ class Driver {
       .orderBy('triggered_at', 'desc')
       .limit(1);
 
-    return db('drivers as d')
+    const query = db('drivers as d')
       .select(
         'd.id', 'd.name', 'd.phone', 'd.email', 'd.san_username',
         'd.vehicle_number', 'd.scheduled_time', 'd.scheduled_days', 'd.day_schedules',
@@ -145,42 +174,25 @@ class Driver {
         'l.triggered_at   as last_run',
       )
       .leftJoin('logs as l', 'l.id', latestLogSubquery)
-      .modify((q) => {
-        if (search) {
-          q.where((builder) => {
-            builder
-              .whereILike('d.name',           `%${search}%`)
-              .orWhereILike('d.email',          `%${search}%`)
-              .orWhereILike('d.vehicle_number', `%${search}%`)
-              .orWhereILike('d.san_username',   `%${search}%`);
-          });
-        }
-        // status: 'active' | 'inactive' filters on is_active; activeOnly kept for back-compat.
-        if (status === 'active'   || activeOnly) q.where('d.is_active', true);
-        else if (status === 'inactive')          q.where('d.is_active', false);
-      })
-      .orderBy('d.scheduled_time', 'asc')
-      .orderBy('d.name',           'asc')
-      .limit(limit)
-      .offset(offset);
+      .modify((q) => applyDriverSearchFilters(q, { search, activeOnly, status }));
+
+    // Sorting. Only 'created_at' is exposed as an alternate order (the admin's
+    // "newest/oldest" filter); the column is whitelisted here so it can't be
+    // injected. Anything else falls back to the schedule-then-name default.
+    if (sort === 'created_at') {
+      const direction = dir === 'asc' ? 'asc' : 'desc';
+      query.orderBy('d.created_at', direction).orderBy('d.id', direction); // id tie-breaker → stable paging
+    } else {
+      query.orderBy('d.scheduled_time', 'asc').orderBy('d.name', 'asc');
+    }
+
+    return query.limit(limit).offset(offset);
   }
 
   /** Count matching drivers — mirrors the filters from search() for pagination totals */
   static searchCount({ search, activeOnly = false, status } = {}) {
     return db('drivers as d')
-      .modify((q) => {
-        if (search) {
-          q.where((builder) => {
-            builder
-              .whereILike('d.name',           `%${search}%`)
-              .orWhereILike('d.email',          `%${search}%`)
-              .orWhereILike('d.vehicle_number', `%${search}%`)
-              .orWhereILike('d.san_username',   `%${search}%`);
-          });
-        }
-        if (status === 'active'   || activeOnly) q.where('d.is_active', true);
-        else if (status === 'inactive')          q.where('d.is_active', false);
-      })
+      .modify((q) => applyDriverSearchFilters(q, { search, activeOnly, status }))
       .count('* as count')
       .first();
   }

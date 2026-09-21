@@ -1,17 +1,71 @@
 const { Router } = require('express');
 const { body, param, query } = require('express-validator');
+const multer = require('multer');
+const crypto = require('crypto');
+const path   = require('path');
 
-const { authenticateAdmin }                          = require('../middleware/auth');
+const { authenticateAdmin, restrictInsuranceRole }   = require('../middleware/auth');
 const { triggerLimiter, apiLimiter, broadcastLimiter } = require('../middleware/rateLimiter');
 const validate               = require('../middleware/validate');
 const adminController        = require('../controllers/adminController');
 const sosController          = require('../controllers/sosController');
 const adminMessagesController = require('../controllers/adminMessagesController');
+const insuranceController    = require('../controllers/insuranceController');
+const InsuranceDocument      = require('../models/InsuranceDocument');
+
+// ─── Insurance document uploads (multipart → disk, metadata in DB) ─────────────
+// Bytes land in InsuranceDocument.UPLOAD_DIR under a random, app-generated name
+// (the original name is never used to build a path). Only insurance-relevant
+// types are accepted; 20 MB / 20 files per request.
+const ALLOWED_UPLOAD_MIME = new Set([
+  'application/pdf',
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/heic', 'image/heif',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'text/csv', 'text/plain',
+]);
+const insuranceUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, InsuranceDocument.UPLOAD_DIR),
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname || '').slice(0, 12).replace(/[^.\w]/g, '');
+      cb(null, `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`);
+    },
+  }),
+  limits: { fileSize: 20 * 1024 * 1024, files: 20 },
+  fileFilter: (_req, file, cb) => {
+    if (ALLOWED_UPLOAD_MIME.has(file.mimetype)) return cb(null, true);
+    const err = new Error(`Unsupported file type: ${file.mimetype}`);
+    err.statusCode = 400;
+    cb(err);
+  },
+}).array('files', 20);
+
+// Run multer and normalise its errors (size/count/type) to clean 400s.
+function handleInsuranceUpload(req, res, next) {
+  insuranceUpload(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE')  err.message = 'A file exceeds the 20 MB limit';
+    if (err.code === 'LIMIT_FILE_COUNT') err.message = 'Too many files (max 20 per upload)';
+    if (!err.statusCode) err.statusCode = 400;
+    next(err);
+  });
+}
 
 const router = Router();
 
 router.use(apiLimiter);
 router.use(authenticateAdmin);
+router.use(restrictInsuranceRole);   // 'insurance' role is confined to /insurance/* (+ /me)
+
+// ─── Session / identity ───────────────────────────────────────────────────────
+// Role-aware session probe used by the admin SPA on boot. Available to every
+// authenticated admin (both roles) so the client can decide what to render.
+router.get('/me', (req, res) => {
+  res.json({ id: req.adminId, username: req.admin?.username, role: req.adminRole });
+});
 
 // ─── SOS ──────────────────────────────────────────────────────────────────────
 router.get( '/sos',                       sosController.adminList);
@@ -267,6 +321,66 @@ router.get(
   ],
   validate,
   adminController.getLogs,
+);
+
+// ─── Insurance module (Phase 1 — reporting) ────────────────────────────────────
+// All read-only except the audited DL reveals. DL numbers are masked in every
+// list response; a reveal writes an insurance_access_log row.
+const pageQuery = [
+  query('limit').optional().isInt({ min: 1, max: 200 }).toInt(),
+  query('offset').optional().isInt({ min: 0 }).toInt(),
+  query('search').optional().trim().isLength({ max: 100 }),
+];
+
+router.get('/insurance/overview', insuranceController.getOverview);
+
+router.get(
+  '/insurance/vehicles',
+  [
+    ...pageQuery,
+    query('company').optional().trim().isLength({ max: 120 }),
+    query('make').optional().trim().isLength({ max: 60 }),
+    query('status').optional({ checkFalsy: true }).isIn(['on', 'off']).withMessage('status must be "on" or "off"'),
+  ],
+  validate,
+  insuranceController.listVehicles,
+);
+
+router.get(
+  '/insurance/drivers',
+  [
+    ...pageQuery,
+    query('needsMedical').optional().isBoolean(),
+    query('noDriver').optional().isBoolean(),
+    query('missingDob').optional().isBoolean(),
+  ],
+  validate,
+  insuranceController.listDrivers,
+);
+
+router.get('/insurance/claims', [...pageQuery], validate, insuranceController.listClaims);
+router.get('/insurance/endorsements', [...pageQuery], validate, insuranceController.listEndorsements);
+router.get('/insurance/reconciliation', insuranceController.getReconciliation);
+
+// Documents — upload (single/multiple/bulk), list, download, preview, delete.
+router.get('/insurance/documents', [...pageQuery], validate, insuranceController.listDocuments);
+router.post('/insurance/documents', handleInsuranceUpload, insuranceController.uploadDocuments);
+router.get('/insurance/documents/:id/download', [idParam], validate, insuranceController.downloadDocument);
+router.get('/insurance/documents/:id/preview',  [idParam], validate, insuranceController.previewDocument);
+router.delete('/insurance/documents/:id', [idParam], validate, insuranceController.deleteDocument);
+
+// Audited full-DL reveal (POST — an explicit action, not a passive read).
+router.post(
+  '/insurance/drivers/:id/reveal-dl',
+  [idParam],
+  validate,
+  insuranceController.revealDriverDl,
+);
+router.post(
+  '/insurance/endorsements/:id/reveal-dl',
+  [idParam],
+  validate,
+  insuranceController.revealEndorsementDl,
 );
 
 module.exports = router;

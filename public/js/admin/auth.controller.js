@@ -22,7 +22,9 @@ document.getElementById('btn-admin-login').addEventListener('click', async () =>
     document.getElementById('admin-name').textContent   = esc(data.admin.username);
     document.getElementById('admin-avatar').textContent = esc(data.admin.username[0].toUpperCase());
     document.getElementById('sidebar').style.display    = 'flex';
-    showPage('page-overview');
+    document.body.classList.add('nav-ready');    // reveal the mobile top bar once authed
+    applyAdminRole(data.admin.role);             // insurance role → Insurance section only
+    showPage(data.admin.role === 'insurance' ? 'page-insurance' : 'page-overview');
   } catch (err) {
     errEl.textContent = err.message;
   } finally {

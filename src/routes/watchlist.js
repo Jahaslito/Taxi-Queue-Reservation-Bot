@@ -3,7 +3,7 @@
 const { Router } = require('express');
 const { param }  = require('express-validator');
 
-const { authenticateAdmin } = require('../middleware/auth');
+const { authenticateAdmin, restrictInsuranceRole } = require('../middleware/auth');
 const { apiLimiter }        = require('../middleware/rateLimiter');
 const validate              = require('../middleware/validate');
 const ctrl                  = require('../controllers/watchlistController');
@@ -12,6 +12,7 @@ const router = Router();
 
 router.use(apiLimiter);
 router.use(authenticateAdmin);
+router.use(restrictInsuranceRole);   // insurance role has no watchlist access
 
 // SSE live stream (lightweight init + state-change events)
 router.get('/stream', ctrl.getStream);

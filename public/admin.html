@@ -50,6 +50,7 @@
       display: flex; flex-direction: column;
       padding: 24px 0;
       position: sticky; top: 0; height: 100vh;
+      transition: width 0.2s ease;
     }
     .sidebar-logo {
       padding: 0 20px 28px;
@@ -387,9 +388,9 @@
     /* ── Mobile top bar ── */
     .mobile-topbar {
       display: none;
-      position: sticky; top: 0; z-index: 100;
+      position: sticky; top: 0; z-index: 250;   /* above the drawer + overlay so the hamburger always toggles */
       background: var(--bg2); border-bottom: 1px solid var(--border);
-      padding: 14px 20px;
+      height: 56px; padding: 0 16px;
       align-items: center; justify-content: space-between;
       flex-shrink: 0;
     }
@@ -404,24 +405,78 @@
     }
     .hamburger-btn:hover { background: rgba(255,255,255,0.06); }
 
+    /* In-drawer close button — shown only inside the mobile slide-out drawer. */
+    .sidebar-close {
+      display: none; position: absolute; top: 12px; right: 12px;
+      background: none; border: none; color: var(--muted2);
+      font-size: 20px; line-height: 1; cursor: pointer;
+      padding: 6px 8px; border-radius: 8px; min-width: 40px; min-height: 40px;
+    }
+    .sidebar-close:hover { background: rgba(255,255,255,0.06); color: var(--white); }
+
+    /* Desktop collapse handle — a round arrow on the sidebar's edge. Hidden on
+       mobile (the hamburger is used there). Arrow points IN (◀) when the nav is
+       open, OUT (▶) when collapsed. Its `left` tracks the sidebar's width. */
+    .sidebar-toggle {
+      display: none;
+      position: fixed; top: 50%; left: 220px; margin-left: -14px;
+      transform: translateY(-50%); z-index: 210;
+      width: 28px; height: 28px; border-radius: 50%;
+      align-items: center; justify-content: center;
+      background: var(--bg3); border: 1px solid var(--border); color: var(--muted2);
+      font-size: 12px; line-height: 1; cursor: pointer;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.35);
+      transition: left 0.2s ease, background 0.15s, color 0.15s;
+    }
+    .sidebar-toggle:hover { background: var(--bg2); color: var(--white); }
+
+    /* Insurance-only role: hide every nav group except Insurance. The server
+       still enforces access (this is just to match the UI to the permissions). */
+    body.role-insurance .nav-group { display: none; }
+    body.role-insurance #nav-group-insurance { display: block; }
+
     /* ── Sidebar overlay (mobile drawer backdrop) ── */
     .sidebar-overlay {
       display: none; position: fixed; inset: 0;
       background: rgba(0,0,0,0.65); z-index: 150;
       backdrop-filter: blur(2px);
     }
-    .sidebar-overlay.open { display: block; }
+    /* The .open reveal is scoped to the drawer breakpoint (below) so the backdrop
+       can never show on desktop, even if the state lingers across a resize. */
 
     /* ── 1100px — stats collapse ── */
     @media (max-width: 1100px) {
       .stats-grid { grid-template-columns: repeat(2, 1fr); }
     }
 
-    /* ── 768px — icon-only sidebar ── */
+    /* ── ≥769px (desktop) — persistent sidebar with an arrow collapse handle ── */
+    @media (min-width: 769px) {
+      body.nav-ready .sidebar-toggle { display: flex; }
+      body.nav-collapsed .sidebar { width: 0; overflow: hidden; border-right: none; }
+      body.nav-collapsed .sidebar-toggle { left: 0; margin-left: 8px; }
+    }
+
+    /* ── ≤768px — sidebar collapses to a hamburger-toggled slide-out drawer ── */
     @media (max-width: 768px) {
-      .sidebar { width: 60px; transition: width 0.25s; }
-      .sidebar .nav-link span:not(.icon) { display: none; }
-      .sidebar-logo .title, .sidebar-logo .sub, .nav-group-label, .admin-info { display: none; }
+      body { flex-direction: column; }
+      body.nav-ready .mobile-topbar { display: flex; }
+
+      /* Sidebar becomes a fixed drawer that slides in from the left, sitting
+         below the 56px top bar so the hamburger stays visible and clickable. */
+      .sidebar {
+        position: fixed; top: 56px; left: 0; bottom: 0;
+        width: 240px; max-width: 82vw; z-index: 200;
+        transform: translateX(-100%);
+        transition: transform 0.25s ease;
+        padding-top: 12px;
+      }
+      .sidebar.open { transform: translateX(0); box-shadow: 0 0 40px rgba(0,0,0,0.5); }
+      .sidebar-logo { display: none; }        /* brand already shown in the top bar */
+      .sidebar-close { display: block; }
+      .sidebar-overlay { top: 56px; }         /* backdrop starts below the top bar */
+      .sidebar-overlay.open { display: block; }
+
+      .main { width: 100%; overflow-x: hidden; }
       .page { padding: 20px 16px; }
       .stats-grid { grid-template-columns: 1fr 1fr; }
       .form-row { grid-template-columns: 1fr; }
@@ -430,29 +485,8 @@
       table { min-width: 540px; }
     }
 
-    /* ── 480px — mobile drawer + full-width layout ── */
+    /* ── ≤480px — phone refinements (the drawer itself comes from ≤768 above) ── */
     @media (max-width: 480px) {
-      body { flex-direction: column; }
-
-      .mobile-topbar { display: flex; }
-
-      /* Sidebar becomes a fixed slide-out drawer */
-      .sidebar {
-        position: fixed;
-        top: 0; left: 0; bottom: 0;
-        width: 220px;
-        z-index: 200;
-        transform: translateX(-100%);
-        transition: transform 0.25s ease;
-      }
-      .sidebar.open { transform: translateX(0); }
-
-      /* Restore full sidebar text inside the drawer */
-      .sidebar .nav-link span:not(.icon) { display: inline; }
-      .sidebar-logo .title, .sidebar-logo .sub,
-      .nav-group-label, .admin-info { display: block; }
-
-      .main { width: 100%; overflow-x: hidden; }
       .page { padding: 16px 14px; }
 
       .page-header { margin-bottom: 18px; }
@@ -484,7 +518,7 @@
 <!-- ══════════════════════════ MOBILE TOP BAR ══════════════════════════ -->
 <div class="mobile-topbar" id="mobile-topbar">
   <div class="mobile-title">SAN <span>Queue</span></div>
-  <button class="hamburger-btn" id="hamburger-btn" aria-label="Open menu">☰</button>
+  <button class="hamburger-btn" id="hamburger-btn" aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">☰</button>
 </div>
 
 <!-- Sidebar backdrop (mobile only) -->
@@ -492,6 +526,7 @@
 
 <!-- ══════════════════════════ SIDEBAR ══════════════════════════ -->
 <aside class="sidebar" id="sidebar" style="display:none;">
+  <button class="sidebar-close" id="sidebar-close" aria-label="Close menu" title="Close menu">✕</button>
   <div class="sidebar-logo">
     <div class="title">SAN <span>Queue</span></div>
     <div class="sub">Admin Panel</div>
@@ -537,6 +572,12 @@
       <span id="early-join-badge" style="display:none;margin-left:auto;min-width:18px;height:18px;border-radius:9px;background:var(--red);color:#fff;font-size:10px;font-weight:700;display:none;align-items:center;justify-content:center;padding:0 4px;"></span>
     </button>
   </div>
+  <div class="nav-group" id="nav-group-insurance">
+    <div class="nav-group-label">Insurance</div>
+    <button class="nav-link" data-page="page-insurance">
+      <span class="icon">🛡️</span><span>Insurance</span>
+    </button>
+  </div>
 
   <div class="sidebar-footer">
     <div class="admin-badge">
@@ -549,6 +590,9 @@
     <button class="btn-logout" id="btn-logout">Sign Out</button>
   </div>
 </aside>
+
+<!-- Desktop-only collapse handle for the sidebar (mobile uses the hamburger) -->
+<button class="sidebar-toggle" id="sidebar-toggle" aria-label="Collapse sidebar" aria-expanded="true" title="Collapse sidebar">◀</button>
 
 <!-- ══════════════════════════ MAIN ══════════════════════════ -->
 <main class="main" id="main-area">
@@ -652,11 +696,16 @@
     </div>
 
     <div class="filter-bar">
-      <input class="search-input" id="driver-search" placeholder="Search by name, vehicle, username…" />
+      <input class="search-input" id="driver-search" placeholder="Search by name, phone, vehicle, username…" />
       <select class="search-input" id="driver-status-filter" style="max-width:170px;">
         <option value="">All statuses</option>
         <option value="active">Active only</option>
         <option value="inactive">Inactive only</option>
+      </select>
+      <select class="search-input" id="driver-sort-filter" style="max-width:190px;" title="Sort the drivers list">
+        <option value="">Sort: Schedule</option>
+        <option value="created_desc">Newest first</option>
+        <option value="created_asc">Oldest first</option>
       </select>
       <button class="btn btn-primary" id="btn-add-driver" style="margin-left:auto;">+ Add Driver</button>
     </div>
@@ -671,10 +720,11 @@
           <th>Active Days</th>
           <th>Last Run</th>
           <th>Status</th>
+          <th>Created</th>
           <th>Actions</th>
         </tr></thead>
         <tbody id="drivers-table-body">
-          <tr><td colspan="8" style="text-align:center;color:var(--muted2);padding:24px;">Loading…</td></tr>
+          <tr><td colspan="9" style="text-align:center;color:var(--muted2);padding:24px;">Loading…</td></tr>
         </tbody>
       </table>
     </div>
@@ -1250,6 +1300,195 @@
     </div>
   </div>
 
+  <!-- ══════════════════════════ INSURANCE PAGE ══════════════════════════ -->
+  <div class="page" id="page-insurance">
+    <style>
+      #page-insurance .ins-tabs { display:flex; gap:4px; flex-wrap:wrap; border-bottom:1px solid var(--border,rgba(255,255,255,0.08)); margin-bottom:20px; }
+      #page-insurance .ins-tab { background:none; border:none; border-bottom:2px solid transparent; color:var(--muted2); font-size:14px; font-weight:600; padding:10px 16px; cursor:pointer; }
+      #page-insurance .ins-tab:hover { color:var(--white); }
+      #page-insurance .ins-tab.active { color:var(--teal); border-bottom-color:var(--teal); }
+      #page-insurance .ins-panel { display:none; }
+      #page-insurance .ins-panel.active { display:block; }
+      #page-insurance .policy-card { background:rgba(0,209,178,0.05); border:1px solid rgba(0,209,178,0.18); border-radius:12px; padding:18px 22px; margin-bottom:20px; display:flex; flex-wrap:wrap; gap:28px; align-items:center; }
+      #page-insurance .policy-card .pc-item .l { font-size:11px; text-transform:uppercase; letter-spacing:0.4px; color:var(--muted2); }
+      #page-insurance .policy-card .pc-item .v { font-size:16px; font-weight:700; margin-top:2px; }
+      #page-insurance .comp-wrap { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px; }
+      @media (max-width:768px){ #page-insurance .comp-wrap { grid-template-columns:1fr; } }
+      #page-insurance .ins-dropzone { border:2px dashed rgba(0,209,178,0.35); border-radius:12px; padding:28px 20px; text-align:center; transition:background .15s,border-color .15s; }
+      #page-insurance .ins-dropzone.dragover { border-color:var(--teal); background:rgba(0,209,178,0.06); }
+      #page-insurance .ins-dropzone .dz-icon { font-size:28px; }
+      #page-insurance .ins-dropzone .dz-main { font-size:15px; font-weight:600; margin-top:6px; }
+      #page-insurance .ins-dropzone .dz-browse { color:var(--teal); text-decoration:underline; cursor:pointer; }
+      #page-insurance .ins-dropzone .dz-sub { font-size:12px; color:var(--muted2); margin-top:4px; }
+      #page-insurance .ins-dropzone .dz-chosen { font-size:13px; color:var(--white); margin-top:10px; }
+      /* Per-file cab-number list shown after files are chosen */
+      #page-insurance .ins-upload-list { margin:12px auto 0; max-width:540px; text-align:left; }
+      #page-insurance .ins-upload-hint { font-size:12px; color:var(--muted2); margin-bottom:8px; }
+      #page-insurance .ins-upload-row { display:flex; align-items:center; gap:10px; padding:6px 0; border-top:1px solid var(--border,rgba(255,255,255,0.06)); }
+      #page-insurance .ins-upload-row:first-of-type { border-top:none; }
+      #page-insurance .ins-upload-file { flex:1; min-width:0; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      #page-insurance .ins-cab-input { max-width:140px; flex-shrink:0; }
+      #page-insurance .ins-cab-input.err { border-color:var(--red); box-shadow:0 0 0 1px var(--red); }
+      /* Upload stays clickable while greyed so a click can explain the missing cab # */
+      #page-insurance #ins-upload-btn.is-inactive { opacity:0.5; cursor:not-allowed; }
+      #page-insurance .doc-actions { display:flex; gap:6px; justify-content:flex-end; flex-wrap:wrap; }
+    </style>
+
+    <div class="page-header" style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;">
+      <div>
+        <h1>🛡️ Insurance</h1>
+        <p>Fleet insurance roster — policy, vehicles, drivers, claims &amp; endorsements</p>
+      </div>
+      <button class="btn btn-ghost btn-sm" id="btn-refresh-insurance">↺ Refresh</button>
+    </div>
+
+    <div class="ins-tabs" id="ins-tabs">
+      <button class="ins-tab active" data-tab="overview">Overview</button>
+      <button class="ins-tab" data-tab="vehicles">Vehicles</button>
+      <button class="ins-tab" data-tab="drivers">Drivers</button>
+      <button class="ins-tab" data-tab="claims">Claims</button>
+      <button class="ins-tab" data-tab="endorsements">Endorsements</button>
+      <button class="ins-tab" data-tab="reconciliation">Reconciliation</button>
+      <button class="ins-tab" data-tab="documents">Documents</button>
+    </div>
+
+    <!-- ── Overview ── -->
+    <div class="ins-panel active" id="ins-panel-overview">
+      <div class="policy-card" id="ins-policy-card">
+        <div class="pc-item"><div class="l">Loading policy…</div></div>
+      </div>
+      <div class="stats-grid">
+        <div class="stat-card teal"  data-icon="🚕"><div class="stat-label">Vehicles on Policy</div><div class="stat-value" id="ins-stat-vehicles">—</div><div class="stat-sub" id="ins-stat-premium">— / yr</div></div>
+        <div class="stat-card green" data-icon="🧑"><div class="stat-label">Insured Drivers</div><div class="stat-value" id="ins-stat-drivers">—</div><div class="stat-sub" id="ins-stat-companies">across companies</div></div>
+        <div class="stat-card amber" data-icon="⚕️"><div class="stat-label">Compliance Flags</div><div class="stat-value" id="ins-stat-flags">—</div><div class="stat-sub" id="ins-stat-flags-sub">needs-medical / no-driver</div></div>
+        <div class="stat-card red"   data-icon="💥"><div class="stat-label">Claims on File</div><div class="stat-value" id="ins-stat-claims">—</div><div class="stat-sub">accident / loss records</div></div>
+      </div>
+
+      <div class="comp-wrap">
+        <div class="table-wrap">
+          <div class="table-header"><h3>Cumulative Fleet Growth</h3></div>
+          <div id="ins-growth-chart" style="padding:16px 20px;min-height:160px;">—</div>
+        </div>
+        <div class="table-wrap">
+          <div class="table-header"><h3>Fleet by Make</h3></div>
+          <div id="ins-make-list" style="padding:8px 20px 16px;">—</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Vehicles ── -->
+    <div class="ins-panel" id="ins-panel-vehicles">
+      <div class="filter-bar">
+        <input class="search-input" id="ins-veh-search" placeholder="Search cab #, company, VIN, make, model…" />
+        <select class="search-input" id="ins-veh-status" style="max-width:170px;">
+          <option value="">All vehicles</option>
+          <option value="on">On policy</option>
+          <option value="off">Off policy</option>
+        </select>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Cab #</th><th>Company</th><th>Vehicle</th><th>VIN</th><th>On Policy</th><th>Status</th><th>App Driver</th></tr></thead>
+          <tbody id="ins-veh-body"><tr><td colspan="7" style="text-align:center;color:var(--muted2);padding:24px;">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="pager" id="ins-veh-pager" data-scope="veh"></div>
+    </div>
+
+    <!-- ── Drivers ── -->
+    <div class="ins-panel" id="ins-panel-drivers">
+      <div class="filter-bar">
+        <input class="search-input" id="ins-drv-search" placeholder="Search name, cab #, company…" />
+        <select class="search-input" id="ins-drv-flag" style="max-width:200px;">
+          <option value="">All drivers</option>
+          <option value="needsMedical">Needs medical</option>
+          <option value="noDriver">No driver assigned</option>
+          <option value="missingDob">Missing DOB</option>
+        </select>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Cab #</th><th>Name</th><th>Company</th><th>DL #</th><th>DOB / Age</th><th>Flags</th><th>Claims</th></tr></thead>
+          <tbody id="ins-drv-body"><tr><td colspan="7" style="text-align:center;color:var(--muted2);padding:24px;">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="pager" id="ins-drv-pager" data-scope="drv"></div>
+    </div>
+
+    <!-- ── Claims ── -->
+    <div class="ins-panel" id="ins-panel-claims">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Date of Loss</th><th>Cab #</th><th>Driver</th><th>Claim #</th><th>Description</th></tr></thead>
+          <tbody id="ins-clm-body"><tr><td colspan="5" style="text-align:center;color:var(--muted2);padding:24px;">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="pager" id="ins-clm-pager" data-scope="clm"></div>
+    </div>
+
+    <!-- ── Endorsements ── -->
+    <div class="ins-panel" id="ins-panel-endorsements">
+      <div class="filter-bar">
+        <input class="search-input" id="ins-end-search" placeholder="Search cab #, name, endorsement…" />
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Cab #</th><th>Name</th><th>Company</th><th>DL #</th><th>Endorsement</th></tr></thead>
+          <tbody id="ins-end-body"><tr><td colspan="5" style="text-align:center;color:var(--muted2);padding:24px;">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="pager" id="ins-end-pager" data-scope="end"></div>
+    </div>
+
+    <!-- ── Reconciliation ── -->
+    <div class="ins-panel" id="ins-panel-reconciliation">
+      <p style="color:var(--muted2);font-size:13px;margin-bottom:16px;">Cross-check the insurance roster against active SanQueue app drivers (matched on cab # ↔ vehicle number).</p>
+      <div class="table-wrap" style="margin-bottom:20px;">
+        <div class="table-header"><h3>💡 On policy, not app subscribers <span id="ins-rec-upsell-count" style="color:var(--muted2);font-weight:400;"></span></h3></div>
+        <table>
+          <thead><tr><th>Cab #</th><th>Company</th><th>Vehicle</th><th>VIN</th></tr></thead>
+          <tbody id="ins-rec-upsell-body"><tr><td colspan="4" style="text-align:center;color:var(--muted2);padding:24px;">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="table-wrap">
+        <div class="table-header"><h3>⚠️ Active app drivers NOT on the policy <span id="ins-rec-gap-count" style="color:var(--muted2);font-weight:400;"></span></h3></div>
+        <table>
+          <thead><tr><th>Vehicle #</th><th>Name</th><th>Email</th></tr></thead>
+          <tbody id="ins-rec-gap-body"><tr><td colspan="3" style="text-align:center;color:var(--muted2);padding:24px;">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ── Documents (upload / list / download / preview / delete) ── -->
+    <div class="ins-panel" id="ins-panel-documents">
+      <div class="ins-dropzone" id="ins-dropzone">
+        <input type="file" id="ins-file-input" multiple
+               accept=".pdf,.png,.jpg,.jpeg,.gif,.webp,.heic,.heif,.doc,.docx,.xls,.xlsx,.csv,.txt" style="display:none;" />
+        <div class="dz-icon">⬆️</div>
+        <div class="dz-main">Drop insurance files here, or <span class="dz-browse">browse</span></div>
+        <div class="dz-sub">Single, multiple, or bulk — PDF, images, Word, Excel, CSV, TXT · up to 20 files · 20&nbsp;MB each</div>
+        <div id="ins-file-chosen" class="dz-chosen"></div>
+        <div style="display:flex;gap:10px;align-items:center;justify-content:center;flex-wrap:wrap;margin-top:12px;">
+          <input class="search-input" id="ins-doc-desc" placeholder="Optional label for this upload…" style="max-width:280px;" />
+          <button class="btn btn-primary btn-sm is-inactive" id="ins-upload-btn">Upload</button>
+        </div>
+        <div id="ins-upload-status" style="margin-top:10px;font-size:13px;"></div>
+      </div>
+
+      <div class="filter-bar" style="margin-top:20px;">
+        <input class="search-input" id="ins-doc-search" placeholder="Search documents by name or cab #…" />
+      </div>
+      <div class="table-wrap" style="margin-top:12px;">
+        <div class="table-header"><h3>Uploaded Documents <span id="ins-doc-count" style="color:var(--muted2);font-weight:400;"></span></h3></div>
+        <table>
+          <thead><tr><th>Name</th><th>Cab #</th><th>Type</th><th>Size</th><th>Uploaded</th><th style="text-align:right;">Actions</th></tr></thead>
+          <tbody id="ins-doc-body"><tr><td colspan="6" style="text-align:center;color:var(--muted2);padding:24px;">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="pager" id="ins-doc-pager" data-scope="doc"></div>
+    </div>
+  </div>
+
 </main>
 
 <!-- ══════════════════════════ ADD/EDIT DRIVER MODAL ══════════════════════════ -->
@@ -1567,41 +1806,22 @@
   .sos-card .actions .btn { flex:0 0 auto; }
 </style>
 
-<script>
-  // ── Mobile hamburger drawer ──────────────────────────────────────────────────
-  (function () {
-    const hamburger = document.getElementById('hamburger-btn');
-    const overlay   = document.getElementById('sidebar-overlay');
-    const sidebar   = document.getElementById('sidebar');
-
-    function openDrawer() {
-      sidebar.classList.add('open');
-      overlay.classList.add('open');
-      document.body.style.overflow = 'hidden';
-    }
-    function closeDrawer() {
-      sidebar.classList.remove('open');
-      overlay.classList.remove('open');
-      document.body.style.overflow = '';
-    }
-
-    hamburger.addEventListener('click', openDrawer);
-    overlay.addEventListener('click', closeDrawer);
-
-    // Close drawer when a nav item is tapped on mobile
-    document.querySelectorAll('.nav-link').forEach(function (link) {
-      link.addEventListener('click', function () {
-        if (window.innerWidth <= 480) closeDrawer();
-      });
-    });
-
-    // Close drawer on resize to desktop
-    window.addEventListener('resize', function () {
-      if (window.innerWidth > 480) closeDrawer();
-    });
-  })();
-</script>
+<!-- Mobile hamburger drawer is wired in js/admin/app.js (initSidebarDrawer) -->
 <script src="/js/utils.js"></script>
+<!-- ══════════ INSURANCE DOCUMENT PREVIEW MODAL ══════════ -->
+<div class="modal-overlay" id="ins-preview-modal" style="z-index:1000;">
+  <div class="modal" style="max-width:900px;width:95vw;max-height:92vh;display:flex;flex-direction:column;overflow:hidden;padding:0;">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.08);">
+      <div id="ins-preview-title" style="font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Preview</div>
+      <div style="display:flex;gap:8px;">
+        <a id="ins-preview-download" class="btn btn-ghost btn-sm" href="#">⬇ Download</a>
+        <button class="btn btn-ghost btn-sm" id="ins-preview-close">✕ Close</button>
+      </div>
+    </div>
+    <div id="ins-preview-body" style="flex:1;min-height:60vh;background:#0b0f14;overflow:auto;display:flex;align-items:center;justify-content:center;"></div>
+  </div>
+</div>
+
 <script src="/js/admin/daySchedule.controller.js"></script>
 <script src="/js/admin/scheduledDrivers.controller.js"></script>
 <script src="/js/admin/drivers.controller.js"></script>
@@ -1614,6 +1834,7 @@
 <script src="/js/admin/terminalMetrics.controller.js"></script>
 <script src="/js/admin/sos.controller.js"></script>
 <script src="/js/admin/messages.controller.js"></script>
+<script src="/js/admin/insurance.controller.js"></script>
 <script src="/js/admin/auth.controller.js"></script>
 <script src="/js/admin/app.js"></script>
 <script src="/js/admin/tableFilter.js"></script>

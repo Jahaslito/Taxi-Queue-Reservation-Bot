@@ -109,12 +109,16 @@ async function getStats(req, res, next) {
 
 async function listDrivers(req, res, next) {
   try {
-    const { search, active, status } = req.query;
+    const { search, active, status, sort, dir } = req.query;
     const limit  = Math.min(parseInt(req.query.limit,  10) || 25, 100);
     const offset = parseInt(req.query.offset, 10) || 0;
     // status = 'active' | 'inactive' | undefined (all). `active=true` kept for back-compat.
     const normalizedStatus = status === 'active' || status === 'inactive' ? status : undefined;
-    const filters = { search, activeOnly: active === 'true', status: normalizedStatus };
+    // sort = 'created_at' enables the created-date ordering (dir 'asc'|'desc',
+    // default desc); any other value keeps the default schedule/name order.
+    const normalizedSort = sort === 'created_at' ? 'created_at' : undefined;
+    const normalizedDir  = dir === 'asc' ? 'asc' : 'desc';
+    const filters = { search, activeOnly: active === 'true', status: normalizedStatus, sort: normalizedSort, dir: normalizedDir };
 
     const [drivers, countResult] = await Promise.all([
       Driver.search({ ...filters, limit, offset }),

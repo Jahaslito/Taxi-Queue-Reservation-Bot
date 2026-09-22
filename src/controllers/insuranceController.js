@@ -234,6 +234,22 @@ function discardUploadedFiles(files) {
   }
 }
 
+// A document can be tagged with ONE cab or SEVERAL (e.g. "Cab #48, #156, #4322").
+// Normalise any such entry to a clean, comma-separated, searchable list: split on
+// commas / spaces / '#' / ';', drop a stray "Cab" label and empties, keep each
+// number exactly as typed (leading zeros intact), de-duplicate, re-join with ", ".
+// Returns '' when nothing usable remains (the caller rejects that as missing).
+function normalizeCabList(value) {
+  const tokens = String(value || '')
+    .split(/[\s,;#]+/)
+    .map((t) => t.trim())
+    .filter((t) => t && !/^cab$/i.test(t));
+  return [...new Set(tokens)].join(', ');
+}
+// Guard rail: a pathological entry returns a clean 400 rather than a DB/index
+// error. Comfortably fits a large multi-cab fleet list.
+const MAX_CAB_LIST_LEN = 500;
+
 async function uploadDocuments(req, res, next) {
   const files = req.files || [];
   try {
@@ -243,11 +259,16 @@ async function uploadDocuments(req, res, next) {
 
     // A cab number is MANDATORY for every uploaded file. The client sends one
     // `cab_numbers` value per file, in the same order as the files themselves.
+    // Each value may be a single cab or a comma-separated list — normalise it.
     const raw = req.body.cab_numbers;
     const cabNumbers = (Array.isArray(raw) ? raw : (raw != null ? [raw] : []))
-      .map((c) => String(c || '').trim());
+      .map((c) => normalizeCabList(c));
     if (cabNumbers.length !== files.length || cabNumbers.some((c) => !c)) {
       const err = new Error('Every uploaded file must have a cab number.');
+      err.statusCode = 400; throw err;
+    }
+    if (cabNumbers.some((c) => c.length > MAX_CAB_LIST_LEN)) {
+      const err = new Error(`Cab number list is too long (max ${MAX_CAB_LIST_LEN} characters).`);
       err.statusCode = 400; throw err;
     }
 

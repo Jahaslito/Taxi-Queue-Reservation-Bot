@@ -57,6 +57,25 @@ describe('Insurance documents', () => {
     expect(list.body.documents.find(d => d.original_name === 'policy.pdf').previewable).toBe(true);
   });
 
+  test('accepts a multi-cab list, normalises it, and stays searchable by any cab', async () => {
+    const admin = await createAdmin();
+    const up = await request(app)
+      .post('/api/admin/insurance/documents')
+      .set('Cookie', adminCookie(admin.id))
+      .field('cab_numbers', 'Cab #48, #156, #157, #4322')
+      .attach('files', PDF, { filename: 'fleet-cert.pdf', contentType: 'application/pdf' });
+
+    expect(up.status).toBe(201);
+    // Stored as a clean, comma-separated list — "Cab"/"#" stripped, not a 500.
+    expect(up.body.documents[0].cab_number).toBe('48, 156, 157, 4322');
+
+    // Substring search by a single cab in the list finds the document.
+    const found = await request(app)
+      .get('/api/admin/insurance/documents?search=156')
+      .set('Cookie', adminCookie(admin.id));
+    expect(found.body.documents.map(d => d.original_name)).toContain('fleet-cert.pdf');
+  });
+
   test('rejects an upload with no cab number (mandatory)', async () => {
     const admin = await createAdmin();
     const res = await request(app)

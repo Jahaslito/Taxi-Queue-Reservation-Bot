@@ -336,11 +336,11 @@ function insSetChosen(files) {
   // until every file has a cab number (enforced again server-side).
   el.innerHTML = `
     <div class="ins-upload-list">
-      <div class="ins-upload-hint">Enter the cab number each document belongs to — required for every file:</div>
+      <div class="ins-upload-hint">Enter the cab number(s) each document belongs to — one, or several comma-separated (e.g. <span class="mono">48, 156, 4322</span>). Required for every file:</div>
       ${insSelectedFiles.map((f, i) => `
         <div class="ins-upload-row">
           <span class="ins-upload-file" title="${esc(f.name)}">${insDocIcon(f.type)} ${esc(f.name)} <small style="color:var(--muted2);">(${insFmtBytes(f.size)})</small></span>
-          <input class="search-input ins-cab-input" data-idx="${i}" placeholder="Cab # *" aria-label="Cab number for ${esc(f.name)}" autocomplete="off" />
+          <input class="search-input ins-cab-input" data-idx="${i}" placeholder="Cab #(s) — e.g. 48, 156, 4322 *" aria-label="Cab number(s) for ${esc(f.name)}" autocomplete="off" />
         </div>`).join('')}
     </div>`;
   insValidateCabs();

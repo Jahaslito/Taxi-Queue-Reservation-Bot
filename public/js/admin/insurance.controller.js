@@ -404,8 +404,10 @@ async function insUpload() {
     status.style.color = 'var(--red)';
     status.textContent = err.message;
   } finally {
+    btn.disabled = false;   // re-enable after the in-flight upload — without this the
+                            // button stays disabled and a 2nd upload needs a page refresh
     btn.innerHTML = 'Upload';
-    insValidateCabs();   // restore the correct disabled state
+    insValidateCabs();   // restore the greyed (is-inactive) look from cab-field validity
   }
 }
 

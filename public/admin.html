@@ -1848,25 +1848,37 @@
         navigator.serviceWorker.getRegistrations().then(function (rs) { rs.forEach(function (r) { r.unregister(); }); });
         if (window.caches) caches.keys().then(function (ks) { ks.forEach(function (k) { caches.delete(k); }); });
       } else {
-        window.addEventListener('load', function () {
-          navigator.serviceWorker.register('/sw.js').then(function (reg) {
-            // Admins keep this tab open all day, so polling is what actually
-            // surfaces a deploy: it re-checks /sw.js, and a bumped CACHE_VERSION
-            // installs the new worker → skipWaiting → controllerchange below.
-            setInterval(function () { reg.update().catch(function () {}); }, 60 * 1000);
-          }).catch(function () {});
-        });
-
-        // A new service worker taking control means a new version was deployed.
-        // Reload to pick up the fresh admin assets — no manual/hard refresh.
-        // (This is the handler the admin side was missing; the driver app has
-        // had the equivalent in js/driver/app.js all along.)
-        var refreshing = false;
+        // A deployed update installs the new worker in the background, but it now
+        // WAITS instead of taking over (sw.js no longer skipWaiting's on install).
+        // We show a persistent "Update available" bar; only when the admin clicks
+        // Refresh do we activate it and reload. Nothing reloads on its own, so an
+        // admin is never yanked out of a task mid-action.
+        var hadController = !!navigator.serviceWorker.controller;
+        var refreshing    = false;
         navigator.serviceWorker.addEventListener('controllerchange', function () {
+          if (!hadController) { hadController = true; return; } // first install — don't reload
           if (refreshing) return;
           refreshing = true;
-          if (window.showToast) showToast('🔄 New version — updating…', 'success', 1500);
-          setTimeout(function () { location.reload(); }, 800);
+          location.reload();
+        });
+
+        window.addEventListener('load', function () {
+          navigator.serviceWorker.register('/sw.js').then(function (reg) {
+            var offerUpdate = function (worker) {
+              if (!worker) return;
+              showUpdateBar(function () { worker.postMessage({ type: 'SKIP_WAITING' }); });
+            };
+            if (reg.waiting && navigator.serviceWorker.controller) offerUpdate(reg.waiting);
+            reg.addEventListener('updatefound', function () {
+              var nw = reg.installing;
+              if (!nw) return;
+              nw.addEventListener('statechange', function () {
+                if (nw.state === 'installed' && navigator.serviceWorker.controller) offerUpdate(nw);
+              });
+            });
+            // Admins keep this tab open all day, so re-check for a deploy on a timer.
+            setInterval(function () { reg.update().catch(function () {}); }, 60 * 1000);
+          }).catch(function () {});
         });
       }
     }
@@ -1877,6 +1889,31 @@
       var es = new EventSource('/__livereload');
       es.onopen    = function ()  { if (opened) location.reload(); opened = true; }; // reconnect after restart
       es.onmessage = function (e) { if (e.data === 'reload') location.reload(); };   // a file changed
+    }
+
+    // Persistent "Update available" bar (no auto-dismiss). Clicking Refresh
+    // activates the waiting worker; the controllerchange handler reloads once.
+    function showUpdateBar(onRefresh) {
+      if (document.getElementById('sw-update-bar')) return;
+      var bar = document.createElement('div');
+      bar.id = 'sw-update-bar';
+      bar.style.cssText =
+        'position:fixed;left:50%;bottom:20px;transform:translateX(-50%);z-index:99999;' +
+        'display:flex;align-items:center;gap:12px;background:#1f2937;color:#fff;' +
+        'padding:10px 12px 10px 16px;border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,.35);' +
+        'font:500 14px system-ui,-apple-system,sans-serif;max-width:92vw;';
+      var msg = document.createElement('span');
+      msg.textContent = 'A new version is available.';
+      var btn = document.createElement('button');
+      btn.textContent = 'Refresh';
+      btn.style.cssText =
+        'background:#3b82f6;color:#fff;border:0;border-radius:8px;padding:8px 16px;' +
+        'font:600 14px system-ui,-apple-system,sans-serif;cursor:pointer;flex:none;';
+      btn.addEventListener('click', function () {
+        btn.disabled = true; btn.textContent = 'Updating…'; onRefresh();
+      });
+      bar.appendChild(msg); bar.appendChild(btn);
+      document.body.appendChild(bar);
     }
   })();
 </script>

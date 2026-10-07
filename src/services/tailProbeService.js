@@ -366,8 +366,14 @@ async function ensureParked(probe) {
   if (probe.parked && probe.page) return probe.page;
   try {
     if (!probe.browser?.isConnected?.()) {
-      if (!deps.chromium) deps.chromium = require('playwright').chromium;
-      probe.browser = await deps.chromium.launch({
+      // Production goes through botService.launchReapableBrowser so the probe's
+      // process group is tracked and reaped like every other browser (a bare
+      // chromium.launch() strands its children → EAGAIN leak). Tests inject
+      // deps.chromium.
+      const launch = deps.chromium
+        ? (opts) => deps.chromium.launch(opts)
+        : (opts) => bot().launchReapableBrowser(opts);
+      probe.browser = await launch({
         headless: true,
         args: [
           '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
@@ -429,7 +435,10 @@ async function disableForDay(probe, reason) {
 async function teardown(probe) {
   const b = probe.browser;
   probe.browser = null; probe.context = null; probe.page = null; probe.parked = false;
-  if (b) await b.close().catch(() => {});
+  if (b) {
+    if (deps.chromium) await b.close().catch(() => {});
+    else await bot().hardCloseBrowser(b, `probe#${probe.vehicle}`);
+  }
   console.log(`[TailProbe] stopped (#${probe.vehicle})`);
 }
 

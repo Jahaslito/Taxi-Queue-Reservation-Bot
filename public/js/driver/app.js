@@ -114,24 +114,74 @@ document.getElementById('btn-resend-verification').addEventListener('click', asy
   }
 });
 
-// ─── Service worker update detection ─────────────────────────────────────────
-// When sw.js bumps its CACHE_VERSION, the browser installs a new SW in the
-// background. After skipWaiting() + clients.claim() take effect, the new SW
-// becomes the controller of this page — that fires 'controllerchange'.
-//
-// We catch that event, show the user a toast, then reload so they pick up the
-// fresh HTML/JS/CSS without having to close and reopen the PWA.
-//
-// The 'refreshing' guard prevents an infinite reload loop if multiple
-// controllerchange events fire (rare but possible during SW lifecycle).
+// ─── Service worker update handling (prompt, never auto-reload) ───────────────
+// When sw.js bumps its CACHE_VERSION the browser installs the new worker in the
+// background, but it now WAITS instead of taking over (sw.js no longer calls
+// skipWaiting on install). We surface a small, persistent "Update available" bar;
+// only when the driver taps Refresh do we tell the waiting worker to activate,
+// which fires 'controllerchange' and we reload once. Nothing reloads on its own —
+// no surprise refresh mid-shift.
 if ('serviceWorker' in navigator) {
-  let refreshing = false;
+  // True on return visits (a worker already controls the page). Used to ignore
+  // the one controllerchange that fires on first-ever install (clients.claim),
+  // so a first launch never reloads itself.
+  let hadController = !!navigator.serviceWorker.controller;
+  let refreshing   = false;
   navigator.serviceWorker.addEventListener('controllerchange', () => {
-    if (refreshing) return;
+    if (!hadController) { hadController = true; return; } // first install — don't reload
+    if (refreshing) return;                               // guard double-fire
     refreshing = true;
-    showToast('🔄 New version available — refreshing…', 'success', 2000);
-    setTimeout(() => window.location.reload(), 1500);
+    window.location.reload();
   });
+
+  navigator.serviceWorker.ready.then((reg) => {
+    const offerUpdate = (worker) => {
+      if (!worker) return;
+      showUpdateBar(() => worker.postMessage({ type: 'SKIP_WAITING' }));
+    };
+    // A worker may already be waiting from an update check on an earlier page.
+    if (reg.waiting && navigator.serviceWorker.controller) offerUpdate(reg.waiting);
+    // Future updates: installing → installed while a controller exists = an update.
+    reg.addEventListener('updatefound', () => {
+      const nw = reg.installing;
+      if (!nw) return;
+      nw.addEventListener('statechange', () => {
+        if (nw.state === 'installed' && navigator.serviceWorker.controller) offerUpdate(nw);
+      });
+    });
+    // Drivers keep the PWA open for a whole shift, so re-check for a deploy
+    // periodically rather than only on navigation.
+    setInterval(() => reg.update().catch(() => {}), 30 * 60 * 1000);
+  }).catch(() => {});
+}
+
+// Persistent "Update available" bar (no auto-dismiss). Tapping Refresh activates
+// the waiting worker; the controllerchange handler above then reloads once.
+// Self-contained styling so it works regardless of app CSS.
+function showUpdateBar(onRefresh) {
+  if (document.getElementById('sw-update-bar')) return;
+  const bar = document.createElement('div');
+  bar.id = 'sw-update-bar';
+  bar.style.cssText =
+    'position:fixed;left:50%;bottom:calc(16px + env(safe-area-inset-bottom));' +
+    'transform:translateX(-50%);z-index:99999;display:flex;align-items:center;' +
+    'gap:12px;background:#1f2937;color:#fff;padding:10px 12px 10px 16px;' +
+    'border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,.35);' +
+    'font:500 14px system-ui,-apple-system,sans-serif;max-width:92vw;';
+  const msg = document.createElement('span');
+  msg.textContent = 'A new version is available.';
+  const btn = document.createElement('button');
+  btn.textContent = 'Refresh';
+  btn.style.cssText =
+    'background:#3b82f6;color:#fff;border:0;border-radius:8px;padding:8px 16px;' +
+    'font:600 14px system-ui,-apple-system,sans-serif;cursor:pointer;flex:none;';
+  btn.addEventListener('click', () => {
+    btn.disabled = true;
+    btn.textContent = 'Updating…';
+    onRefresh();
+  });
+  bar.append(msg, btn);
+  document.body.appendChild(bar);
 }
 
 // ─── Manual refresh fallback ─────────────────────────────────────────────────

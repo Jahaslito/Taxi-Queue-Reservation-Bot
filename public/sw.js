@@ -8,7 +8,7 @@
 //   3. activate handler purges any caches not matching CACHE_NAME
 //   4. clients.claim() takes over open tabs immediately
 //   5. Next navigation (or app reopen) serves the new files
-const CACHE_VERSION = 'v42';
+const CACHE_VERSION = 'v43';
 const CACHE_NAME    = `san-queue-${CACHE_VERSION}`;
 
 // On localhost the service worker only gets in the way: cache-first serving of
@@ -52,11 +52,21 @@ const PRECACHE = [
 
 self.addEventListener('install', event => {
   if (DEV) { self.skipWaiting(); return; }
+  // NOTE: no skipWaiting() here. The new worker installs and then WAITS — it does
+  // not take over on its own. The page detects the waiting worker, shows an
+  // "Update available" bar, and only when the user taps Refresh do we receive the
+  // SKIP_WAITING message (below) and activate. This is what stops the app from
+  // reloading unprompted.
   event.waitUntil(
-    caches.open(CACHE_NAME)
-      .then(cache => cache.addAll(PRECACHE))
-      .then(() => self.skipWaiting())
+    caches.open(CACHE_NAME).then(cache => cache.addAll(PRECACHE))
   );
+});
+
+// The page's "Refresh" button posts this when the user accepts an update. Only
+// then do we skip waiting → activate → clients.claim() → controllerchange, which
+// the page listens for to reload once.
+self.addEventListener('message', event => {
+  if (event.data && event.data.type === 'SKIP_WAITING') self.skipWaiting();
 });
 
 self.addEventListener('activate', event => {

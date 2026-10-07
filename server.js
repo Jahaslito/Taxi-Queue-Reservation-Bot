@@ -58,6 +58,15 @@ app.use('/api/webhook/stripe', require('./src/routes/webhook'));
 // ─── Body parsing + static files ──────────────────────────────────────────────
 app.use(express.json());
 app.use(cookieParser());
+// The service worker must always be revalidated: if an edge/proxy caches it,
+// browsers can flip between stale and fresh copies and reload on every
+// controllerchange (the "random refresh" on both apps). Send no-cache from the
+// origin so nginx/Cloudflare have nothing cacheable to pin. Must precede the
+// static handler below so these headers win.
+app.get('/sw.js', (req, res) => {
+  res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.sendFile(path.join(__dirname, 'public', 'sw.js'));
+});
 // index:false so a bare "/" is NOT auto-served as public/index.html (the driver
 // app). The marketing landing page owns "/" now; the driver app lives at "/app".
 // Static assets (/js, /icons, /sw.js, /manifest.json, …) are still served here.
@@ -235,6 +244,10 @@ async function bootstrap() {
     // Oracle-shadow daily report (position-accuracy ceilings; LOG-ONLY, never
     // touches live decisions). Self-gates on MONITOR_ORACLE_SHADOW (default on).
     require('./src/services/oracleShadowService').start();
+
+    // Process-slot watchdog + overnight self-heal restart (EAGAIN outages
+    // 09-16 / 09-29 / 10-06). Self-gates on RESOURCE_GUARD_ENABLED (default on).
+    require('./src/services/resourceGuardService').start();
   });
 }
 
@@ -263,8 +276,13 @@ process.on('unhandledRejection', (reason) => {
 // Railway sends SIGTERM before force-killing. Give in-flight requests up to 10s
 // to finish before the process exits, so active SSE clients and bot jobs aren't
 // cut off mid-run.
-process.on('SIGTERM', () => {
-  console.log('[Shutdown] SIGTERM received — closing server gracefully…');
+function shutdown(signal) {
+  console.log(`[Shutdown] ${signal} received — closing server gracefully…`);
+  // Kill our Chromium groups FIRST, synchronously: pm2 SIGKILLs us ~1.6 s after
+  // SIGINT, long before the 10 s grace below, and a SIGKILLed node leaves every
+  // live browser orphaned (the EAGAIN thread leak). Browsers are useless once
+  // we're shutting down anyway.
+  try { require('./src/services/botService').killAllBrowsers(); } catch { /* best effort */ }
   // server is module-scoped via app.listen return value; re-use the reference
   // by attaching it at listen time.
   if (global._httpServer) {
@@ -280,6 +298,9 @@ process.on('SIGTERM', () => {
   } else {
     process.exit(0);
   }
-});
+}
+// SIGTERM = docker stop / ResourceGuard; SIGINT = pm2's stop/restart signal.
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
 
 module.exports = app;

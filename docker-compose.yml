@@ -55,6 +55,12 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: always
+    # Run Docker's tini as PID 1 so orphaned Chromium children get reaped.
+    # Without it pm2-runtime is PID 1 and never wait()s on re-parented
+    # processes → zombies pile up (140/143 procs 5h after a restart on
+    # 2026-09-30) until browser launches fail with spawn EAGAIN /
+    # pthread_create "Resource temporarily unavailable" (09-16, 09-29/30).
+    init: true
     depends_on:
       db:
         condition: service_healthy

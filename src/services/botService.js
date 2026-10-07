@@ -58,10 +58,37 @@ child_process.spawn = function spawn(...args) {
 // and its stranded children could not be reaped.
 async function launchReapableBrowser(launchOptions) {
   const store = {};
-  const browser = await _launchPidStore.run(store, () => chromium.launch(launchOptions));
-  if (store.pid) browserLaunchPid.set(browser, store.pid);
+  let browser;
+  try {
+    browser = await _launchPidStore.run(store, () => chromium.launch(launchOptions));
+  } catch (err) {
+    // Launch can die AFTER the spawn (pthread_create EAGAIN, "Target … closed"
+    // mid-handshake) — no Browser object comes back, so nothing would ever
+    // hardClose it. Reap whatever part of the tree did start.
+    if (store.pid > 1) { try { process.kill(-store.pid, 'SIGKILL'); } catch { /* already gone */ } }
+    throw err;
+  }
+  if (store.pid) {
+    browserLaunchPid.set(browser, store.pid);
+    liveBrowserPids.add(store.pid);
+    browser.on('disconnected', () => liveBrowserPids.delete(store.pid));
+  }
   return browser;
 }
+
+// Every browser group this process currently owns. If node dies (pm2
+// max_memory_restart, uncaughtException → exit(1), SIGTERM) its live browsers
+// would otherwise keep running as orphans with all their threads — a leak an
+// init can't fix because they're alive, not zombies. Kill them on the way out;
+// resourceGuardService's orphan sweep is the backstop for SIGKILL deaths.
+const liveBrowserPids = new Set();
+function killAllBrowsers() {
+  for (const pid of liveBrowserPids) {
+    try { process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ }
+  }
+  liveBrowserPids.clear();
+}
+process.on('exit', killAllBrowsers);
 
 // ─── Browser teardown (force-reap) ────────────────────────────────────────────
 // A bare browser.close() is NOT enough. When a Chromium is wedged or already
@@ -106,6 +133,7 @@ async function hardCloseBrowser(browser, label = '') {
   //    reaps them. See the header note for why this can only ever hit the
   //    browser's own group, never Node's.
   if (pid && pid > 1) {
+    liveBrowserPids.delete(pid);
     try {
       process.kill(-pid, 'SIGKILL');
     } catch (err) {
@@ -2823,6 +2851,7 @@ module.exports = {
   sanitizeError,
   hardCloseBrowser,
   launchReapableBrowser,
+  killAllBrowsers,
   sessionStore,
   // Exposed for the warmer service and tests.
   saveSession,

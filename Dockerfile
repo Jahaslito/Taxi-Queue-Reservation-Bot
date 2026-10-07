@@ -23,6 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgbm1 libpango-1.0-0 libcairo2 libasound2 \
     # Utilities needed by Playwright's install script
     ca-certificates curl wget \
+    # PID-1 init that reaps zombie Chromium processes (see ENTRYPOINT below)
+    tini \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -47,4 +49,11 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
   CMD node -e "require('http').get('http://localhost:3000/api/health', \
     r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
 
+# tini as PID 1 reaps orphaned/zombie Chromium processes. Without it pm2-runtime
+# is PID 1, never wait()s on re-parented children, and zombies pile up until
+# every browser launch fails with spawn EAGAIN (outages 09-16, 09-29, 10-06).
+# -s (subreaper) keeps it correct even when compose `init: true` also adds
+# docker-init as PID 1. ⛔ Do not remove — resourceGuardService logs an ERROR
+# at boot if PID 1 is not an init.
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
 CMD ["pm2-runtime", "start", "ecosystem.config.js"]
